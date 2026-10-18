@@ -99,18 +99,30 @@ Run the tests (they use only hard-coded values and the example config):
 ```
 
 The viewer reads the fuselage, engine and every other component straight from the `.vsp3` through the
-OpenVSP API (a temporary set and a temporary STL, both removed afterwards; the model is never written) and shows:
+OpenVSP API (a temporary set and a temporary STL, both removed afterwards; the model is never written). It is a
+Qt window (PySide6 + pyvistaqt) with the 3D view in the centre and a compact dark panel on the right; nothing is
+drawn inside the 3D view except the scene itself (translucent fuselage, other components as grey context, the
+engine, the engine-face disc and the inlets).
 
-- a translucent fuselage, the other components as light-grey context, the engine, and the engine-face disc;
-- **left-click the fuselage** to place the right inlet; the left one appears mirrored about the XZ plane
-  (a click on the left side is mirrored onto the right). Hover and press `p` if clicking is awkward;
-- sliders for the pentagon shape (`width_bottom`, `width_top`, `height`, `apex_height`, `skew`; `apex_height = 0`
-  gives a quadrilateral), the inlet-plane tilt, and an x/y nudge that keeps the inlet on the skin. The polygon is
-  always scaled to the per-inlet capture area from the sizing step;
-- a live readout: centroid, capture area, aspect ratio, distance to the engine face, the (dy, dz) offset, and
-  the offset/length ratio;
-- keys: `s` saves the inlet into `duct_config.yaml` (comments and every other key are preserved), `r` reloads
-  the config, `f` cycles the skin-fit mode, `1`-`4` switch between side, top, front and isometric views.
+- **Placement is explicit.** Clicking the geometry does nothing by default. Press **Place inlet** (`P`): the next
+  click on the fuselage places the right inlet (the left one is its mirror image about XZ; a click on the left
+  side is mirrored onto the right) and place mode switches itself off. `Esc` cancels. The status bar shows
+  `View` or `Placing inlet - click on fuselage, Esc to cancel`. Dragging still rotates the camera.
+- **Lock inlet** disables placement and nudges.
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) cover every change, placement and parameters alike (up to 200 steps;
+  rapid edits of one value merge into one step).
+- **Panel** (collapsible groups): position x/y/z with a nudge-step selector (the inlet snaps to the skin), the
+  shape ratios `width_bottom`, `width_top`, `height`, `apex_height` (0 gives a quadrilateral) and `skew`, the
+  tilt, the skin-fit mode, and read-only monospace readouts: centroid, capture area target vs actual, aspect
+  ratio, distance to the face, (dy, dz) offset, offset/length, maximum skin gap, opening height and the engine
+  face/envelope check, with WARN in amber and PASS in green. Spin boxes take the mouse wheel only while focused.
+- **Save to config** (`Ctrl+S`) writes the inlet into `duct_config.yaml`, keeping its comments and every other
+  key; **Revert to saved** re-reads it. The title bar shows `*` while there are unsaved changes, and closing the
+  window then asks first.
+- **View** toolbar: side / top / front / iso (`1`-`4`), and toggles for the context components and the engine
+  envelope.
+
+The polygon is always scaled to the per-inlet capture area from the sizing step.
 
 **Skin fit** (`ducts.inlet.skin_fit`): `none` is the planar polygon centred on the clicked point. `bottom_edge`
 (the example default) keeps the outline planar but replaces its bottom edge with the curve where the inlet plane
@@ -126,8 +138,13 @@ The engine face is centred on the front (min-x) end of the Geom named by `engine
 `engine.face_diameter` from the config (the fan); the Geom's bounding box is only the engine envelope (casing),
 drawn as a faint outline around the face disc. The viewer prints both diameters and the ratio
 face / envelope, and warns when it is outside `engine.face_to_envelope_range` (default `[0.80, 0.98]`).
-Neither value is ever changed. `s` never writes to the tracked example config: copy it to
-`duct_config.yaml` first. `--screenshot out.png` renders the scene off-screen instead of opening a window.
+Neither value is ever changed. Save never writes to the tracked example config (the button is disabled): copy it
+to `duct_config.yaml` first. `--screenshot out.png` renders the scene off-screen, without Qt, instead of opening
+a window.
+
+Tests: `python -m pytest` runs without a display (the window is tested on Qt's offscreen platform, without its 3D
+view). The embedded 3D view and real clicks need a desktop session:
+`$env:DUCTMGR_GUI_TESTS=1; python -m pytest tests/test_qt_gui_3d.py` (opens a window briefly).
 
 ## Using your own model
 

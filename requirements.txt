@@ -14,5 +14,7 @@ pyyaml
 ruamel.yaml
 matplotlib
 pyvista
+PySide6-Essentials
+pyvistaqt
 pytest
 pre-commit
