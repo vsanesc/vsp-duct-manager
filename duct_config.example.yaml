@@ -1,0 +1,51 @@
+# VSP Duct Manager - example configuration with generic dummy values.
+# Copy to duct_config.yaml (gitignored) and edit; that file is used in preference to this one.
+# Units: metres, seconds, kg, K, Pa.  VSP axes: +X aft, +Y right, +Z up.
+# All numbers below are placeholders, not a validated design.
+
+model:
+  vsp3_path: example_model.vsp3    # input model; never overwritten (output: <name>_ducts.vsp3)
+                                   # create the dummy model with: python make_example_model.py
+  fuselage_name: Test Fuselage     # name of the fuselage Geom in the model
+  duct_prefix: DUCT_               # only Geoms with this prefix are ever touched
+
+# ---- Phase 1: engine and area sizing ------------------------------------
+engine:
+  face_diameter: 0.5               # m, single circular engine face
+  hub_to_tip_ratio: 0.0            # 0 = full disc
+  corrected_flow_per_area: 190.0   # kg/s/m^2 (corrected flow per unit face area)
+  reference_thrust: 10000.0        # N, optional (sanity check)
+  specific_thrust_range: [200.0, 600.0]   # [min, max] N/(kg/s), optional (sanity check)
+
+design_point:
+  mach: 0.6
+  altitude: 5000.0                 # m
+  pressure_recovery: 0.97          # total-pressure recovery eta
+  capture_margin: 1.05
+
+# ---- Phase 2: duct geometry ---------------------------------------------
+ducts:
+  inlet:                           # right inlet; the left one is mirrored about XZ
+    centroid: [2.0, 0.5, 0.4]      # [x, y, z]
+    normal: [-1.0, 0.0, 0.0]       # inlet plane normal [x, y, z]
+    polygon:                       # normalised vertices in the inlet plane, CCW, 4-6 points
+      - [0.0, 0.5]
+      - [0.5, 0.2]
+      - [0.3, -0.5]
+      - [-0.3, -0.5]
+      - [-0.5, 0.2]
+    lip_extension: 0.05            # m, how far the negative starts outside the skin
+  junction:
+    point: [4.0, 0.0, 0.2]         # [x, 0, z] where the branches merge
+  engine_face:
+    centre: [5.0, 0.0, 0.0]        # [x, 0, z]
+    normal: [1.0, 0.0, 0.0]        # default +X
+  n_stations_branch: 12
+  n_stations_trunk: 12
+  n_section_points: 64             # points per resampled cross-section
+  area_law: cosine                 # "linear" or "cosine"
+
+# ---- Phase 3: checks and visualisation ----------------------------------
+checks:
+  min_clearance: 0.02              # m, minimum wall clearance to the fuselage skin
+  max_diffuser_half_angle_deg: 6.0

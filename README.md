@@ -1,0 +1,103 @@
+# VSP Duct Manager
+
+Design the air-intake ducts of an aircraft in Python, check them against the real fuselage
+geometry, and write them into an [OpenVSP](https://openvsp.org) model as native,
+GUI-editable components. You keep working in the OpenVSP GUI afterwards; the Python API is
+only used to generate and update the duct components.
+
+> **Status: early development.** Only the environment/config scaffolding exists so far
+> (config loader, `env_check.py`, example model). The design, check and export stages
+> below are planned and not implemented yet; see [PHASES.md](PHASES.md).
+
+## What it will do
+
+Configuration modelled: one engine with a single circular engine face, fed by two inlets
+that are mirror-symmetric about the XZ plane, merging into a Y-duct and a single trunk.
+
+1. **Sizing** (`ductmgr/engine.py`): ISA conditions, engine mass flow, capture and face areas, Mach checks.
+2. **Geometry** (`ductmgr/geometry.py`): centrelines, frames, area law, cross-section morphing from an inlet polygon to a circle.
+3. **Checks and visualisation** (`ductmgr/checks.py`, `viz.py`): clearance to the fuselage skin, diffuser half-angle, S-duct severity, PyVista 3D view and an A(s) plot.
+4. **Export** (`ductmgr/vspio.py`): write `DUCT_*` components into `<name>_ducts.vsp3` as closed Stack volumes with the negative-volume flag set and Edit Curve cross-sections, then verify with CompGeom.
+
+Safety rules: your input `.vsp3` is never overwritten (output is `<name>_ducts.vsp3`), and
+only Geoms whose name starts with `DUCT_` are ever created, deleted or modified.
+
+Units are metres, seconds, kg, K and Pa. OpenVSP axes: +X aft, +Y right, +Z up.
+
+## Requirements
+
+- Windows (developed and tested there).
+- **Python 3.13.** OpenVSP's compiled Python modules link `python313.dll`; other versions fail to import.
+- **OpenVSP 3.55.0** with its bundled Python packages. OpenVSP is not included in this repository;
+  download it from <https://openvsp.org>.
+
+## Install
+
+From the repository root, in PowerShell. Set `$VSP` to the folder that contains OpenVSP's `python` directory
+(for example the unpacked `OpenVSP-3.55.0-win64`):
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+
+$VSP = "path\to\OpenVSP-3.55.0-win64"
+foreach ($p in "openvsp_config","utilities","degen_geom","openvsp") {
+    .venv\Scripts\python -m pip install --no-deps -e "$VSP\python\$p"
+}
+```
+
+`--no-deps` matters: without it pip would try to resolve the name `utilities` against PyPI, where it is an
+unrelated package. `utilities` and `degen_geom` are needed because `openvsp` imports them on load.
+The optional CHARM, AvlPy and pyPMARC packages are not needed.
+
+Check the install:
+
+```powershell
+.venv\Scripts\python -c "import openvsp as vsp; print(vsp.GetVSPVersion())"
+```
+
+## Quickstart (example config)
+
+`duct_config.example.yaml` holds generic dummy values. The tools use `duct_config.yaml` if it exists (copy
+the example to that name for your own model; it is gitignored) and fall back to the example otherwise.
+Pass `--config <path>` to choose a file explicitly.
+
+```powershell
+# 1. build a dummy model (one plain fuselage named "Test Fuselage"); refuses to overwrite an existing file
+.venv\Scripts\python make_example_model.py
+
+# 2. open it through the OpenVSP API and list every Geom (name, type, ID, bounding box)
+.venv\Scripts\python env_check.py --config duct_config.example.yaml
+```
+
+## Using your own model
+
+```powershell
+Copy-Item duct_config.example.yaml duct_config.yaml
+# edit duct_config.yaml: model.vsp3_path, model.fuselage_name, engine and duct values
+.venv\Scripts\python env_check.py
+```
+
+All inputs live in the YAML config; the example file documents every field.
+
+## Development
+
+Hooks run [gitleaks](https://github.com/gitleaks/gitleaks) and a 1 MB file-size limit before each commit:
+
+```powershell
+.venv\Scripts\python -m pre_commit install
+.venv\Scripts\python -m pre_commit run --all-files
+```
+
+`.vsp3` models, `duct_config.yaml`, generated outputs and meshes are gitignored on purpose; do not commit them.
+
+## License
+
+Copyright (C) 2026 Víctor Sánchez Escalante.
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version (**GPL-3.0-or-later**). See [LICENSE](LICENSE).
+
+It is distributed in the hope that it will be useful, but without any warranty. OpenVSP is a separate
+program with its own license and is not part of this repository.

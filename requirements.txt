@@ -1,0 +1,17 @@
+# Python 3.13 only (the OpenVSP .pyd modules link python313.dll).
+#
+# Recreate the environment from the project root (PowerShell):
+#   py -3.13 -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+#   foreach ($p in "openvsp_config","utilities","degen_geom","openvsp") {
+#       .venv\Scripts\python -m pip install --no-deps -e OpenVSP-3.55.0-win64\python\$p }
+#
+# The four editable installs come from the vendor folder (not edited). --no-deps stops pip
+# resolving the name `utilities` against PyPI. CHARM / AvlPy / pyPMARC are deliberately not installed.
+numpy
+scipy
+pyyaml
+matplotlib
+pyvista
+pytest
+pre-commit

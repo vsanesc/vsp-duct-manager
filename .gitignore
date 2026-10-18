@@ -1,0 +1,44 @@
+# environment / vendor (not project source)
+.venv/
+OpenVSP-3.55.0-win64/
+*.egg-info/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# generated OpenVSP outputs (the input model is never overwritten; outputs are <name>_ducts.vsp3)
+*_ducts.vsp3
+*_ducts.vsp3.bak
+*.vsp3.bak
+
+# meshes / tessellation / analysis exports
+*.stl
+*.obj
+*.vtk
+*.vtp
+*.msh
+*.tri
+*.facet
+*_CompGeom.*
+*_DegenGeom.*
+
+# scratch
+.claude/
+graphify-out/
+
+# ---- private / never publish ----
+*.vsp3
+duct_config.yaml
+CLAUDE.local.md
+outputs/
+*.csv
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*secret*
+*token*
+credentials*
