@@ -46,6 +46,7 @@ ductmgr/
   geometry.py     # centreline, frames, area law, section morphing
   checks.py       # clearance vs fuselage, area error, diffusion angle
   viz.py          # PyVista scene + matplotlib A(s) plot
+run_explore.py    # interactive viewer: place the inlets, save them to the config
 run_design.py     # design + visualise (no VSP write)
 run_export.py     # write DUCT_* into <name>_ducts.vsp3 + CompGeom check
 tests/

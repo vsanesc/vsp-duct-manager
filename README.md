@@ -6,9 +6,9 @@ GUI-editable components. You keep working in the OpenVSP GUI afterwards; the Pyt
 only used to generate and update the duct components.
 
 > **Status: early development.** Implemented so far: the environment/config scaffolding
-> (config loader, `env_check.py`, example model) and Phase 1 engine/capture-area sizing.
-> The geometry, check and export stages below are planned and not implemented yet; see
-> [PHASES.md](PHASES.md).
+> (config loader, `env_check.py`, example model), Phase 1 engine/capture-area sizing, and
+> Phase 2: an interactive 3D viewer to place the inlets on the fuselage. The duct geometry,
+> checks and export stages below are planned and not implemented yet.
 
 ## What it will do
 
@@ -91,13 +91,40 @@ Run the tests (they use only hard-coded values and the example config):
 .venv\Scripts\python -m pytest
 ```
 
+### Interactive inlet placement
+
+```powershell
+.venv\Scripts\python make_example_model.py                      # once, for the example
+.venv\Scripts\python run_explore.py --config duct_config.example.yaml
+```
+
+The viewer reads the fuselage, engine and every other component straight from the `.vsp3` through the
+OpenVSP API (a temporary set and a temporary STL, both removed afterwards; the model is never written) and shows:
+
+- a translucent fuselage, the other components as light-grey context, the engine, and the engine-face disc;
+- **left-click the fuselage** to place the right inlet; the left one appears mirrored about the XZ plane
+  (a click on the left side is mirrored onto the right). Hover and press `p` if clicking is awkward;
+- sliders for the pentagon shape (`width_bottom`, `width_top`, `height`, `apex_height`, `skew`; `apex_height = 0`
+  gives a quadrilateral), the inlet-plane tilt, and an x/y nudge that keeps the inlet on the skin. The polygon is
+  always scaled to the per-inlet capture area from the sizing step;
+- a live readout: centroid, capture area, aspect ratio, distance to the engine face, the (dy, dz) offset, and
+  the offset/length ratio;
+- keys: `s` saves the inlet into `duct_config.yaml` (comments and every other key are preserved), `r` reloads
+  the config, `1`-`4` switch between side, top, front and isometric views.
+
+The engine face is the centre of the front (min-x) end of the Geom named by `engine.geom_name`; if its diameter
+differs from `engine.face_diameter` by more than `engine.face_diameter_tolerance` (default 2 %) a warning is
+printed, and neither value is changed. `s` never writes to the tracked example config: copy it to
+`duct_config.yaml` first. `--screenshot out.png` renders the scene off-screen instead of opening a window.
+
 ## Using your own model
 
 ```powershell
 Copy-Item duct_config.example.yaml duct_config.yaml
-# edit duct_config.yaml: model.vsp3_path, model.fuselage_name, engine and duct values
+# edit duct_config.yaml: model.vsp3_path, model.fuselage_name, engine.geom_name, engine and duct values
 .venv\Scripts\python env_check.py
 .venv\Scripts\python -m ductmgr.engine
+.venv\Scripts\python run_explore.py
 ```
 
 All inputs live in the YAML config; the example file documents every field.

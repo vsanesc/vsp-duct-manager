@@ -79,7 +79,7 @@ def test_flow_function_peaks_at_sonic():
     assert engine.corrected_flux(1.01) < engine.max_corrected_flux()
 
 
-@pytest.mark.parametrize("mach", [0.01, 0.2, 0.4, 0.6, 0.8, 0.95, 0.999])
+@pytest.mark.parametrize("mach", [0.01, 0.2, 0.4, 0.6, 0.75, 0.95, 0.999])
 def test_mach_inversion_round_trip(mach):
     flux = engine.corrected_flux(mach)
     assert engine.mach_from_corrected_flux(flux) == pytest.approx(mach, abs=1e-9)

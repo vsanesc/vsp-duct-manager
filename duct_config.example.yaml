@@ -11,7 +11,9 @@ model:
 
 # ---- Phase 1: engine and area sizing ------------------------------------
 engine:
+  geom_name: Test Engine           # Geom in the model whose front end is the engine face
   face_diameter: 0.5               # m, single circular engine face
+  face_diameter_tolerance: 0.02    # relative; WARN if the Geom's diameter differs by more
   hub_to_tip_ratio: 0.0            # 0 = full disc
   corrected_flow_per_area: 190.0   # kg/s/m^2 (corrected flow per unit face area)
   reference_thrust: 10000.0        # N, optional (sanity check)
@@ -33,12 +35,13 @@ ducts:
   inlet:                          # right inlet; the left one is mirrored about XZ
     centroid: [2.0, 0.5, 0.4]      # [x, y, z]
     normal: [-1.0, 0.0, 0.0]       # inlet plane normal [x, y, z]
-    polygon:                       # normalised vertices in the inlet plane, CCW, 4-6 points
-      - [0.0, 0.5]
-      - [0.5, 0.2]
-      - [0.3, -0.5]
-      - [-0.3, -0.5]
-      - [-0.5, 0.2]
+    tilt_deg: 0.0                  # inlet plane pitch about Y; 0 = facing the freestream (-X)
+    shape:                         # ratios only; absolute size comes from the capture area
+      width_bottom: 1.0
+      width_top: 0.7
+      height: 1.0
+      apex_height: 0.3             # 5th vertex above the top edge, fraction of height (0 = quadrilateral)
+      skew: 0.0                    # lateral apex offset, fraction of width_top
     lip_extension: 0.05            # m, how far the negative starts outside the skin
   junction:
     point: [4.0, 0.0, 0.2]         # [x, 0, z] where the branches merge
