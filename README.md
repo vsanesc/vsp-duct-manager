@@ -79,7 +79,9 @@ Pass `--config <path>` to choose a file explicitly.
 
 Prints the ISA conditions, free-stream velocity, total temperature and pressure, face area, corrected and
 actual mass flow, face Mach number (subsonic root of the isentropic flow function), total and per-inlet
-capture area, and a specific-thrust sanity check. Out-of-range results are flagged `WARN`, never silently
+capture area, and a specific-thrust sanity check. The thrust rating is divided by the mass flow at its own
+reference condition (`engine.reference_thrust_condition`, default sea-level static), not the design-point
+flow. Out-of-range results are flagged `WARN`, never silently
 corrected. If the requested corrected flow cannot pass the face (choked), it stops with an error that states
 the maximum mass flow for that face area.
 

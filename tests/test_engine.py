@@ -178,15 +178,51 @@ def test_capture_area_scales_with_margin_and_inlet_count():
 
 
 # ---- specific-thrust check -----------------------------------------------------------------------
-def test_specific_thrust_pass_and_warn():
-    m = engine.size_engine(**BASE).mass_flow
-    ok = engine.size_engine(**BASE, reference_thrust=m * 400.0, specific_thrust_range=(300.0, 500.0))
-    assert ok.specific_thrust == pytest.approx(400.0)
-    assert ok.specific_thrust_status == "PASS"
+def test_specific_thrust_sls_static_hand_calculation():
+    # SLS static: T0 = 288.15 K, p0 = 101325 Pa, so m_ref = corrected flow * recovery exactly.
+    area = math.pi / 4 * 0.5**2  # 0.196349541 m^2
+    m_ref = 190.0 * area * 0.97  # 36.18722 kg/s
+    r = engine.size_engine(**BASE, reference_thrust=10000.0, specific_thrust_range=(250.0, 300.0))
+    assert r.reference_condition == (0.0, 0.0)
+    assert r.reference_mass_flow == pytest.approx(36.18722, abs=1e-5)
+    assert r.reference_mass_flow == pytest.approx(m_ref, rel=1e-9)
+    assert r.specific_thrust == pytest.approx(276.3406, abs=1e-4)
+    assert r.specific_thrust_status == "PASS"
 
-    with pytest.warns(EngineSizingWarning, match="specific thrust"):
-        bad = engine.size_engine(**BASE, reference_thrust=m * 900.0, specific_thrust_range=(300.0, 500.0))
+
+def test_specific_thrust_independent_of_design_point():
+    kwargs = dict(reference_thrust=10000.0, specific_thrust_range=(250.0, 300.0))
+    a = engine.size_engine(**BASE, **kwargs)
+    b = engine.size_engine(**{**BASE, "mach": 0.8, "altitude": 9000.0}, **kwargs)
+    assert a.mass_flow != pytest.approx(b.mass_flow)  # design-point flow differs...
+    assert a.specific_thrust == pytest.approx(b.specific_thrust, rel=1e-12)  # ...the check does not
+
+
+def test_specific_thrust_non_default_reference_condition():
+    # Mach 0.3 at sea level: T0/T = 1.018, p0/p = 1.018^3.5, so m = mc * 0.97 * 1.018^3.
+    area = math.pi / 4 * 0.5**2
+    m_ref = 190.0 * area * 0.97 * 1.018**3  # 38.17672 kg/s
+    r = engine.size_engine(
+        **BASE,
+        reference_thrust=10000.0,
+        reference_thrust_condition=(0.3, 0.0),
+        specific_thrust_range=(200.0, 300.0),
+    )
+    assert r.reference_mass_flow == pytest.approx(38.17672, abs=1e-5)
+    assert r.reference_mass_flow == pytest.approx(m_ref, rel=1e-9)
+    assert r.specific_thrust == pytest.approx(10000.0 / m_ref, rel=1e-9)
+
+
+def test_specific_thrust_warn_names_reference_condition():
+    with pytest.warns(EngineSizingWarning, match="reference condition"):
+        bad = engine.size_engine(**BASE, reference_thrust=20000.0, specific_thrust_range=(250.0, 300.0))
     assert bad.specific_thrust_status == "WARN"
+    assert bad.specific_thrust == pytest.approx(20000.0 / 36.18722, rel=1e-6)
+
+
+def test_negative_reference_mach_rejected():
+    with pytest.raises(ValueError, match="Mach"):
+        engine.size_engine(**BASE, reference_thrust_condition=(-0.1, 0.0))
 
 
 def test_specific_thrust_skipped_when_inputs_missing():
@@ -237,11 +273,22 @@ def test_optional_config_keys_default():
     cfg = copy.deepcopy(example_cfg())
     del cfg["ducts"]["n_inlets"]
     del cfg["engine"]["face_mach_range"]
-    cfg["engine"]["reference_thrust"] = None
+    del cfg["engine"]["reference_thrust_condition"]
     r = engine.size_from_config(cfg)
     assert r.n_inlets == 2
     assert r.face_mach_range == (0.3, 0.7)
-    assert r.specific_thrust_status == "SKIPPED"
+    assert r.reference_condition == (0.0, 0.0)  # defaults to sea-level static
+    cfg["engine"]["reference_thrust"] = None
+    assert engine.size_from_config(cfg).specific_thrust_status == "SKIPPED"
+
+
+def test_reference_condition_read_from_config():
+    cfg = copy.deepcopy(example_cfg())
+    cfg["engine"]["reference_thrust_condition"] = {"mach": 0.3, "altitude": 0.0}
+    assert engine.size_from_config(cfg).reference_condition == (0.3, 0.0)
+    del cfg["engine"]["reference_thrust_condition"]["altitude"]
+    with pytest.raises(ValueError, match="reference_thrust_condition.altitude"):
+        engine.size_from_config(cfg)
 
 
 # ---- CLI ------------------------------------------------------------------------------------------------
@@ -258,6 +305,8 @@ def test_cli_prints_summary(capsys):
         "Face Mach",
         "Capture area, total",
         "per inlet",
+        "Reference condition",
+        "Mass flow at reference",
         "Specific thrust",
     ):
         assert label in out

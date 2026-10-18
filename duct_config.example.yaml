@@ -15,6 +15,9 @@ engine:
   hub_to_tip_ratio: 0.0            # 0 = full disc
   corrected_flow_per_area: 190.0   # kg/s/m^2 (corrected flow per unit face area)
   reference_thrust: 10000.0        # N, optional (sanity check)
+  reference_thrust_condition:      # where reference_thrust is rated (default: sea-level static)
+    mach: 0.0
+    altitude: 0.0                  # m
   specific_thrust_range: [200.0, 600.0]   # [min, max] N/(kg/s), optional (sanity check)
   face_mach_range: [0.3, 0.7]      # expected engine-face Mach band; outside it -> WARN
 

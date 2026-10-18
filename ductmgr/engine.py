@@ -35,6 +35,7 @@ LAPSE_RATE = -0.0065  # K/m in the troposphere
 # ---- defaults for optional config keys -----------------------------------------
 DEFAULT_N_INLETS = 2
 DEFAULT_FACE_MACH_RANGE = (0.3, 0.7)
+DEFAULT_REFERENCE_THRUST_CONDITION = (0.0, 0.0)  # (Mach, altitude [m]): sea-level static
 
 _CHOKE_RTOL = 1e-12  # a flux this close above the M=1 maximum is treated as exactly sonic
 
@@ -96,6 +97,20 @@ def mach_from_corrected_flux(flux: float) -> float:
     return brentq(lambda m: corrected_flux(m) - flux, 0.0, 1.0, xtol=1e-14, rtol=1e-14)
 
 
+# ---- flight condition and mass flow ----------------------------------------------------
+def flight_conditions(mach: float, altitude: float) -> tuple[float, float, float, float, float, float]:
+    """Static T, p, rho, velocity, total T0 and total p0 at a Mach number and altitude."""
+    T, p, rho = isa(altitude)
+    V = mach * math.sqrt(GAMMA * R_AIR * T)
+    ram = 1.0 + 0.5 * (GAMMA - 1.0) * mach**2
+    return T, p, rho, V, T * ram, p * ram ** (GAMMA / (GAMMA - 1.0))
+
+
+def actual_mass_flow(corrected_flow: float, T0: float, p0: float, pressure_recovery: float) -> float:
+    """Actual mass flow [kg/s] from corrected flow, free-stream totals and inlet recovery."""
+    return corrected_flow * (p0 * pressure_recovery / P_REF) / math.sqrt(T0 / T_REF)
+
+
 # ---- sizing --------------------------------------------------------------------------
 @dataclass(frozen=True)
 class SizingResult:
@@ -126,8 +141,10 @@ class SizingResult:
     streamtube_area: float
     capture_area_total: float
     capture_area_per_inlet: float
-    # optional specific-thrust check
+    # optional specific-thrust check (thrust rating and mass flow both at the reference condition)
     thrust: float | None
+    reference_condition: tuple[float, float]  # (Mach, altitude [m])
+    reference_mass_flow: float | None
     specific_thrust: float | None
     specific_thrust_range: tuple[float, float] | None
     specific_thrust_status: str
@@ -153,6 +170,7 @@ def size_engine(
     n_inlets: int = DEFAULT_N_INLETS,
     face_mach_range: tuple[float, float] = DEFAULT_FACE_MACH_RANGE,
     reference_thrust: float | None = None,
+    reference_thrust_condition: tuple[float, float] = DEFAULT_REFERENCE_THRUST_CONDITION,
     specific_thrust_range: tuple[float, float] | None = None,
 ) -> SizingResult:
     if face_diameter <= 0.0:
@@ -169,25 +187,24 @@ def size_engine(
         raise ValueError("capture_margin must be positive")
     if n_inlets < 1:
         raise ValueError("n_inlets must be at least 1")
+    ref_mach, ref_altitude = reference_thrust_condition
+    if ref_mach < 0.0:
+        raise ValueError("reference_thrust_condition Mach must be non-negative")
 
     # ISA, free stream, total conditions
-    T, p, rho = isa(altitude)
-    V = mach * math.sqrt(GAMMA * R_AIR * T)
-    ram = 1.0 + 0.5 * (GAMMA - 1.0) * mach**2
-    T0 = T * ram
-    p0 = p * ram ** (GAMMA / (GAMMA - 1.0))
+    T, p, rho, V, T0, p0 = flight_conditions(mach, altitude)
 
     # engine face and mass flow
     face_area = 0.25 * math.pi * face_diameter**2 * (1.0 - hub_to_tip_ratio**2)
     mc = corrected_flow_per_area * face_area
     p0_face = p0 * pressure_recovery
-    m = mc * (p0_face / P_REF) / math.sqrt(T0 / T_REF)
+    m = actual_mass_flow(mc, T0, p0, pressure_recovery)
 
     try:
         face_mach = mach_from_corrected_flux(corrected_flow_per_area)
     except ChokedFlowError as exc:
         mc_max = max_corrected_flux() * face_area
-        m_max = mc_max * (p0_face / P_REF) / math.sqrt(T0 / T_REF)
+        m_max = actual_mass_flow(mc_max, T0, p0, pressure_recovery)
         raise ChokedFlowError(
             f"engine face is choked: corrected flow {mc:.4g} kg/s ({corrected_flow_per_area:.4g} kg/s/m^2 over "
             f"{face_area:.4g} m^2) exceeds the maximum {mc_max:.4g} kg/s ({max_corrected_flux():.4g} kg/s/m^2). "
@@ -205,14 +222,20 @@ def size_engine(
     if face_status == "WARN":
         msgs.append(f"face Mach {face_mach:.3f} outside the expected range {lo:g}-{hi:g}")
 
+    # The thrust rating belongs to the reference condition, so divide by the mass flow there
+    # (same corrected flow per area and pressure recovery), not by the design-point mass flow.
     specific = None
+    m_ref = None
     st_status = "SKIPPED"
     if reference_thrust is not None and specific_thrust_range is not None:
-        specific = reference_thrust / m
+        _, _, _, _, T0_ref, p0_ref = flight_conditions(ref_mach, ref_altitude)
+        m_ref = actual_mass_flow(mc, T0_ref, p0_ref, pressure_recovery)
+        specific = reference_thrust / m_ref
         st_status = _check_range(specific, *specific_thrust_range)
         if st_status == "WARN":
             msgs.append(
-                f"specific thrust {specific:.1f} N/(kg/s) outside the range "
+                f"specific thrust {specific:.1f} N/(kg/s) at the reference condition "
+                f"(Mach {ref_mach:g}, {ref_altitude:g} m) outside the range "
                 f"{specific_thrust_range[0]:g}-{specific_thrust_range[1]:g}"
             )
     for msg in msgs:
@@ -244,6 +267,8 @@ def size_engine(
         capture_area_total=capture_total,
         capture_area_per_inlet=capture_total / n_inlets,
         thrust=reference_thrust,
+        reference_condition=(ref_mach, ref_altitude),
+        reference_mass_flow=m_ref,
         specific_thrust=specific,
         specific_thrust_range=tuple(specific_thrust_range) if specific_thrust_range is not None else None,
         specific_thrust_status=st_status,
@@ -256,6 +281,16 @@ def _require(section: dict, name: str, key: str):
     if value is None:
         raise ValueError(f"config value '{name}.{key}' is not set")
     return value
+
+
+def _reference_condition(section: dict | None) -> tuple[float, float]:
+    """(Mach, altitude) from engine.reference_thrust_condition; sea-level static when absent."""
+    if section is None:
+        return DEFAULT_REFERENCE_THRUST_CONDITION
+    return (
+        _require(section, "engine.reference_thrust_condition", "mach"),
+        _require(section, "engine.reference_thrust_condition", "altitude"),
+    )
 
 
 def size_from_config(cfg: dict) -> SizingResult:
@@ -274,6 +309,7 @@ def size_from_config(cfg: dict) -> SizingResult:
         n_inlets=ducts.get("n_inlets") or DEFAULT_N_INLETS,
         face_mach_range=tuple(eng.get("face_mach_range") or DEFAULT_FACE_MACH_RANGE),
         reference_thrust=eng.get("reference_thrust"),
+        reference_thrust_condition=_reference_condition(eng.get("reference_thrust_condition")),
         specific_thrust_range=(
             tuple(eng["specific_thrust_range"]) if eng.get("specific_thrust_range") is not None else None
         ),
@@ -321,8 +357,16 @@ def format_summary(r: SizingResult) -> str:
         rows.append(("Specific thrust", "SKIPPED (reference thrust or range not set)"))
     else:
         lo, hi = r.specific_thrust_range
+        ref_mach, ref_alt = r.reference_condition
+        rows.append(("Reference condition", f"Mach {ref_mach:.3f}, altitude {ref_alt:,.0f} m"))
+        rows.append(("Mass flow at reference", f"{r.reference_mass_flow:.3f} kg/s"))
         rows.append(("Reference thrust", f"{r.thrust:,.0f} N"))
-        rows.append(("Specific thrust", f"{r.specific_thrust:.1f} N/(kg/s)   [{r.specific_thrust_status}: expected {lo:g}-{hi:g}]"))
+        rows.append(
+            (
+                "Specific thrust",
+                f"{r.specific_thrust:.1f} N/(kg/s)   [{r.specific_thrust_status}: expected {lo:g}-{hi:g}]",
+            )
+        )
 
     width = max(len(a) for row in rows if row for a in row[:1]) + 2
     lines = ["=" * 74, "ENGINE AND CAPTURE-AREA SIZING", "=" * 74]
