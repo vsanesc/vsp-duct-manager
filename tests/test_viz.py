@@ -10,7 +10,7 @@ import pyvista as pv
 
 from ductmgr.explore_model import InletModel
 from ductmgr.config import load_config
-from ductmgr.viz import BACKGROUND, VIEWS, SceneView, load_scene
+from ductmgr.viz import BACKGROUND, ERROR_COLOR, VIEWS, SceneView, load_scene
 
 WINDOW = (640, 480)
 
@@ -32,7 +32,7 @@ def model_for(scene, example_env, placed=True):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
     if not placed:
-        cfg["ducts"]["inlet"]["centroid"] = None
+        cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["inlet"]["vertices"] = cfg["ducts"]["inlet"]["snapped"] = None
     return InletModel(scene, cfg, path, None)
 
 
@@ -151,8 +151,52 @@ def test_the_left_inlet_mirrors_the_right_one(plotter, scene, example_env):
     # each outline is closed by repeating its first point; the left one is the mirrored vertices in reverse order
     right = np.asarray(plotter.renderer.actors["inlet_right_edge"].GetMapper().GetInput().points)[:-1]
     left = np.asarray(plotter.renderer.actors["inlet_left_edge"].GetMapper().GetInput().points)[:-1]
-    assert left[::-1][:, 1] == pytest.approx(-right[:, 1], abs=1e-9)  # y negated exactly
-    assert left[::-1][:, [0, 2]] == pytest.approx(right[:, [0, 2]], abs=1e-9)
+    assert left[::-1][:, 1] == pytest.approx(-right[:, 1], abs=1e-6)  # y negated (float32 actor points)
+    assert left[::-1][:, [0, 2]] == pytest.approx(right[:, [0, 2]], abs=1e-6)
+
+
+def test_the_opening_is_drawn_on_the_inlet_plane(plotter, scene, example_env):
+    view = SceneView(plotter, scene)
+    model = model_for(scene, example_env)
+    view.update_inlet(model)
+    plane = model.state.plane
+    right = np.asarray(plotter.renderer.actors["inlet_right_edge"].GetMapper().GetInput().points)[:-1]
+    assert (right - plane.origin) @ plane.normal == pytest.approx(np.zeros(len(right)), abs=1e-5)  # in the plane
+    assert right == pytest.approx(plane.to_3d(model.opening.outline), abs=1e-5)  # at the sketched (u, v)
+
+
+def test_the_section_curve_and_the_plane_frame_are_drawn(plotter, scene, example_env):
+    view = SceneView(plotter, scene)
+    model = model_for(scene, example_env)
+    view.update_inlet(model)
+    acts = plotter.renderer.actors
+    for name in ("section_curve", "frame_u", "frame_v", "frame_n"):
+        assert name in acts
+    section = np.asarray(acts["section_curve"].GetMapper().GetInput().points)
+    plane = model.state.plane
+    assert (section - plane.origin) @ plane.normal == pytest.approx(np.zeros(len(section)), abs=1e-5)
+    assert len(section) == len(model.section.points) + 1  # a closed loop
+    for name, axis in zip(("frame_u", "frame_v", "frame_n"), plane.frame()):  # arrows start at O along u, v, n
+        pts = np.asarray(acts[name].GetMapper().GetInput().points)
+        along = (pts - plane.origin) @ axis
+        assert along.min() == pytest.approx(0.0, abs=1e-5)  # the arrow starts at the origin...
+        assert along.max() > 0.05  # ...and points along its axis
+        across = np.linalg.norm((pts - plane.origin) - np.outer(along, axis), axis=1)
+        assert across.max() < 0.05  # a thin arrow: nothing strays sideways
+
+
+def test_an_invalid_opening_is_drawn_red(plotter, scene, example_env):
+    view = SceneView(plotter, scene)
+    model = model_for(scene, example_env)
+    view.update_inlet(model)
+    ok_colour = plotter.renderer.actors["inlet_right_edge"].GetProperty().GetColor()
+    model.drag_vertex(0, (model.state.vertices[0][0], -0.8), snap_tolerance=None)  # inside the fuselage
+    assert not model.valid
+    view.update_inlet(model)
+    red = tuple(int(ERROR_COLOR[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    for name in ("inlet_right_edge", "inlet_right_fill", "inlet_left_edge", "inlet_left_fill"):
+        assert plotter.renderer.actors[name].GetProperty().GetColor() == pytest.approx(red, abs=1e-3)
+    assert ok_colour != pytest.approx(red, abs=1e-3)
 
 
 def test_visibility_toggles(plotter, scene):

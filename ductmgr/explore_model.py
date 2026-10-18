@@ -3,61 +3,85 @@
 
 """State of the inlet explorer, independent of any GUI toolkit.
 
-Holds the inlet definition (picked point, shape, tilt, skin fit), the fitted outline, the undo/redo history,
-the place-mode state machine, the lock, the dirty flag and save/revert. The Qt window and the headless
+Holds the inlet plane and the 5-vertex section sketch (vertices in the plane's (u, v), snapped flags), the
+section curve and the evaluated opening, one undo/redo history shared by the 3D view, the panel and the
+sketcher, the place-mode state machine, the lock, the dirty flag and save/revert. The Qt window and the headless
 screenshot both drive this class, so everything that matters is testable without a display.
 """
 import time
 import warnings
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
-from ductmgr import vspio
+from ductmgr import sketch
 from ductmgr.config import PRIVATE_CONFIG, load_config, save_inlet_definition
 from ductmgr.engine import EngineSizingWarning, size_from_config
-from ductmgr.geometry import DEFAULT_TILT_DEG, InletShape, inlet_frame, inlet_readout
-from ductmgr.skinfit import AREA_TOLERANCE, DEFAULT_SKIN_FIT, InletOutline, fit_inlet, validate_mode
+from ductmgr.geometry import InletPlane, inlet_readout
+from ductmgr.section import Section, align_sweep_to_chine, compute_section
 
 UNDO_LIMIT = 200  # history entries kept (the requirement is at least 50)
-MERGE_WINDOW_S = 0.8  # consecutive edits of one parameter within this window share one undo step
-GAP_PASS = 1e-3  # m: skin gap below which the skin contact is shown as PASS
-
-SHAPE_KEYS = tuple(f.name for f in fields(InletShape))
-PARAM_KEYS = SHAPE_KEYS + ("tilt_deg", "skin_fit")
+MERGE_WINDOW_S = 0.8  # consecutive edits of one parameter / vertex within this window share one undo step
+PLANE_KEYS = ("pitch_deg", "sweep_deg")
 
 MODE_VIEW, MODE_PLACING = "view", "placing"
 MODE_TEXT = {MODE_VIEW: "View", MODE_PLACING: "Placing inlet - click on fuselage, Esc to cancel"}
+
+LEGACY_INLET_KEYS = ("shape", "skin_fit", "attach_point", "centroid", "normal", "tilt_deg", "station_x", "polygon")
 
 
 @dataclass(frozen=True)
 class InletState:
     """Everything the undo history tracks."""
 
-    base_point: tuple[float, float, float] | None  # the picked / typed point; the centroid is its skin snap
-    shape: InletShape
-    tilt_deg: float
-    skin_fit: str
+    plane: InletPlane | None  # None until an inlet has been placed
+    vertices: tuple[tuple[float, float], ...] | None  # 5 (u, v) pairs, right inlet
+    snapped: tuple[bool, ...]
 
 
 @dataclass(frozen=True)
 class Readout:
     label: str
     value: str
-    level: str = "info"  # "info", "pass" or "warn"
+    level: str = "info"  # "info", "pass", "warn" or "error"
+
+
+# ---- config <-> state -----------------------------------------------------------------------------------------
+def legacy_notice(cfg: dict) -> str:
+    """One line naming old ducts.inlet keys that are ignored; empty when there are none."""
+    inlet = ((cfg.get("ducts") or {}).get("inlet")) or {}
+    old = [k for k in LEGACY_INLET_KEYS if inlet.get(k) is not None]
+    if not old:
+        return ""
+    return (f"ducts.inlet: ignoring old key(s) {', '.join(old)}; the inlet is now origin, pitch_deg, sweep_deg, "
+            "vertices and snapped")
 
 
 def state_from_config(cfg: dict) -> InletState:
     inlet = ((cfg.get("ducts") or {}).get("inlet")) or {}
-    centroid = inlet.get("centroid")
-    tilt = inlet.get("tilt_deg")
-    return InletState(
-        base_point=tuple(float(v) for v in centroid) if centroid is not None else None,
-        shape=InletShape.from_dict(inlet.get("shape")),
-        tilt_deg=DEFAULT_TILT_DEG if tilt is None else float(tilt),
-        skin_fit=validate_mode(inlet.get("skin_fit") or DEFAULT_SKIN_FIT),
+    origin = inlet.get("origin")
+    if origin is None:
+        return InletState(None, None, (False,) * sketch.N_VERTICES)
+    if not (isinstance(origin, (list, tuple)) and len(origin) == 3):
+        raise ValueError("ducts.inlet.origin must be [x, y, z]")
+    plane = InletPlane(
+        tuple(float(c) for c in origin), float(inlet.get("pitch_deg") or 0.0), float(inlet.get("sweep_deg") or 0.0)
     )
+    plane.frame()  # validates the angles
+    raw = inlet.get("vertices")
+    if raw is None:
+        return InletState(plane, None, (False,) * sketch.N_VERTICES)
+    if not (isinstance(raw, (list, tuple)) and len(raw) == sketch.N_VERTICES
+            and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in raw)):
+        raise ValueError(f"ducts.inlet.vertices must be {sketch.N_VERTICES} [u, v] pairs")
+    flags = inlet.get("snapped")
+    if flags is None:
+        flags = [False] * sketch.N_VERTICES
+    if not (isinstance(flags, (list, tuple)) and len(flags) == sketch.N_VERTICES
+            and all(isinstance(f, bool) for f in flags)):
+        raise ValueError(f"ducts.inlet.snapped must be {sketch.N_VERTICES} true/false values")
+    return InletState(plane, tuple((float(u), float(v)) for u, v in raw), tuple(flags))
 
 
 class InletModel:
@@ -72,15 +96,18 @@ class InletModel:
         self._future: list[InletState] = []
         self._last_key: str | None = None
         self._last_time = -1e9
+        self._section_cache: tuple[InletPlane, Section | None] | None = None
         self.mode = MODE_VIEW
         self.locked = False
         self.message = ""
-        self.centroid: np.ndarray | None = None
-        self.surface_normal: np.ndarray | None = None
-        self.on_surface = True
-        self.fit: InletOutline | None = None
-        self.state = state_from_config(cfg)
-        self.saved_state = self.state
+        self.notice = legacy_notice(cfg)
+        self.section: Section | None = None
+        self.opening: sketch.Opening | None = None
+        loaded = state_from_config(cfg)
+        self.state = self._normalised(loaded)
+        # a state completed here (resnapped to the section, default sketch added) differs from the file only
+        # by rounding: the file is the saved state unless a sketch had to be created
+        self.saved_state = self.state if loaded.vertices is not None or loaded.plane is None else loaded
         self._recompute()
 
     # ---- observers ---------------------------------------------------------------------------------
@@ -100,6 +127,18 @@ class InletModel:
         return self.scene.sizing.capture_area_per_inlet
 
     @property
+    def plane(self) -> InletPlane | None:
+        return self.state.plane
+
+    @property
+    def placed(self) -> bool:
+        return self.state.plane is not None
+
+    @property
+    def valid(self) -> bool:
+        return self.opening is not None and self.opening.valid
+
+    @property
     def dirty(self) -> bool:
         return self.state != self.saved_state
 
@@ -112,24 +151,50 @@ class InletModel:
         return bool(self._future)
 
     @property
+    def can_save(self) -> bool:
+        return self.save_target is not None and self.valid
+
+    @property
     def mode_text(self) -> str:
         return MODE_TEXT[self.mode]
 
+    @property
+    def opening_centroid(self) -> np.ndarray | None:
+        """3D centroid of the opening."""
+        if self.opening is None:
+            return None
+        return self.state.plane.to_3d([self.opening.centroid_uv])[0]
+
+    def left_vertices(self):
+        """The left inlet's vertices and flags (mirror image of the right one)."""
+        from ductmgr.geometry import mirror_vertices
+
+        return mirror_vertices(self.state.vertices, self.state.snapped)
+
+    def _section_for(self, plane: InletPlane) -> Section | None:
+        if self._section_cache is None or self._section_cache[0] != plane:
+            self._section_cache = (plane, compute_section(self.scene.fuselage, plane))
+        return self._section_cache[1]
+
+    def _normalised(self, state: InletState) -> InletState:
+        """Snapped vertices put exactly on the current section; a default sketch if there is none yet."""
+        if state.plane is None:
+            return state
+        section = self._section_for(state.plane)
+        if state.vertices is None:
+            verts, flags = sketch.default_sketch(section, state.plane, self.area)
+        else:
+            verts, flags = sketch.resnap(state.vertices, state.snapped, section)
+        return replace(state, vertices=verts, snapped=flags)
+
     def _recompute(self) -> None:
         st = self.state
-        if st.base_point is None:
-            self.centroid = self.surface_normal = self.fit = None
-            self.on_surface = True
+        if st.plane is None:
+            self.section = self.opening = None
             return
-        x, y, z = st.base_point
-        snapped = vspio.snap_to_surface(self.scene.fuselage, x, abs(y), z)
-        self.on_surface = snapped is not None
-        if snapped is None:  # the vertical line through (x, y) misses the fuselage: keep the given height
-            self.centroid = np.array([x, abs(y), z])
-            self.surface_normal = vspio.surface_normal(self.scene.fuselage, self.centroid)
-        else:
-            self.centroid, self.surface_normal = snapped
-        self.fit = fit_inlet(self.scene.fuselage, self.centroid, st.tilt_deg, st.shape, self.area, st.skin_fit)
+        self.section = self._section_for(st.plane)
+        self.opening = (sketch.evaluate(st.vertices, st.snapped, self.section, st.plane, self.area)
+                        if st.vertices is not None else None)
 
     # ---- history ----------------------------------------------------------------------------------------
     def _commit(self, new: InletState, key: str | None = None) -> bool:
@@ -170,34 +235,76 @@ class InletModel:
         return True
 
     # ---- editing ----------------------------------------------------------------------------------------------
-    def set_param(self, key: str, value) -> bool:
-        """Change a shape ratio, the tilt or the skin-fit mode. Returns True when something changed."""
-        st = self.state
-        if key in SHAPE_KEYS:
-            new = replace(st, shape=replace(st.shape, **{key: float(value)}))
-        elif key == "tilt_deg":
-            new = replace(st, tilt_deg=float(value))
-        elif key == "skin_fit":
-            new = replace(st, skin_fit=validate_mode(value))
-        else:
-            raise KeyError(key)
-        changed = self._commit(new, key)
+    def _changed(self, changed: bool, text: str = "") -> bool:
         if changed:
-            self._say("")
+            self._say(text)
             self._notify()
         return changed
 
-    def set_position(self, x: float, y: float, z: float) -> bool:
-        """Move the inlet to (x, y, z); it snaps to the skin nearest that height. Blocked while locked."""
+    def _with_plane(self, plane: InletPlane, key: str | None) -> bool:
+        """Move / rotate the plane: the sketch keeps its (u, v) and snapped vertices follow the new section."""
+        plane.frame()  # validates the angles before anything changes
+        if plane == self.state.plane:
+            return False
+        base = replace(self.state, plane=plane)
+        return self._commit(self._normalised(base), key)
+
+    def set_param(self, key: str, value) -> bool:
+        """Change the pitch or the sweep (degrees)."""
+        if key not in PLANE_KEYS:
+            raise KeyError(key)
+        if self.state.plane is None:
+            raise ValueError("place the inlet first")
+        return self._changed(self._with_plane(replace(self.state.plane, **{key: float(value)}), key))
+
+    def set_origin(self, x: float, y: float, z: float) -> bool:
+        """Move the plane origin (the right inlet keeps y >= 0). Blocked while locked."""
         if self.locked:
             self._say("Inlet is locked")
             self._notify()
             return False
-        changed = self._commit(replace(self.state, base_point=(float(x), abs(float(y)), float(z))), "position")
-        if changed:
-            self._say("")
+        old = self.state.plane
+        plane = InletPlane((float(x), abs(float(y)), float(z)), old.pitch_deg if old else 0.0,
+                           old.sweep_deg if old else 0.0)
+        return self._changed(self._with_plane(plane, "origin"))
+
+    def drag_vertex(self, index: int, uv, snap_tolerance: float | None) -> bool:
+        """Move vertex ``index`` to ``uv``; it snaps onto the section curve within ``snap_tolerance`` metres
+        (None disables snapping) and unsnaps when dropped further away."""
+        if self.state.vertices is None:
+            return False
+        point, flag = sketch.snap_point(self.section, uv, snap_tolerance)
+        verts = list(self.state.vertices)
+        flags = list(self.state.snapped)
+        verts[index], flags[index] = point, flag
+        new = replace(self.state, vertices=tuple(verts), snapped=tuple(flags))
+        return self._changed(self._commit(new, f"vertex{index}"))
+
+    def fit_area(self) -> bool:
+        """Scale only the free vertices so the projected area matches the capture area target."""
+        if self.state.vertices is None:
+            return False
+        verts, ok, message = sketch.fit_area(self.state.vertices, self.state.snapped, self.section,
+                                             self.state.plane, self.area)
+        self._commit(replace(self.state, vertices=verts))
+        self._say(message)
+        self._notify()
+        return ok
+
+    def align_to_chine(self) -> bool:
+        """Set the sweep so the opening's u axis is parallel to the local chine line (planform)."""
+        if self.state.plane is None:
+            return False
+        found = align_sweep_to_chine(self.scene.fuselage, self.state.plane.origin)
+        if found is None:
+            self._say("No chine found near the origin")
             self._notify()
-        return changed
+            return False
+        sweep, (dx, dy) = found
+        self._with_plane(replace(self.state.plane, sweep_deg=sweep), None)
+        self._say(f"Aligned to the chine: sweep {sweep:.2f} deg")
+        self._notify()
+        return True
 
     # ---- place mode -----------------------------------------------------------------------------------------------
     def begin_place(self) -> bool:
@@ -222,11 +329,15 @@ class InletModel:
         return self.cancel_place() if self.mode == MODE_PLACING else self.begin_place()
 
     def handle_click(self, point) -> bool:
-        """A click on the fuselage. Ignored unless in place mode; places the inlet and leaves place mode."""
+        """A click on the fuselage. Ignored unless in place mode; places the plane origin there (creating the
+        default sketch the first time) and leaves place mode."""
         if self.mode != MODE_PLACING:
             return False
         p = np.asarray(point, dtype=float)
-        self._commit(replace(self.state, base_point=(float(p[0]), abs(float(p[1])), float(p[2]))))
+        old = self.state.plane
+        plane = InletPlane((float(p[0]), abs(float(p[1])), float(p[2])), old.pitch_deg if old else 0.0,
+                           old.sweep_deg if old else 0.0)
+        self._with_plane(plane, None)
         self.mode = MODE_VIEW
         self._say("Inlet placed")
         self._notify()
@@ -242,15 +353,15 @@ class InletModel:
     # ---- save / revert -----------------------------------------------------------------------------------------------
     def inlet_definition(self) -> dict | None:
         """What Save writes to ``ducts.inlet``; None until an inlet has been placed."""
-        if self.centroid is None:
+        st = self.state
+        if st.plane is None or st.vertices is None:
             return None
-        _, _, normal = inlet_frame(self.state.tilt_deg)
         return {
-            "centroid": [float(v) for v in self.centroid],
-            "normal": [float(v) for v in normal],
-            "tilt_deg": float(self.state.tilt_deg),
-            "skin_fit": self.state.skin_fit,
-            "shape": self.state.shape.to_dict(),
+            "origin": [float(c) for c in st.plane.origin],
+            "pitch_deg": float(st.plane.pitch_deg),
+            "sweep_deg": float(st.plane.sweep_deg),
+            "vertices": [[float(u), float(v)] for u, v in st.vertices],
+            "snapped": [bool(f) for f in st.snapped],
         }
 
     def save(self) -> bool:
@@ -259,6 +370,8 @@ class InletModel:
             self._say(f"Not saved: the example config is read-only. Copy it to {PRIVATE_CONFIG.name}.")
         elif definition is None:
             self._say("Nothing to save: place an inlet first.")
+        elif not self.valid:
+            self._say(f"ERROR: not saved: {self.opening.errors[0]}")
         else:
             try:
                 path = save_inlet_definition(definition, self.save_target)
@@ -285,9 +398,12 @@ class InletModel:
             self._notify()
             return False
         self.scene.sizing = sizing
-        self._commit(stored)
-        self._recompute()  # the capture area may have changed even if the inlet did not
-        self.saved_state = stored
+        self.notice = legacy_notice(cfg)
+        self._section_cache = None  # the capture area (hence the default sketch) may have changed
+        normalised = self._normalised(stored)
+        self._commit(normalised)
+        self._recompute()
+        self.saved_state = normalised if stored.vertices is not None or stored.plane is None else stored
         self.mode = MODE_VIEW
         self._say(f"Reverted to {self.config_path.name}.")
         self._notify()
@@ -295,7 +411,7 @@ class InletModel:
 
     # ---- readouts -------------------------------------------------------------------------------------------------------
     def readouts(self) -> list[Readout]:
-        """Lines for the read-only panel; ``level`` drives the colour (WARN amber, PASS green)."""
+        """Lines for the read-only panel; ``level`` drives the colour (PASS green, WARN amber, ERROR red)."""
         out: list[Readout] = []
         check = self.scene.engine_check
         # the engine check has its own line; keep it out of the generic warning list
@@ -305,28 +421,35 @@ class InletModel:
                                f"{check.face_diameter:.4f} / {check.envelope_diameter:.4f} m = {check.ratio:.3f} "
                                f"[{check.status}: {check.ratio_range[0]:g}-{check.ratio_range[1]:g}]",
                                "pass" if check.status == "PASS" else "warn"))
-        if self.fit is None:
+        tail = [Readout("", w, "warn") for w in notes]
+        if self.notice:
+            tail.append(Readout("", self.notice, "warn"))
+        if self.opening is None:
             out.append(Readout("Inlet", "not placed - use Place inlet (P)"))
-            out += [Readout("", w, "warn") for w in notes]
-            return out
+            return out + tail
 
-        fit, c = self.fit, self.centroid
-        err = fit.area_error
-        area_level = "info" if fit.mode == "none" else ("pass" if abs(err) <= AREA_TOLERANCE else "warn")
+        op, plane = self.opening, self.state.plane
+        x, y, z = plane.origin
+        within = abs(op.delta) <= sketch.AREA_TOLERANCE
         out += [
-            Readout("Centroid", f"{c[0]:.4f} {c[1]:.4f} {c[2]:.4f} m", "info" if self.on_surface else "warn"),
-            Readout("Capture area target", f"{fit.target_area:.5f} m^2"),
-            Readout("Capture area actual", f"{fit.area:.5f} m^2 ({100 * err:+.2f} %)", area_level),
-            Readout("Skin fit", fit.mode),
-            Readout("Max skin gap", f"{fit.max_gap:.4f} m",
-                    "info" if fit.mode == "none" else ("pass" if fit.max_gap <= GAP_PASS else "warn")),
-            Readout("Opening height", "n/a (flush)" if fit.mode == "flush" else f"{fit.opening_height:.4f} m"),
+            Readout("Origin x y z", f"{x:.4f} {y:.4f} {z:.4f} m"),
+            Readout("Pitch / sweep", f"{plane.pitch_deg:.2f} / {plane.sweep_deg:.2f} deg"),
+            Readout("|n.X|", f"{op.projection_factor:.3f}",
+                    "warn" if op.projection_factor < sketch.MIN_PROJECTION else "info"),
+            Readout("Area in plane", f"{op.area_plane:.5f} m^2"),
+            Readout("Area projected", f"{op.area_projected:.5f} m^2 ({100 * op.delta:+.2f} %)",
+                    "pass" if within else "warn"),
+            Readout("Area target", f"{op.target_area:.5f} m^2"),
+            Readout("Snapped edge length", f"{op.snapped_length:.4f} m"),
+            Readout("Free-edge clearance",
+                    "n/a" if op.clearance is None else f"{op.clearance:.4f} m",
+                    "info" if op.clearance is None else ("pass" if op.clearance >= 0 else "error")),
         ]
         face = self.scene.face_center
         if face is None:
             out.append(Readout("Engine face", "unknown: no distance / offset readout", "warn"))
         else:
-            r = inlet_readout(c, face, fit.uv, fit.area)
+            r = inlet_readout(self.opening_centroid, face, op.outline, op.area_projected)
             out += [
                 Readout("Aspect ratio (w/h)", f"{r.aspect_ratio:.3f}"),
                 Readout("Distance to face", f"{r.distance_to_face:.4f} m"),
@@ -335,6 +458,6 @@ class InletModel:
                         f"{r.offset_over_length:.3f}" if r.length > 0 else "n/a (face not aft)",
                         "info" if r.length > 0 else "warn"),
             ]
-        out += [Readout("", w, "warn") for w in notes]
-        out += [Readout("", f"WARN {w}", "warn") for w in fit.warnings]
-        return out
+        out += [Readout("", f"ERROR: {e}", "error") for e in op.errors]
+        out += [Readout("", f"WARN {w}", "warn") for w in op.warnings if "from the target" not in w]
+        return out + tail

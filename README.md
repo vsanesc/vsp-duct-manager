@@ -100,39 +100,60 @@ Run the tests (they use only hard-coded values and the example config):
 
 The viewer reads the fuselage, engine and every other component straight from the `.vsp3` through the
 OpenVSP API (a temporary set and a temporary STL, both removed afterwards; the model is never written). It is a
-Qt window (PySide6 + pyvistaqt) with the 3D view in the centre and a compact dark panel on the right; nothing is
-drawn inside the 3D view except the scene itself (translucent fuselage, other components as grey context, the
-engine, the engine-face disc and the inlets).
+Qt window (PySide6 + pyvistaqt): the 3D view in the centre, the **section sketcher** docked on the left and a
+compact dark panel on the right. Nothing is drawn inside the 3D view except the scene itself (translucent
+fuselage, other components as grey context, the engine, the engine-face disc and the inlets).
+
+**The inlet plane.** The opening is drawn in a plane defined by an origin `O` (on or near the skin) and two angles:
+`pitch_deg` (rotation about Y, the opening tilted up for positive values) and `sweep_deg` (rotation about Z, the
+opening swept in planform). The plane normal, facing the freestream, is `n = Rz(sweep) . Ry(pitch) . (-X)`, so
+both angles 0 is the plane x = const facing forward. In the plane, `v` is the component of +Z orthogonal to `n`
+and `u = v x n` (seen from the front, `u` to the right and `v` up, so the aircraft's +Y side is on the left). All
+sketch vertices are stored as `(u, v)` in metres relative to `O`, never as `(y, z)`. The left inlet is the exact
+mirror image of the right one about XZ (origin mirrored, sweep negated, `u` negated). The capture area is the
+opening area projected normal to the freestream, `area_in_plane * |n . X|`; the readouts show both, and warn when
+`|n . X| < 0.5` (the opening is more than 60 degrees off the flow). **Align to chine** looks at the chine line
+nearest `O` in planform and sets the sweep so the opening's `u` axis is parallel to it; the sweep stays editable.
+(A chine running along X gives a sweep of 90 degrees, a plane parallel to the flow, which the `|n . X|` warning
+flags; the alignment is meant for chines swept well away from X.)
+
+**The sketcher.** The curve where the plane cuts the fuselage skin is computed in `(u, v)`, with chine corners
+(turning angle above 30 degrees) marked. The opening is a 5-vertex polygon that you drag with the mouse:
+
+- A vertex dropped within 12 pixels of the section curve **snaps** onto it (drawn filled); drag it away to
+  unsnap, or hold `Alt` to disable snapping.
+- An edge whose two end vertices are both snapped **follows the section curve** between them (the shorter arc,
+  chine corners included), drawn in the accent colour. Every other edge is a straight line.
+- Live readouts: the projected area against the Phase 1 target, the snapped edge length and the minimum clearance
+  of the free edges above the skin. **Fit area** scales only the free vertices about the centre of the snapped
+  edge until the area matches the target (within 0.5 %); the snapped vertices never move.
+- If any part of the opening lies inside the fuselage section the outline turns red, the readout says ERROR and
+  **Save is disabled**.
+- The mirrored left inlet is shown greyed, with the symmetry plane y = 0, a grid and a scale bar. The wheel zooms
+  and a middle-drag pans.
+
+The 3D view draws both openings on their planes, the section curve and the plane's `u`/`v`/`n` arrows at `O`.
+
+Other controls:
 
 - **Placement is explicit.** Clicking the geometry does nothing by default. Press **Place inlet** (`P`): the next
-  click on the fuselage places the right inlet (the left one is its mirror image about XZ; a click on the left
+  click on the fuselage sets the plane origin there (creating a default sketch the first time; a click on the left
   side is mirrored onto the right) and place mode switches itself off. `Esc` cancels. The status bar shows
   `View` or `Placing inlet - click on fuselage, Esc to cancel`. Dragging still rotates the camera.
-- **Lock inlet** disables placement and nudges.
-- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) cover every change, placement and parameters alike (up to 200 steps;
-  rapid edits of one value merge into one step).
-- **Panel** (collapsible groups): position x/y/z with a nudge-step selector (the inlet snaps to the skin), the
-  shape ratios `width_bottom`, `width_top`, `height`, `apex_height` (0 gives a quadrilateral) and `skew`, the
-  tilt, the skin-fit mode, and read-only monospace readouts: centroid, capture area target vs actual, aspect
-  ratio, distance to the face, (dy, dz) offset, offset/length, maximum skin gap, opening height and the engine
-  face/envelope check, with WARN in amber and PASS in green. Spin boxes take the mouse wheel only while focused.
+- **Lock inlet** disables placement and nudges (the origin).
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) cover every change, placement, origin, angles and sketch drags alike (up
+  to 200 steps; a drag or rapid edits of one value merge into one step).
+- **Panel**: origin x/y/z with a nudge-step selector, pitch, sweep, Align to chine, and read-only monospace
+  readouts with PASS in green, WARN in amber and ERROR in red. Spin boxes take the mouse wheel only while focused.
 - **Save to config** (`Ctrl+S`) writes the inlet into `duct_config.yaml`, keeping its comments and every other
   key; **Revert to saved** re-reads it. The title bar shows `*` while there are unsaved changes, and closing the
   window then asks first.
-- **View** toolbar: side / top / front / iso (`1`-`4`), and toggles for the context components and the engine
-  envelope.
+- **View** toolbar: side / top / front / iso (`1`-`4`), toggles for the context components, the engine envelope
+  and the sketcher dock.
 
-The polygon is always scaled to the per-inlet capture area from the sizing step.
-
-**Skin fit** (`ducts.inlet.skin_fit`): `none` is the planar polygon centred on the clicked point. `bottom_edge`
-(the example default) keeps the outline planar but replaces its bottom edge with the curve where the inlet plane
-cuts the fuselage skin, so the opening sits on the skin; the other vertices keep the shape ratios above it.
-`flush` projects the whole outline onto the skin along the inlet axis (a non-planar outline) and always warns that
-a flush inlet means low pressure recovery and boundary-layer ingestion. For `bottom_edge` and `flush` the shape is
-scaled iteratively until the outline area projected normal to the freestream matches the per-inlet capture area
-(within 0.5 %). A flush outline on skin that is almost parallel to the freestream has almost no frontal area, so
-the fit can fail there; the viewer says so. The readout shows the mode, the maximum gap between outline and skin,
-and the opening height above the skin.
+The config stores the inlet as `ducts.inlet.origin` `[x, y, z]`, `pitch_deg`, `sweep_deg`, `vertices` (five
+`[u, v]` pairs) and `snapped` (five booleans). Older keys (`shape`, `skin_fit`, `centroid`, `normal`, `tilt_deg`,
+`attach_point`, `station_x`, `polygon`) are ignored with a one-line notice.
 
 The engine face is centred on the front (min-x) end of the Geom named by `engine.geom_name`. Its diameter is
 `engine.face_diameter` from the config (the fan); the Geom's bounding box is only the engine envelope (casing),

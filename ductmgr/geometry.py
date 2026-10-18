@@ -1,80 +1,98 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Víctor Sánchez Escalante
 
-"""Inlet shape and placement (Phase 2: shape only, no ducts yet).
+"""The inlet plane and 2D polygon helpers.
 
-The inlet is an irregular pentagon (or a quadrilateral) described by ratios, scaled so its area equals
-the per-inlet capture area. 2D coordinates are (u, v): u is lateral (+Y, outboard for the right inlet) and
-v is "up" in the inlet plane. With flow direction f = -n (n is the outward plane normal facing the
-freestream), (u, v, f) is right-handed, so the vertex order is counter-clockwise seen looking upstream.
+The inlet plane is defined by an origin O and two angles. With ``pitch`` (rotation about Y, opening tilted up
+for positive values) and ``sweep`` (rotation about Z), the outward normal, facing the freestream, is
+
+    n = R_z(sweep) . R_y(pitch) . (-X)
+
+so pitch = sweep = 0 is the plane x = const facing forward. The in-plane basis is v = the component of +Z
+orthogonal to n (normalised) and u = v x n. Seen from the front, looking along -n towards the opening, u is to
+the right and v is up (so the aircraft's +Y side appears on the left). Every sketch vertex is stored as (u, v)
+in metres relative to O; (y, z) is never stored.
+
+The left inlet is the mirror image of the right one about the XZ plane: mirror O, negate sweep, and negate u
+of every vertex (mirroring flips handedness, so the vertex order is reversed to stay counter-clockwise).
 
 Units: metres. VSP axes: +X aft, +Y right, +Z up.
 """
 import math
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass
 
 import numpy as np
 
-# Shape used when the config has no ``ducts.inlet.shape`` yet. Only the ratios matter.
-DEFAULT_SHAPE = {
-    "width_bottom": 1.0,
-    "width_top": 0.7,
-    "height": 1.0,
-    "apex_height": 0.3,
-    "skew": 0.0,
-}
-DEFAULT_TILT_DEG = 0.0
+FREESTREAM = np.array([1.0, 0.0, 0.0])  # air moves aft (+X) relative to the aircraft
+MAX_PITCH_DEG = 89.0  # the frame is singular at +-90 deg (v is undefined)
+
+
+def plane_frame(pitch_deg: float, sweep_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Orthonormal in-plane axes (u, v) and the outward normal n (facing the freestream)."""
+    if abs(pitch_deg) > MAX_PITCH_DEG:
+        raise ValueError(f"|pitch| must be at most {MAX_PITCH_DEG:g} deg (the in-plane frame is singular at 90)")
+    t, s = math.radians(pitch_deg), math.radians(sweep_deg)
+    n = np.array([-math.cos(t) * math.cos(s), -math.cos(t) * math.sin(s), math.sin(t)])
+    z = np.array([0.0, 0.0, 1.0])
+    v = z - np.dot(z, n) * n
+    v /= np.linalg.norm(v)
+    u = np.cross(v, n)
+    return u, v, n
 
 
 @dataclass(frozen=True)
-class InletShape:
-    """Shape ratios of the inlet polygon (absolute size comes from the capture area).
+class InletPlane:
+    origin: tuple[float, float, float]
+    pitch_deg: float = 0.0
+    sweep_deg: float = 0.0
 
-    width_bottom, width_top, height : relative sizes of the bottom edge, top edge and body height.
-    apex_height : height of the 5th vertex above the top edge, as a fraction of ``height``;
-                  0 gives a quadrilateral.
-    skew        : lateral offset of the apex, as a fraction of ``width_top`` (+ = toward +u).
-    """
-
-    width_bottom: float = DEFAULT_SHAPE["width_bottom"]
-    width_top: float = DEFAULT_SHAPE["width_top"]
-    height: float = DEFAULT_SHAPE["height"]
-    apex_height: float = DEFAULT_SHAPE["apex_height"]
-    skew: float = DEFAULT_SHAPE["skew"]
-
-    def __post_init__(self):
-        for name in ("width_bottom", "width_top", "height"):
-            if not getattr(self, name) > 0.0:
-                raise ValueError(f"inlet shape '{name}' must be positive")
-        if self.apex_height < 0.0:
-            raise ValueError("inlet shape 'apex_height' must be >= 0")
-
-    @classmethod
-    def from_dict(cls, data: dict | None) -> "InletShape":
-        """Build from a config mapping; missing or null keys take the defaults."""
-        data = data or {}
-        known = {f.name for f in fields(cls)}
-        unknown = set(data) - known
-        if unknown:
-            raise ValueError(f"unknown inlet shape key(s): {', '.join(sorted(unknown))}")
-        return cls(**{k: float(v) for k, v in data.items() if v is not None})
-
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def frame(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return plane_frame(self.pitch_deg, self.sweep_deg)
 
     @property
-    def is_quadrilateral(self) -> bool:
-        return self.apex_height == 0.0
+    def normal(self) -> np.ndarray:
+        return self.frame()[2]
+
+    @property
+    def projection_factor(self) -> float:
+        """|n . X|: in-plane area times this is the area projected normal to the freestream."""
+        return abs(float(np.dot(self.normal, FREESTREAM)))
+
+    def to_3d(self, uv) -> np.ndarray:
+        """3D points of (u, v) coordinates, shape (N, 3)."""
+        u, v, _ = self.frame()
+        uv = np.atleast_2d(np.asarray(uv, dtype=float))
+        return np.asarray(self.origin) + np.outer(uv[:, 0], u) + np.outer(uv[:, 1], v)
+
+    def to_uv(self, points) -> np.ndarray:
+        """(u, v) of 3D points (orthogonal projection onto the plane), shape (N, 2)."""
+        u, v, _ = self.frame()
+        rel = np.atleast_2d(np.asarray(points, dtype=float)) - np.asarray(self.origin)
+        return np.c_[rel @ u, rel @ v]
+
+    def mirrored(self) -> "InletPlane":
+        """The left inlet's plane: origin mirrored about XZ, sweep negated."""
+        x, y, z = self.origin
+        return InletPlane((x, -y, z), self.pitch_deg, -self.sweep_deg)
 
 
+def mirror_vertices(vertices, flags=None):
+    """The left inlet's (u, v) vertices (and optional per-vertex flags): u negated, order reversed."""
+    mirrored = [(-float(u), float(v)) for u, v in vertices][::-1]
+    return mirrored if flags is None else (mirrored, list(flags)[::-1])
+
+
+# ---- 2D polygon helpers ---------------------------------------------------------------------------
 def polygon_area(poly: np.ndarray) -> float:
     """Signed area of a 2D polygon (positive when counter-clockwise), shoelace formula."""
+    poly = np.asarray(poly, dtype=float)
     x, y = poly[:, 0], poly[:, 1]
     return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(np.roll(x, -1), y))
 
 
 def polygon_centroid(poly: np.ndarray) -> np.ndarray:
     """Area centroid of a 2D polygon."""
+    poly = np.asarray(poly, dtype=float)
     x, y = poly[:, 0], poly[:, 1]
     xn, yn = np.roll(x, -1), np.roll(y, -1)
     cross = x * yn - xn * y
@@ -82,65 +100,9 @@ def polygon_centroid(poly: np.ndarray) -> np.ndarray:
     return np.array([np.dot(x + xn, cross) / a6, np.dot(y + yn, cross) / a6])
 
 
-def inlet_vertices(shape: InletShape) -> np.ndarray:
-    """(N, 2) counter-clockwise vertices of the shape at its own (unscaled) size, bottom edge at v = 0.
-
-    N is 4 for a quadrilateral (apex_height = 0) and 5 otherwise. Vertex order: bottom-left, bottom-right,
-    top-right, [apex], top-left.
-    """
-    wb, wt, h = shape.width_bottom, shape.width_top, shape.height
-    pts = [(-wb / 2, 0.0), (wb / 2, 0.0), (wt / 2, h)]
-    if not shape.is_quadrilateral:
-        pts.append((shape.skew * wt, h * (1.0 + shape.apex_height)))
-    pts.append((-wt / 2, h))
-    return np.array(pts, dtype=float)
-
-
-def inlet_polygon(shape: InletShape, area: float) -> np.ndarray:
-    """(N, 2) counter-clockwise vertices, centred on the area centroid, with area exactly ``area``."""
-    if not area > 0.0:
-        raise ValueError("inlet area must be positive")
-    poly = inlet_vertices(shape)
-    poly -= polygon_centroid(poly)
-    return poly * math.sqrt(area / polygon_area(poly))
-
-
-def inlet_frame(tilt_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Orthonormal in-plane axes (u, v) and outward plane normal n for a tilt about the Y axis.
-
-    tilt = 0 gives n = -X (facing the freestream) with v = +Z. Positive tilt pitches the opening upward
-    (n gains a +Z component) while the plane stays perpendicular to the XZ plane.
-    """
-    t = math.radians(tilt_deg)
-    n = np.array([-math.cos(t), 0.0, math.sin(t)])
-    u = np.array([0.0, 1.0, 0.0])
-    v = np.cross(u, n)
-    return u, v, n
-
-
-def place_polygon(poly: np.ndarray, centroid, tilt_deg: float) -> tuple[np.ndarray, np.ndarray]:
-    """3D vertices of the polygon in the inlet plane through ``centroid``, and the plane normal."""
-    u, v, n = inlet_frame(tilt_deg)
-    c = np.asarray(centroid, dtype=float)
-    return c + np.outer(poly[:, 0], u) + np.outer(poly[:, 1], v), n
-
-
-def mirror_xz(points: np.ndarray, reverse: bool = False) -> np.ndarray:
-    """Mirror points about the XZ plane (y -> -y). ``reverse`` also reverses the vertex order."""
-    out = np.array(points, dtype=float, copy=True)
-    out[..., 1] *= -1.0
-    return out[::-1].copy() if reverse else out
-
-
-def mirror_normal(normal) -> np.ndarray:
-    n = np.array(normal, dtype=float, copy=True)
-    n[1] *= -1.0
-    return n
-
-
 def aspect_ratio(poly: np.ndarray) -> float:
-    """Lateral width over total height of the polygon's bounding box."""
-    extent = poly.max(axis=0) - poly.min(axis=0)
+    """Width over height of the polygon's bounding box."""
+    extent = np.asarray(poly).max(axis=0) - np.asarray(poly).min(axis=0)
     return float(extent[0] / extent[1])
 
 
@@ -149,7 +111,7 @@ class InletReadout:
     centroid: tuple[float, float, float]
     capture_area: float
     aspect_ratio: float
-    distance_to_face: float  # straight-line distance, inlet centroid -> engine face centre
+    distance_to_face: float  # straight-line distance, opening centroid -> engine face centre
     dy: float  # lateral offset, inlet -> face
     dz: float  # vertical offset, inlet -> face
     offset: float  # hypot(dy, dz): distance of the inlet from the engine axis line

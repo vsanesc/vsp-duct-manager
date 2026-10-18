@@ -38,7 +38,6 @@ def load_config(path: Path | None = None) -> tuple[dict, Path]:
         return yaml.safe_load(f), path.resolve()
 
 
-INLET_FLOW_STYLE_KEYS = ("centroid", "normal")  # written as [x, y, z]
 SAVE_DECIMALS = 6
 
 
@@ -84,6 +83,27 @@ def save_inlet_definition(inlet: dict, target: Path | None = None) -> Path:
             parent[key] = CommentedMap()
         return parent[key]
 
+    def flow_seq(items):
+        seq = CommentedSeq(items)
+        seq.fa.set_flow_style()  # [a, b, c] on one line
+        return seq
+
+    def assign_list(slot, key, value):
+        """Set a list value. An existing list of the same shape is updated in place, which keeps its comments."""
+        existing = slot.get(key)
+        nested = bool(value) and all(isinstance(item, list) for item in value)
+        if isinstance(existing, CommentedSeq) and len(existing) == len(value):
+            for i, item in enumerate(value):
+                if nested and isinstance(existing[i], CommentedSeq) and len(existing[i]) == len(item):
+                    for j, x in enumerate(item):
+                        existing[i][j] = x
+                else:
+                    existing[i] = flow_seq(item) if isinstance(item, list) else item
+        elif nested:
+            slot[key] = CommentedSeq([flow_seq(item) for item in value])  # one [u, v] pair per line
+        else:
+            slot[key] = flow_seq(value)
+
     slot = mapping(mapping(doc, "ducts"), "inlet")
     for key, value in _round_values(inlet).items():
         if isinstance(value, dict):
@@ -91,9 +111,7 @@ def save_inlet_definition(inlet: dict, target: Path | None = None) -> Path:
             for k, v in value.items():
                 sub[k] = v
         elif isinstance(value, list):
-            seq = CommentedSeq(value)
-            seq.fa.set_flow_style()
-            slot[key] = seq
+            assign_list(slot, key, value)
         else:
             slot[key] = value
 

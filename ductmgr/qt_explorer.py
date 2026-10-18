@@ -1,49 +1,44 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Víctor Sánchez Escalante
 
-"""Qt window of the inlet explorer: the 3D view in the centre, a compact panel on the right.
+"""Qt window of the inlet explorer: the 3D view in the centre, the section sketcher docked on the left and a
+compact control panel on the right.
 
 The window only translates between widgets and ``explore_model.InletModel``; all state, history and rules
 live in the model. The 3D view (pyvistaqt ``QtInteractor``) draws no widgets of its own.
 """
 import html
 import sys
-from pathlib import Path
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ductmgr.explore_model import MODE_PLACING, SHAPE_KEYS, InletModel, Readout
-from ductmgr.skinfit import SKIN_FIT_MODES
+from ductmgr.explore_model import MODE_PLACING, InletModel, Readout
+from ductmgr.qt_sketch import SketchDock
 from ductmgr.viz import ACCENT, BACKGROUND, Scene, SceneView
 
 # ---- UI constants (not design inputs) -------------------------------------------------------------
-WINDOW_SIZE = (1440, 880)
+WINDOW_SIZE = (1560, 900)
 PANEL_WIDTH = 350
+SKETCH_WIDTH = 520
 FONT_POINT_SIZE = 9
 READOUT_FONT = "Consolas"
 READOUT_FONT_POINT_SIZE = 8
-READOUT_MIN_HEIGHT = 250
+READOUT_MIN_HEIGHT = 300
 LABEL_WIDTH = 21  # characters, readout label column
 NUDGE_STEPS = (0.001, 0.005, 0.01, 0.05, 0.1)  # m
 DEFAULT_NUDGE_STEP = 0.01
 POSITION_MARGIN = 0.05  # of the fuselage size, beyond its bounds, for the position spin ranges
-TILT_RANGE_DEG = (-85.0, 85.0)
+PITCH_RANGE_DEG = (-85.0, 85.0)
+SWEEP_RANGE_DEG = (-90.0, 90.0)
 CLICK_TOLERANCE_PX = 4  # a press-release further apart than this is a camera drag, not a click
-COLORS = {"info": "#C9D1D9", "pass": "#4CAF50", "warn": "#E0A030"}  # readout text colours
-# key: (label, minimum, maximum, step, suffix)
-SHAPE_SPECS = {
-    "width_bottom": ("Width bottom", 0.05, 5.0, 0.05, " rel"),
-    "width_top": ("Width top", 0.05, 5.0, 0.05, " rel"),
-    "height": ("Height", 0.05, 5.0, 0.05, " rel"),
-    "apex_height": ("Apex height", 0.0, 2.0, 0.05, " x h"),
-    "skew": ("Skew", -1.0, 1.0, 0.02, " x wt"),
-}
+COLORS = {"info": "#C9D1D9", "pass": "#4CAF50", "warn": "#E0A030", "error": "#F85149"}  # readout text colours
 
 STYLESHEET = f"""
 QWidget {{ background: {BACKGROUND}; color: #D7DCE0; font-size: {FONT_POINT_SIZE}pt; }}
-QMainWindow::separator {{ background: #2C333B; width: 1px; }}
+QMainWindow::separator {{ background: #2C333B; width: 1px; height: 1px; }}
 QDockWidget {{ border: 0; }}
+QDockWidget::title {{ background: #1B1F24; padding: 3px 6px; border-bottom: 1px solid #2C333B; }}
 QScrollArea {{ border: 0; }}
 QToolBar {{ background: #1B1F24; border: 0; border-bottom: 1px solid #2C333B; spacing: 3px; padding: 2px; }}
 QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: 3px; padding: 2px 7px; }}
@@ -73,7 +68,7 @@ QToolTip {{ background: #1E2329; color: #D7DCE0; border: 1px solid {ACCENT}; }}
 
 
 def readouts_html(readouts: list[Readout]) -> str:
-    """Monospace HTML for the read-only panel: WARN in amber, PASS in green, the rest neutral."""
+    """Monospace HTML for the read-only panel: PASS green, WARN amber, ERROR red, the rest neutral."""
     lines = []
     for r in readouts:
         text = f"{r.label:<{LABEL_WIDTH}} {r.value}" if r.label else r.value
@@ -143,6 +138,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self._build_center(with_3d)
         self._build_actions()
         self._build_panel()
+        self._build_sketch_dock()
         self._build_toolbar()
         self._build_status_bar()
         self.model.add_listener(self.sync)
@@ -176,12 +172,15 @@ class ExploreWindow(QtWidgets.QMainWindow):
     def _build_actions(self) -> None:
         m = self.model
         self.act_place = self._action("Place inlet", m.toggle_place, ["P"], True,
-                                      "Place inlet (P): the next click on the fuselage places it")
+                                      "Place inlet (P): the next click on the fuselage places the plane origin there")
         self.act_cancel = self._action("Cancel placement", m.cancel_place, [QtCore.Qt.Key.Key_Escape.value])
         self.act_undo = self._action("Undo", m.undo, ["Ctrl+Z"], tip="Undo (Ctrl+Z)")
         self.act_redo = self._action("Redo", m.redo, ["Ctrl+Y", "Ctrl+Shift+Z"], tip="Redo (Ctrl+Y)")
         self.act_save = self._action("Save to config", m.save, ["Ctrl+S"], tip="Save to config (Ctrl+S)")
         self.act_revert = self._action("Revert to saved", m.revert, tip="Re-read the inlet from the config file")
+        self.act_fit_area = self._action("Fit area", m.fit_area, tip="Scale the free vertices to the target area")
+        self.act_align = self._action("Align to chine", m.align_to_chine,
+                                      tip="Set the sweep so the opening's u axis is parallel to the local chine line")
         self.view_actions = {
             name: self._action(name.capitalize(), lambda n=name: self._set_view(n), [str(i + 1)],
                                tip=f"{name.capitalize()} view ({i + 1})")
@@ -206,6 +205,11 @@ class ExploreWindow(QtWidgets.QMainWindow):
         bar.addSeparator()
         bar.addAction(self.act_context)
         bar.addAction(self.act_envelope)
+        bar.addSeparator()
+        self.act_sketch = self.sketch_dock.toggleViewAction()
+        self.act_sketch.setText("Sketch")
+        self.act_sketch.setToolTip("Show / hide the section sketcher")
+        bar.addAction(self.act_sketch)
 
     def _spin(self, lo, hi, step, decimals=3, suffix="") -> FocusSpinBox:
         box = FocusSpinBox()
@@ -228,8 +232,8 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.grp_place = CollapsibleGroup("Placement")
         self.btn_place = QtWidgets.QPushButton("Place inlet  (P)")
         self.btn_place.setCheckable(True)
-        self.btn_place.setToolTip("While on, the next click on the fuselage places the inlet, then this switches off. "
-                                  "Esc cancels.")
+        self.btn_place.setToolTip("While on, the next click on the fuselage places the plane origin, then this "
+                                  "switches off. Esc cancels.")
         self.btn_place.clicked.connect(lambda *_: self.model.toggle_place())
         self.chk_lock = QtWidgets.QCheckBox("Lock inlet")
         self.chk_lock.setToolTip("Disables placement and nudges")
@@ -238,20 +242,20 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.grp_place.form.addRow(self.chk_lock)
         col.addWidget(self.grp_place)
 
-        # Position
+        # Inlet plane: origin, pitch, sweep
         b = self.scene.fuselage.bounds
         pad = POSITION_MARGIN * max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
-        self.grp_position = CollapsibleGroup("Inlet position")
+        self.grp_position = CollapsibleGroup("Inlet plane")
         self.spin_pos = {
             "x": self._spin(b[0] - pad, b[1] + pad, DEFAULT_NUDGE_STEP, suffix=" m"),
             "y": self._spin(0.0, b[3] + pad, DEFAULT_NUDGE_STEP, suffix=" m"),
             "z": self._spin(b[4] - pad, b[5] + pad, DEFAULT_NUDGE_STEP, suffix=" m"),
         }
-        tips = {"x": "X (aft), m", "y": "Y (right inlet, y >= 0), m", "z": "Z: the inlet snaps to the skin nearest this height"}
+        tips = {"x": "Origin X (aft), m", "y": "Origin Y (right inlet, y >= 0), m", "z": "Origin Z, m"}
         for axis, box in self.spin_pos.items():
             box.setToolTip(tips[axis])
             box.valueChanged.connect(lambda *_: self._on_position())
-            self.grp_position.form.addRow(axis.upper(), box)
+            self.grp_position.form.addRow(f"Origin {axis.upper()}", box)
         self.combo_step = QtWidgets.QComboBox()
         for step in NUDGE_STEPS:
             self.combo_step.addItem(f"{step:g} m", step)
@@ -259,30 +263,19 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.combo_step.setToolTip("Step of the arrow keys / spin arrows (nudge)")
         self.combo_step.currentIndexChanged.connect(self._on_step)
         self.grp_position.form.addRow("Nudge step", self.combo_step)
+        self.spin_pitch = self._spin(*PITCH_RANGE_DEG, 1.0, decimals=2, suffix=" deg")
+        self.spin_pitch.setToolTip("Rotation about Y: positive tilts the opening up")
+        self.spin_sweep = self._spin(*SWEEP_RANGE_DEG, 1.0, decimals=2, suffix=" deg")
+        self.spin_sweep.setToolTip("Rotation about Z: the opening swept in planform")
+        self.spin_pitch.valueChanged.connect(lambda v: self._on_param("pitch_deg", v))
+        self.spin_sweep.valueChanged.connect(lambda v: self._on_param("sweep_deg", v))
+        self.grp_position.form.addRow("Pitch", self.spin_pitch)
+        self.grp_position.form.addRow("Sweep", self.spin_sweep)
+        self.btn_align = QtWidgets.QPushButton("Align to chine")
+        self.btn_align.setToolTip(self.act_align.toolTip())
+        self.btn_align.clicked.connect(lambda *_: self.model.align_to_chine())
+        self.grp_position.form.addRow(self.btn_align)
         col.addWidget(self.grp_position)
-
-        # Shape
-        self.grp_shape = CollapsibleGroup("Shape")
-        self.spin_shape = {}
-        for key in SHAPE_KEYS:
-            label, lo, hi, step, suffix = SHAPE_SPECS[key]
-            box = self._spin(lo, hi, step, suffix=suffix)
-            box.valueChanged.connect(lambda v, k=key: self._on_param(k, v))
-            self.spin_shape[key] = box
-            self.grp_shape.form.addRow(label, box)
-        col.addWidget(self.grp_shape)
-
-        # Orientation + skin fit
-        self.grp_orient = CollapsibleGroup("Orientation")
-        self.spin_tilt = self._spin(*TILT_RANGE_DEG, 1.0, decimals=1, suffix=" deg")
-        self.spin_tilt.valueChanged.connect(lambda v: self._on_param("tilt_deg", v))
-        self.combo_fit = QtWidgets.QComboBox()
-        self.combo_fit.addItems(SKIN_FIT_MODES)
-        self.combo_fit.setToolTip("none / bottom_edge / flush: how the outline meets the fuselage skin")
-        self.combo_fit.currentTextChanged.connect(lambda t: self._on_param("skin_fit", t))
-        self.grp_orient.form.addRow("Tilt", self.spin_tilt)
-        self.grp_orient.form.addRow("Skin fit", self.combo_fit)
-        col.addWidget(self.grp_orient)
 
         # Readouts
         self.grp_readouts = CollapsibleGroup("Readouts")
@@ -316,6 +309,17 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.dock.setFixedWidth(PANEL_WIDTH)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
 
+    def _build_sketch_dock(self) -> None:
+        self.sketch = SketchDock(self.model)
+        self.sketch_dock = QtWidgets.QDockWidget("Section sketch", self)
+        self.sketch_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                                     | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable
+                                     | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.sketch_dock.setWidget(self.sketch)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.sketch_dock)
+        self.sketch_dock.setMinimumWidth(SKETCH_WIDTH)
+        self.resizeDocks([self.sketch_dock], [SKETCH_WIDTH], QtCore.Qt.Orientation.Horizontal)
+
     def _build_status_bar(self) -> None:
         self.mode_label = QtWidgets.QLabel()
         self.message_label = QtWidgets.QLabel()
@@ -329,7 +333,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
 
     def _on_position(self) -> None:
         if not self._syncing:
-            self.model.set_position(*(self.spin_pos[a].value() for a in "xyz"))
+            self.model.set_origin(*(self.spin_pos[a].value() for a in "xyz"))
 
     def _on_lock(self, locked: bool) -> None:
         if not self._syncing:
@@ -383,16 +387,12 @@ class ExploreWindow(QtWidgets.QMainWindow):
         m = self.model
         self._syncing = True
         try:
-            placed = m.centroid is not None
+            placed = m.placed
             if placed:
-                for axis, v in zip("xyz", m.centroid):
-                    self._set_value(self.spin_pos[axis], float(v))
-            for key, box in self.spin_shape.items():
-                self._set_value(box, getattr(m.state.shape, key))
-            self._set_value(self.spin_tilt, m.state.tilt_deg)
-            self.combo_fit.blockSignals(True)
-            self.combo_fit.setCurrentText(m.state.skin_fit)
-            self.combo_fit.blockSignals(False)
+                for axis, value in zip("xyz", m.state.plane.origin):
+                    self._set_value(self.spin_pos[axis], float(value))
+                self._set_value(self.spin_pitch, m.state.plane.pitch_deg)
+                self._set_value(self.spin_sweep, m.state.plane.sweep_deg)
             self.chk_lock.setChecked(m.locked)
             placing = m.mode == MODE_PLACING
             for checkable in (self.btn_place, self.act_place):
@@ -400,11 +400,19 @@ class ExploreWindow(QtWidgets.QMainWindow):
             for box in self.spin_pos.values():
                 box.setEnabled(placed and not m.locked)
             self.combo_step.setEnabled(placed and not m.locked)
+            for box in (self.spin_pitch, self.spin_sweep):
+                box.setEnabled(placed)
+            self.btn_align.setEnabled(placed)
             self.btn_place.setEnabled(not m.locked)
             self.act_undo.setEnabled(m.can_undo)
             self.act_redo.setEnabled(m.can_redo)
-            self.btn_save.setEnabled(m.save_target is not None)
-            self.act_save.setEnabled(m.save_target is not None)
+            can_save = m.can_save
+            self.btn_save.setEnabled(can_save)
+            self.act_save.setEnabled(can_save)
+            tip = ("Save to config (Ctrl+S)" if can_save else
+                   "Save is disabled: the example config is read-only" if m.save_target is None else
+                   "Save is disabled: the opening is not valid" if m.placed else "Place an inlet first")
+            self.btn_save.setToolTip(tip)
             self.readout_view.setHtml(readouts_html(m.readouts()))
         finally:
             self._syncing = False
@@ -427,11 +435,13 @@ class ExploreWindow(QtWidgets.QMainWindow):
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
         box.setWindowTitle("Unsaved changes")
         box.setText("The inlet has unsaved changes.")
-        can_save = self.model.save_target is not None
+        can_save = self.model.can_save
         if can_save:
             save = box.addButton("Save", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
         else:
-            box.setInformativeText("The example config is read-only, so the changes cannot be saved.")
+            box.setInformativeText("The example config is read-only, so the changes cannot be saved."
+                                   if self.model.save_target is None else
+                                   "The opening is not valid, so the changes cannot be saved.")
             save = None
         discard = box.addButton("Discard", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
         cancel = box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)

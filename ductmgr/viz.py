@@ -18,7 +18,6 @@ from vtkmodules.vtkRenderingCore import vtkCellPicker
 from ductmgr import vspio
 from ductmgr.config import resolve_model_path
 from ductmgr.engine import EngineSizingWarning, SizingResult, size_from_config
-from ductmgr.geometry import mirror_xz
 
 # ---- appearance (dark theme) ---------------------------------------------------------------
 BACKGROUND = "#15181C"
@@ -30,12 +29,14 @@ FACE_COLOR = "#e5534b"
 RIGHT_COLOR, LEFT_COLOR = "#f0a030", ACCENT
 INLET_OPACITY = 0.7
 OUTLINE_COLOR = "#e6edf3"
+ERROR_COLOR = "#e5534b"  # an invalid opening (inside the fuselage) is drawn red
 RULER_COLOR = "#9aa4ad"
-TANGENT_COLOR, TANGENT_OPACITY = "#3fb950", 0.18
+SECTION_COLOR, SECTION_WIDTH = "#d29922", 2  # the plane ∩ skin curve
+FRAME_COLORS = {"u": "#e5534b", "v": "#3fb950", "n": "#58a6ff"}  # plane frame arrows at the origin
+FRAME_ARROW_FRACTION = 0.035  # arrow length, as a fraction of the largest fuselage dimension
 GUIDE_COLOR = "#9aa4ad"
 DISC_RESOLUTION = (4, 64)  # radial, circumferential
 ENVELOPE_COLOR, ENVELOPE_OPACITY, ENVELOPE_SEGMENTS = "#e5534b", 0.4, 96
-TANGENT_PATCH_SCALE = 1.6  # tangent-plane square, in units of the inlet's largest dimension
 PICK_TOLERANCE = 0.0005  # vtkCellPicker tolerance (fraction of the render window diagonal)
 
 VIEWS = {"side": "xz", "top": "xy", "front": "yz", "iso": "iso"}
@@ -137,8 +138,8 @@ def _polygon_mesh(points: np.ndarray, planar: bool = True) -> tuple[pv.PolyData,
 class SceneView:
     """Draws the scene and the inlets on a PyVista plotter. Holds no inlet state and adds no widgets."""
 
-    INLET_ACTORS = ("inlet_right_fill", "inlet_right_edge", "inlet_left_fill", "inlet_left_edge", "tangent",
-                    "to_face")
+    INLET_ACTORS = ("inlet_right_fill", "inlet_right_edge", "inlet_left_fill", "inlet_left_edge", "section_curve",
+                    "frame_u", "frame_v", "frame_n", "to_face")
 
     def __init__(self, plotter, scene: Scene):
         self.plotter = plotter
@@ -192,28 +193,43 @@ class SceneView:
 
     # ---- inlets ------------------------------------------------------------------------------------------
     def update_inlet(self, model) -> None:
-        """Redraw the right inlet, its mirror image, the tangent patch and the guide line from the model."""
+        """Redraw both openings (the left one is the exact mirror image), the section curve, the plane frame at
+        the origin and the guide line to the engine face. A red opening means the sketch is invalid."""
         p = self.plotter
-        fit = model.fit
-        if fit is None:
+        op = model.opening
+        if op is None:
             for name in self.INLET_ACTORS:
                 p.remove_actor(name, render=False)
             return
-        right = fit.points
-        for side, pts, color in (("right", right, RIGHT_COLOR), ("left", mirror_xz(right, reverse=True), LEFT_COLOR)):
-            fill, outline = _polygon_mesh(pts, fit.planar)
-            p.add_mesh(fill, color=color, opacity=INLET_OPACITY, name=f"inlet_{side}_fill", pickable=False,
-                       show_edges=False, render=False)
-            p.add_mesh(outline, color=OUTLINE_COLOR, line_width=2, name=f"inlet_{side}_edge", pickable=False,
-                       render=False)
+        plane = model.state.plane
+        right = plane.to_3d(op.outline)
+        left = (right * np.array([1.0, -1.0, 1.0]))[::-1]  # mirror about XZ; reversed to stay counter-clockwise
+        for side, pts, color in (("right", right, RIGHT_COLOR), ("left", left, LEFT_COLOR)):
+            fill, outline = _polygon_mesh(pts)
+            p.add_mesh(fill, color=ERROR_COLOR if not op.valid else color, opacity=INLET_OPACITY,
+                       name=f"inlet_{side}_fill", pickable=False, show_edges=False, render=False)
+            p.add_mesh(outline, color=ERROR_COLOR if not op.valid else OUTLINE_COLOR, line_width=3 if not op.valid else 2,
+                       name=f"inlet_{side}_edge", pickable=False, render=False)
 
-        size = TANGENT_PATCH_SCALE * float(np.ptp(fit.uv, axis=0).max())
-        patch = pv.Plane(center=model.centroid, direction=model.surface_normal, i_size=size, j_size=size)
-        p.add_mesh(patch, color=TANGENT_COLOR, opacity=TANGENT_OPACITY, name="tangent", pickable=False,
-                   render=False)
+        if model.section is not None:
+            ring = plane.to_3d(model.section.points)
+            if model.section.closed:
+                ring = np.vstack([ring, ring[:1]])
+            p.add_mesh(pv.lines_from_points(ring), color=SECTION_COLOR, line_width=SECTION_WIDTH,
+                       name="section_curve", pickable=False, render=False)
+        else:
+            p.remove_actor("section_curve", render=False)
+
+        b = self.scene.fuselage.bounds
+        length = FRAME_ARROW_FRACTION * max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
+        u, v, n = plane.frame()
+        for name, direction in (("u", u), ("v", v), ("n", n)):
+            p.add_mesh(pv.Arrow(start=plane.origin, direction=direction, scale=length), color=FRAME_COLORS[name],
+                       name=f"frame_{name}", pickable=False, render=False)
+
         face = self.scene.face_center
         if face is not None:
-            p.add_mesh(pv.Line(model.centroid, face), color=GUIDE_COLOR, line_width=1, name="to_face",
+            p.add_mesh(pv.Line(model.opening_centroid, face), color=GUIDE_COLOR, line_width=1, name="to_face",
                        pickable=False, render=False)
         else:
             p.remove_actor("to_face", render=False)

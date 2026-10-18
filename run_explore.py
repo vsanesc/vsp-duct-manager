@@ -47,6 +47,8 @@ def main(argv=None) -> int:
         print(check.message)  # a WARN is already among scene.warnings
     for msg in scene.warnings:
         print(msg)
+    if model.notice:
+        print(f"NOTE {model.notice}")
 
     if args.screenshot:
         import pyvista as pv
