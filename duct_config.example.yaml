@@ -11,9 +11,10 @@ model:
 
 # ---- Phase 1: engine and area sizing ------------------------------------
 engine:
-  geom_name: Test Engine           # Geom in the model whose front end is the engine face
-  face_diameter: 0.5               # m, single circular engine face
-  face_diameter_tolerance: 0.02    # relative; WARN if the Geom's diameter differs by more
+  geom_name: Test Engine           # Geom in the model: its front (min-x) end centre is the face centre,
+                                   # its bounding box is the engine envelope (casing)
+  face_diameter: 0.5               # m, the fan / engine face (NOT the casing)
+  face_to_envelope_range: [0.80, 0.98]   # expected face diameter / Geom bounding-box (casing) diameter; outside -> WARN
   hub_to_tip_ratio: 0.0            # 0 = full disc
   corrected_flow_per_area: 190.0   # kg/s/m^2 (corrected flow per unit face area)
   reference_thrust: 10000.0        # N, optional (sanity check)

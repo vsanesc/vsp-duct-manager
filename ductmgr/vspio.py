@@ -15,7 +15,7 @@ import numpy as np
 import openvsp as vsp
 import pyvista as pv
 
-DEFAULT_ENGINE_DIAMETER_TOLERANCE = 0.02  # relative; engine.face_diameter_tolerance overrides
+DEFAULT_FACE_TO_ENVELOPE_RANGE = (0.80, 0.98)  # engine.face_to_envelope_range overrides
 TEMP_SET_NAME = "ductmgr_tmp_export"
 STL_NAME = "export.stl"
 BOUNDS_MISMATCH_TOLERANCE = 0.01  # relative to the model size: mesh bounds vs API bounding boxes
@@ -32,9 +32,22 @@ class GeomInfo:
 
 @dataclass(frozen=True)
 class EngineFace:
+    """Where the engine face is, from the engine Geom. The fan diameter is NOT here: it comes from the
+    config (the Geom's bounding box is the casing, i.e. the envelope)."""
+
     geom: GeomInfo
-    center: np.ndarray  # centre of the front (min-x) end
-    diameter: float  # larger of the geom's y and z extents
+    center: np.ndarray  # centre of the front (min-x) end of the Geom
+    envelope_diameter: float  # larger of the Geom's y and z extents (the casing)
+
+
+@dataclass(frozen=True)
+class FaceEnvelopeCheck:
+    face_diameter: float  # from the config (fan)
+    envelope_diameter: float  # from the model (casing)
+    ratio: float
+    ratio_range: tuple[float, float]
+    status: str  # "PASS" or "WARN"
+    message: str
 
 
 def open_model(path) -> None:
@@ -146,23 +159,25 @@ def context_geoms(exclude_names: list[str]) -> list[GeomInfo]:
 
 
 def engine_face(geom_name: str) -> EngineFace:
-    """Engine face = centre of the front (min-x) end of the geom's bounding box; diameter = y/z extent."""
+    """Face centre = centre of the front (min-x) end of the geom's bounding box (the engine envelope)."""
     geom = find_geom(geom_name)
     lo, hi = geom.bbox_min, geom.bbox_max
     center = np.array([lo[0], 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])])
-    return EngineFace(geom=geom, center=center, diameter=float(max(hi[1] - lo[1], hi[2] - lo[2])))
+    return EngineFace(geom=geom, center=center, envelope_diameter=float(max(hi[1] - lo[1], hi[2] - lo[2])))
 
 
-def engine_diameter_warning(face: EngineFace, config_diameter: float, tolerance: float) -> str | None:
-    """WARN text when the model's engine diameter differs from the config's by more than ``tolerance``."""
-    rel = (face.diameter - config_diameter) / config_diameter
-    if abs(rel) <= tolerance:
-        return None
-    return (
-        f"WARN engine '{face.geom.name}' diameter from the model is {face.diameter:.4f} m but "
-        f"engine.face_diameter is {config_diameter:.4f} m ({rel * 100:+.1f} %, tolerance "
-        f"{tolerance * 100:.1f} %); neither value was changed"
+def check_face_to_envelope(
+    face: EngineFace, face_diameter: float, ratio_range: tuple[float, float]
+) -> FaceEnvelopeCheck:
+    """Compare the configured fan diameter with the model's envelope diameter (nothing is changed)."""
+    ratio = face_diameter / face.envelope_diameter
+    lo, hi = ratio_range
+    status = "PASS" if lo <= ratio <= hi else "WARN"
+    message = (
+        f"engine '{face.geom.name}': face diameter {face_diameter:.4f} m (config) / envelope diameter "
+        f"{face.envelope_diameter:.4f} m (model) = {ratio:.3f}  [{status}: expected {lo:g}-{hi:g}]"
     )
+    return FaceEnvelopeCheck(face_diameter, face.envelope_diameter, ratio, (lo, hi), status, message)
 
 
 # ---- surface queries ---------------------------------------------------------------------------------

@@ -41,6 +41,9 @@ def main(argv=None) -> int:
     print(f"Config: {config_path.name}   " + (
         f"(s saves to {save_target.name})" if save_target else f"(s disabled: copy it to {PRIVATE_CONFIG.name} to save)"
     ))
+    check = scene.engine_check
+    if check is not None and check.status == "PASS":
+        print(check.message)  # a WARN is already among scene.warnings
     for msg in scene.warnings:
         print(msg)
 

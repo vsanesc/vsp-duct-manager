@@ -47,20 +47,43 @@ def test_scene_reads_fuselage_engine_and_sizing(scene):
     assert scene.fuselage.n_cells > 100
     assert scene.engine_mesh.n_cells > 0
     assert scene.face_source == "model"
-    assert scene.face_center == pytest.approx([5.0, 0.0, 0.0], abs=1e-6)
-    assert scene.face_diameter == pytest.approx(0.5, abs=1e-6)
+    assert scene.face_center == pytest.approx([5.0, 0.0, 0.0], abs=1e-6)  # front end of the engine Geom
+    assert scene.face_diameter == 0.5  # the fan: engine.face_diameter from the config
+    assert scene.envelope_diameter == pytest.approx(0.575, abs=1e-6)  # the Geom's bounding box (casing)
     assert scene.sizing.capture_area_per_inlet == pytest.approx(scene.sizing.capture_area_total / 2)
     assert scene.warnings == []  # example config is internally consistent
 
 
-def test_engine_diameter_mismatch_warns_without_changing_anything(example_env):
+def test_face_to_envelope_check_passes_for_the_example(scene):
+    c = scene.engine_check
+    assert c.status == "PASS" and c.ratio == pytest.approx(0.5 / 0.575)
+    assert c.face_diameter == 0.5 and c.envelope_diameter == pytest.approx(0.575, abs=1e-6)
+    assert c.ratio_range == (0.80, 0.98)
+    assert "0.5000 m (config)" in c.message and "0.5750 m (model)" in c.message and "PASS" in c.message
+
+
+@pytest.mark.parametrize("face_diameter, ratio", [(0.4, 0.4 / 0.575), (0.57, 0.57 / 0.575)])
+def test_face_diameter_outside_the_band_warns_and_is_never_replaced(example_env, face_diameter, ratio):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
-    cfg["engine"]["face_diameter"] = 0.6
+    cfg["engine"]["face_diameter"] = face_diameter
     s = load_scene(cfg, path)
-    assert any("Test Engine" in w and "0.5000" in w and "0.6000" in w for w in s.warnings)
-    assert s.face_diameter == pytest.approx(0.5, abs=1e-6)  # the model value is shown, nothing is rewritten
-    assert cfg["engine"]["face_diameter"] == 0.6
+    assert s.engine_check.status == "WARN" and s.engine_check.ratio == pytest.approx(ratio)
+    assert any(w.startswith("WARN") and "Test Engine" in w and f"{face_diameter:.4f} m (config)" in w and "0.5750 m (model)" in w
+               for w in s.warnings)
+    assert s.face_diameter == face_diameter  # the config value is used as given; the bbox never replaces it
+    assert cfg["engine"]["face_diameter"] == face_diameter
+
+
+def test_face_to_envelope_range_comes_from_the_config_with_a_default(example_env):
+    cfg, path, _ = example_env
+    narrow = copy.deepcopy(cfg)
+    narrow["engine"]["face_to_envelope_range"] = [0.90, 0.98]  # the example's 0.870 now falls outside
+    assert load_scene(narrow, path).engine_check.status == "WARN"
+    default = copy.deepcopy(cfg)
+    del default["engine"]["face_to_envelope_range"]
+    s = load_scene(default, path)
+    assert s.engine_check.ratio_range == (0.80, 0.98) and s.engine_check.status == "PASS"
 
 
 def test_without_engine_geom_name_the_config_face_is_used(example_env):
@@ -70,7 +93,9 @@ def test_without_engine_geom_name_the_config_face_is_used(example_env):
     s = load_scene(cfg, path)
     assert s.face_source == "config"
     assert s.face_center == pytest.approx(cfg["ducts"]["engine_face"]["centre"])
+    assert s.face_diameter == 0.5
     assert s.engine_mesh.n_points == 0
+    assert s.engine_check is None and s.envelope_diameter is None  # no Geom, so no envelope to compare
     assert any("geom_name is not set" in w for w in s.warnings)
 
 
@@ -246,6 +271,32 @@ def test_save_before_placing_an_inlet_does_nothing(plotter, scene, example_env, 
 
 
 # ---- rendering ----------------------------------------------------------------------------------------------
+def _extent(actor, axis):
+    b = actor.GetMapper().GetInput().GetBounds()
+    return b[2 * axis + 1] - b[2 * axis]
+
+
+def test_face_disc_uses_the_config_diameter_and_the_envelope_is_an_outline(plotter, scene, example_env):
+    _, path, _ = example_env
+    app = make_app(plotter, scene, path, None)
+    face, envelope = app.actors["face"], app.actors["envelope"]
+    assert _extent(face, 1) == pytest.approx(0.5, abs=1e-6) and _extent(face, 2) == pytest.approx(0.5, abs=1e-6)
+    assert _extent(envelope, 1) == pytest.approx(0.575, abs=1e-3) and _extent(envelope, 2) == pytest.approx(0.575, abs=1e-3)
+    assert envelope.GetProperty().GetOpacity() < 0.5  # faint
+    assert envelope.GetMapper().GetInput().n_lines > 0 and envelope.GetMapper().GetInput().n_faces == 0
+    for actor in (face, envelope):  # both sit in the front-end plane of the engine Geom
+        b = actor.GetMapper().GetInput().GetBounds()
+        assert b[0] == pytest.approx(5.0, abs=1e-6) and b[1] == pytest.approx(5.0, abs=1e-6)
+
+
+def test_no_envelope_outline_without_an_engine_geom(plotter, example_env):
+    cfg, path, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    cfg["engine"]["geom_name"] = None
+    app = ExploreApp(plotter, load_scene(cfg, path), cfg, path, None)
+    assert "face" in app.actors and "envelope" not in app.actors
+
+
 def test_scene_renders_something(plotter, scene, example_env):
     _, path, _ = example_env
     make_app(plotter, scene, path, None)

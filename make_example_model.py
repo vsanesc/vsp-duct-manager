@@ -13,7 +13,8 @@ from pathlib import Path
 from ductmgr.config import EXAMPLE_CONFIG, add_config_argument, load_config, resolve_model_path
 
 FUSELAGE_LENGTH = 8.0  # m
-ENGINE_LENGTH_OVER_DIAMETER = 3.0  # the stand-in engine pod is this many diameters long
+ENGINE_ENVELOPE_OVER_FACE = 1.15  # the stand-in pod (casing) is this much wider than the fan face
+ENGINE_LENGTH_OVER_DIAMETER = 3.0  # the stand-in engine pod is this many envelope diameters long
 ENGINE_X_FRACTION = 0.6  # of the fuselage length, used when the config has no engine face position
 
 
@@ -26,7 +27,7 @@ def build_example_model(out: Path, cfg: dict) -> None:
     vsp.SetGeomName(fus, cfg["model"]["fuselage_name"])
     vsp.SetParmVal(fus, "Length", "Design", FUSELAGE_LENGTH)
 
-    diameter = cfg["engine"]["face_diameter"]
+    diameter = ENGINE_ENVELOPE_OVER_FACE * cfg["engine"]["face_diameter"]
     centre = ((cfg.get("ducts") or {}).get("engine_face") or {}).get("centre")
     x_face = centre[0] if centre else ENGINE_X_FRACTION * FUSELAGE_LENGTH
     pod = vsp.AddGeom("POD")

@@ -38,6 +38,7 @@ RIGHT_COLOR, LEFT_COLOR = "#ff7f0e", "#17becf"
 INLET_OPACITY = 0.65
 BACKGROUND = "white"
 DISC_RESOLUTION = (4, 64)  # radial, circumferential
+ENVELOPE_COLOR, ENVELOPE_OPACITY, ENVELOPE_SEGMENTS = "#d62728", 0.35, 96
 TANGENT_PATCH_SCALE = 1.6  # tangent-plane square, in units of the inlet's largest dimension
 
 # ---- UI ranges (not design inputs) ------------------------------------------------------------
@@ -69,10 +70,12 @@ class Scene:
     context: pv.PolyData
     engine_mesh: pv.PolyData
     face_center: np.ndarray | None
-    face_diameter: float | None
-    face_source: str  # "model", "config" or "none"
+    face_diameter: float  # the fan, always engine.face_diameter from the config
+    face_source: str  # where the face centre came from: "model", "config" or "none"
     hub_to_tip_ratio: float
     sizing: SizingResult
+    envelope_diameter: float | None = None  # engine Geom bounding box (casing), when the Geom is known
+    engine_check: vspio.FaceEnvelopeCheck | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -98,23 +101,25 @@ def load_scene(cfg: dict, config_path: Path) -> Scene:
 
     engine_name = eng.get("geom_name")
     engine_geom = None
-    face_center = face_diameter = None
+    face_center = None
+    face_diameter = float(eng["face_diameter"])  # the fan: from the config, never from the bounding box
     face_source = "none"
+    envelope_diameter = None
+    engine_check = None
     if engine_name:
         face = vspio.engine_face(engine_name)
         engine_geom = face.geom
-        face_center, face_diameter, face_source = face.center, face.diameter, "model"
-        tol = eng.get("face_diameter_tolerance")
-        warn = vspio.engine_diameter_warning(
-            face, eng["face_diameter"], vspio.DEFAULT_ENGINE_DIAMETER_TOLERANCE if tol is None else tol
+        face_center, face_source = face.center, "model"
+        envelope_diameter = face.envelope_diameter
+        engine_check = vspio.check_face_to_envelope(
+            face, face_diameter, tuple(eng.get("face_to_envelope_range") or vspio.DEFAULT_FACE_TO_ENVELOPE_RANGE)
         )
-        if warn:
-            msgs.append(warn)
+        if engine_check.status == "WARN":
+            msgs.append(f"WARN {engine_check.message}")
     else:
         centre = ((cfg.get("ducts") or {}).get("engine_face") or {}).get("centre")
         if centre is not None:
-            face_center = np.array(centre, dtype=float)
-            face_diameter, face_source = eng["face_diameter"], "config"
+            face_center, face_source = np.array(centre, dtype=float), "config"
         msgs.append(
             "WARN engine.geom_name is not set: the engine face is "
             + ("taken from ducts.engine_face.centre" if centre is not None else "unknown")
@@ -133,6 +138,8 @@ def load_scene(cfg: dict, config_path: Path) -> Scene:
         face_source=face_source,
         hub_to_tip_ratio=float(eng.get("hub_to_tip_ratio") or 0.0),
         sizing=sizing,
+        envelope_diameter=envelope_diameter,
+        engine_check=engine_check,
         warnings=msgs,
     )
 
@@ -288,6 +295,14 @@ class ExploreApp:
                 normal=(1.0, 0.0, 0.0), r_res=DISC_RESOLUTION[0], c_res=DISC_RESOLUTION[1],
             )
             self.actors["face"] = p.add_mesh(disc, color=FACE_COLOR, opacity=0.9, name="face", pickable=False)
+            if s.envelope_diameter is not None:  # the casing, as a faint outline around the fan disc
+                t = np.linspace(0.0, 2.0 * np.pi, ENVELOPE_SEGMENTS + 1)
+                r = 0.5 * s.envelope_diameter
+                ring = s.face_center + np.c_[np.zeros_like(t), r * np.cos(t), r * np.sin(t)]
+                self.actors["envelope"] = p.add_mesh(
+                    pv.lines_from_points(ring), color=ENVELOPE_COLOR, opacity=ENVELOPE_OPACITY,
+                    line_width=1, name="envelope", pickable=False,
+                )
 
         everything = s.fuselage.bounds
         if s.context.n_points:
@@ -373,7 +388,9 @@ class ExploreApp:
     def _draw_text(self) -> None:
         self._text("readout", self.readout_text(), READOUT_POS[0], READOUT_POS[1], READOUT_FONT_SIZE, top=True,
                    font="courier")
-        notes = self.scene.warnings + ([self.status] if self.status else [])
+        check = self.scene.engine_check
+        passed = [check.message] if check is not None and check.status == "PASS" else []
+        notes = passed + self.scene.warnings + ([self.status] if self.status else [])
         self._text("status", "\n".join([HELP] + notes), STATUS_POS[0], STATUS_POS[1], 8, top=False)
 
     def update(self) -> None:

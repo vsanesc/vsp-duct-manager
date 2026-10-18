@@ -112,9 +112,11 @@ OpenVSP API (a temporary set and a temporary STL, both removed afterwards; the m
 - keys: `s` saves the inlet into `duct_config.yaml` (comments and every other key are preserved), `r` reloads
   the config, `1`-`4` switch between side, top, front and isometric views.
 
-The engine face is the centre of the front (min-x) end of the Geom named by `engine.geom_name`; if its diameter
-differs from `engine.face_diameter` by more than `engine.face_diameter_tolerance` (default 2 %) a warning is
-printed, and neither value is changed. `s` never writes to the tracked example config: copy it to
+The engine face is centred on the front (min-x) end of the Geom named by `engine.geom_name`. Its diameter is
+`engine.face_diameter` from the config (the fan); the Geom's bounding box is only the engine envelope (casing),
+drawn as a faint outline around the face disc. The viewer prints both diameters and the ratio
+face / envelope, and warns when it is outside `engine.face_to_envelope_range` (default `[0.80, 0.98]`).
+Neither value is ever changed. `s` never writes to the tracked example config: copy it to
 `duct_config.yaml` first. `--screenshot out.png` renders the scene off-screen instead of opening a window.
 
 ## Using your own model
