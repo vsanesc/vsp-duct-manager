@@ -82,20 +82,25 @@ def polygon_centroid(poly: np.ndarray) -> np.ndarray:
     return np.array([np.dot(x + xn, cross) / a6, np.dot(y + yn, cross) / a6])
 
 
-def inlet_polygon(shape: InletShape, area: float) -> np.ndarray:
-    """(N, 2) counter-clockwise vertices, centred on the area centroid, with area exactly ``area``.
+def inlet_vertices(shape: InletShape) -> np.ndarray:
+    """(N, 2) counter-clockwise vertices of the shape at its own (unscaled) size, bottom edge at v = 0.
 
     N is 4 for a quadrilateral (apex_height = 0) and 5 otherwise. Vertex order: bottom-left, bottom-right,
     top-right, [apex], top-left.
     """
-    if not area > 0.0:
-        raise ValueError("inlet area must be positive")
     wb, wt, h = shape.width_bottom, shape.width_top, shape.height
     pts = [(-wb / 2, 0.0), (wb / 2, 0.0), (wt / 2, h)]
     if not shape.is_quadrilateral:
         pts.append((shape.skew * wt, h * (1.0 + shape.apex_height)))
     pts.append((-wt / 2, h))
-    poly = np.array(pts, dtype=float)
+    return np.array(pts, dtype=float)
+
+
+def inlet_polygon(shape: InletShape, area: float) -> np.ndarray:
+    """(N, 2) counter-clockwise vertices, centred on the area centroid, with area exactly ``area``."""
+    if not area > 0.0:
+        raise ValueError("inlet area must be positive")
+    poly = inlet_vertices(shape)
     poly -= polygon_centroid(poly)
     return poly * math.sqrt(area / polygon_area(poly))
 

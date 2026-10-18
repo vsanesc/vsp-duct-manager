@@ -37,6 +37,8 @@ ducts:
     centroid: [2.0, 0.5, 0.4]      # [x, y, z]
     normal: [-1.0, 0.0, 0.0]       # inlet plane normal [x, y, z]
     tilt_deg: 0.0                  # inlet plane pitch about Y; 0 = facing the freestream (-X)
+    skin_fit: bottom_edge          # none | bottom_edge | flush: how the outline meets the fuselage skin
+                                   # (bottom_edge: planar, bottom edge on the skin; flush: projected onto it)
     shape:                         # ratios only; absolute size comes from the capture area
       width_bottom: 1.0
       width_top: 0.7

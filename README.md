@@ -110,7 +110,17 @@ OpenVSP API (a temporary set and a temporary STL, both removed afterwards; the m
 - a live readout: centroid, capture area, aspect ratio, distance to the engine face, the (dy, dz) offset, and
   the offset/length ratio;
 - keys: `s` saves the inlet into `duct_config.yaml` (comments and every other key are preserved), `r` reloads
-  the config, `1`-`4` switch between side, top, front and isometric views.
+  the config, `f` cycles the skin-fit mode, `1`-`4` switch between side, top, front and isometric views.
+
+**Skin fit** (`ducts.inlet.skin_fit`): `none` is the planar polygon centred on the clicked point. `bottom_edge`
+(the example default) keeps the outline planar but replaces its bottom edge with the curve where the inlet plane
+cuts the fuselage skin, so the opening sits on the skin; the other vertices keep the shape ratios above it.
+`flush` projects the whole outline onto the skin along the inlet axis (a non-planar outline) and always warns that
+a flush inlet means low pressure recovery and boundary-layer ingestion. For `bottom_edge` and `flush` the shape is
+scaled iteratively until the outline area projected normal to the freestream matches the per-inlet capture area
+(within 0.5 %). A flush outline on skin that is almost parallel to the freestream has almost no frontal area, so
+the fit can fail there; the viewer says so. The readout shows the mode, the maximum gap between outline and skin,
+and the opening height above the skin.
 
 The engine face is centred on the front (min-x) end of the Geom named by `engine.geom_name`. Its diameter is
 `engine.face_diameter` from the config (the fan); the Geom's bounding box is only the engine envelope (casing),

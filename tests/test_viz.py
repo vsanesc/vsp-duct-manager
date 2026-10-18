@@ -113,7 +113,8 @@ def test_initial_inlet_comes_from_the_config_and_is_snapped_to_the_skin(plotter,
     app = make_app(plotter, scene, path, None)
     assert app.centroid is not None and app.on_surface
     assert app.centroid[:2] == pytest.approx([2.0, 0.5])  # x, y as configured
-    assert app.readout is not None and app.readout.capture_area == pytest.approx(app.area)
+    assert app.skin_fit == "bottom_edge"  # the example config's default
+    assert app.readout is not None and app.readout.capture_area == pytest.approx(app.area, rel=5e-3)
 
 
 def test_picking_a_left_side_point_is_mirrored_to_the_right(plotter, scene, example_env):
@@ -186,6 +187,75 @@ def test_no_inlet_until_one_is_placed(plotter, scene, example_env):
     assert app.centroid is None
 
 
+# ---- skin fit ------------------------------------------------------------------------------------------------
+def test_skin_fit_modes_in_the_viewer(plotter, scene, example_env):
+    _, path, _ = example_env
+    app = make_app(plotter, scene, path, None)
+    app.pick([3.0, 0.4, 1.4])
+    assert app.fit.mode == "bottom_edge" and app.fit.planar
+    assert abs(app.fit.area_error) < 5e-3 and app.fit.max_gap < 1e-2  # follows the skin of the example fuselage
+
+    app.set_skin_fit("none")
+    assert app.fit.mode == "none" and app.fit.area == pytest.approx(app.area, rel=1e-9)
+    app.set_skin_fit("flush")
+    assert app.fit.mode == "flush" and not app.fit.planar
+    assert any(w.startswith("flush inlet: low pressure recovery") for w in app.fit.warnings)
+    with pytest.raises(ValueError, match="skin_fit"):
+        app.set_skin_fit("wrap")
+    assert app.skin_fit == "flush"  # an invalid mode changes nothing
+
+    seen = []
+    for _ in range(3):
+        app.cycle_skin_fit()
+        seen.append(app.skin_fit)
+    assert seen == ["none", "bottom_edge", "flush"]
+
+
+def test_readout_shows_mode_gap_height_and_actual_area(plotter, scene, example_env):
+    _, path, _ = example_env
+    app = make_app(plotter, scene, path, None)
+    app.pick([3.0, 0.4, 1.4])
+    text = app.readout_text()
+    for label in ("Capture area target", "Capture area actual", "Skin fit", "bottom_edge", "Max skin gap",
+                  "Opening height"):
+        assert label in text
+    app.set_skin_fit("flush")
+    assert "n/a (flush)" in app.readout_text()
+    app.set_skin_fit("none")
+    assert "Skin fit             : none" in app.readout_text()
+
+
+def test_flush_warning_reaches_the_status_text(plotter, scene, example_env):
+    _, path, _ = example_env
+    app = make_app(plotter, scene, path, None)
+    app.pick([3.0, 0.4, 1.4])
+    app.set_skin_fit("flush")
+    text = plotter.renderer._actors["status"].GetInput()
+    assert "WARN flush inlet: low pressure recovery and boundary-layer ingestion" in text
+
+
+def test_the_skin_fit_mode_round_trips_through_the_config(plotter, scene, writable):
+    app = make_app(plotter, scene, writable, writable)
+    app.pick([3.0, 0.4, 1.4])
+    app.set_skin_fit("flush")
+    app.save()
+    assert yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlet"]["skin_fit"] == "flush"
+    app.set_skin_fit("none")
+    app.reload()
+    assert app.skin_fit == "flush"
+
+
+def test_config_without_skin_fit_keeps_the_old_behaviour(plotter, scene, example_env):
+    cfg, path, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    del cfg["ducts"]["inlet"]["skin_fit"]
+    app = ExploreApp(plotter, scene, cfg, path, None)
+    assert app.skin_fit == "none" and app.fit.area == pytest.approx(app.area, rel=1e-9)
+    cfg["ducts"]["inlet"]["skin_fit"] = "wrap"
+    with pytest.raises(ValueError, match="skin_fit"):
+        ExploreApp(plotter, scene, cfg, path, None)
+
+
 # ---- save / reload ---------------------------------------------------------------------------------------
 def test_inlet_definition_contents(plotter, scene, example_env):
     _, path, _ = example_env
@@ -193,7 +263,8 @@ def test_inlet_definition_contents(plotter, scene, example_env):
     app.pick([3.0, 0.4, 1.4])
     app.set_param("tilt_deg", 20.0)
     d = app.inlet_definition()
-    assert set(d) == {"centroid", "normal", "tilt_deg", "shape"}
+    assert set(d) == {"centroid", "normal", "tilt_deg", "skin_fit", "shape"}
+    assert d["skin_fit"] == "bottom_edge"
     assert d["centroid"] == pytest.approx(list(app.centroid))
     assert d["normal"] == pytest.approx(list(inlet_frame(20.0)[2]))
     assert d["shape"] == app.shape.to_dict() and d["tilt_deg"] == 20.0
