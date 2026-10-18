@@ -5,9 +5,10 @@ geometry, and write them into an [OpenVSP](https://openvsp.org) model as native,
 GUI-editable components. You keep working in the OpenVSP GUI afterwards; the Python API is
 only used to generate and update the duct components.
 
-> **Status: early development.** Only the environment/config scaffolding exists so far
-> (config loader, `env_check.py`, example model). The design, check and export stages
-> below are planned and not implemented yet; see [PHASES.md](PHASES.md).
+> **Status: early development.** Implemented so far: the environment/config scaffolding
+> (config loader, `env_check.py`, example model) and Phase 1 engine/capture-area sizing.
+> The geometry, check and export stages below are planned and not implemented yet; see
+> [PHASES.md](PHASES.md).
 
 ## What it will do
 
@@ -70,12 +71,31 @@ Pass `--config <path>` to choose a file explicitly.
 .venv\Scripts\python env_check.py --config duct_config.example.yaml
 ```
 
+### Engine and capture-area sizing
+
+```powershell
+.venv\Scripts\python -m ductmgr.engine --config duct_config.example.yaml
+```
+
+Prints the ISA conditions, free-stream velocity, total temperature and pressure, face area, corrected and
+actual mass flow, face Mach number (subsonic root of the isentropic flow function), total and per-inlet
+capture area, and a specific-thrust sanity check. Out-of-range results are flagged `WARN`, never silently
+corrected. If the requested corrected flow cannot pass the face (choked), it stops with an error that states
+the maximum mass flow for that face area.
+
+Run the tests (they use only hard-coded values and the example config):
+
+```powershell
+.venv\Scripts\python -m pytest
+```
+
 ## Using your own model
 
 ```powershell
 Copy-Item duct_config.example.yaml duct_config.yaml
 # edit duct_config.yaml: model.vsp3_path, model.fuselage_name, engine and duct values
 .venv\Scripts\python env_check.py
+.venv\Scripts\python -m ductmgr.engine
 ```
 
 All inputs live in the YAML config; the example file documents every field.
