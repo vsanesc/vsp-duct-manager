@@ -104,7 +104,10 @@ All inputs live in the YAML config; the example file documents every field.
 
 ## Development
 
-Hooks run [gitleaks](https://github.com/gitleaks/gitleaks) and a 1 MB file-size limit before each commit:
+Hooks run [gitleaks](https://github.com/gitleaks/gitleaks), a 1 MB file-size limit, and a local check
+(`scripts/check_private_values.py`) that blocks a commit if its added lines contain a value from your private
+`duct_config.yaml` (it reports file:line and the config key, never the value; it does nothing if that file is
+absent). Stage files by name rather than with `git add .`.
 
 ```powershell
 .venv\Scripts\python -m pre_commit install

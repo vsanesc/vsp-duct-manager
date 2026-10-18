@@ -8,3 +8,12 @@ repos:
     hooks:
       - id: check-added-large-files
         args: ["--maxkb=1024"]
+  - repo: local
+    hooks:
+      - id: check-private-values
+        name: block values from the private duct_config.yaml
+        entry: python scripts/check_private_values.py
+        language: python
+        additional_dependencies: [pyyaml]
+        pass_filenames: false
+        always_run: true

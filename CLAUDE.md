@@ -34,6 +34,8 @@ Lives in `CLAUDE.local.md` (gitignored, never published). Imported below:
    Run the secret scan (pre-commit) before every commit; never push without the
    user's explicit OK.
 7. Each phase ends with its acceptance checks passing; report results, then stop.
+8. Never use `git add .`, `git add -A` or `git commit -a`. Stage files by name and
+   show `git diff --cached --stat` before every commit.
 
 ## Layout
 ```
