@@ -17,7 +17,6 @@ from ductmgr.geometry import InletPlane, polygon_area
 CHINE_ANGLE_DEG = 30.0  # a vertex whose turning angle exceeds this is a chine corner
 MERGE_TOL = 1e-9  # m: consecutive section points closer than this are merged
 ARC_EPS = 1e-12  # m: tolerance when deciding which polyline vertices lie strictly inside an arc
-ALIGN_HALF_SPAN_FRACTION = 0.05  # of the fuselage length: station spacing for the chine direction
 
 
 @dataclass(frozen=True)
@@ -219,48 +218,3 @@ def signed_distance(section: Section, pts: np.ndarray) -> np.ndarray:
     """Distance to the skin: positive outside the fuselage section, negative inside (unsigned if open)."""
     dist = distance_to_section(section, pts)
     return np.where(inside_mask(section, pts), -dist, dist)
-
-
-# ---- chine alignment ---------------------------------------------------------------------------------------
-def _nearest_chine_3d(mesh: pv.PolyData, x: float, near_yz: np.ndarray) -> np.ndarray | None:
-    plane = InletPlane((x, float(near_yz[0]), float(near_yz[1])), 0.0, 0.0)
-    sec = compute_section(mesh, plane)
-    if sec is None or len(sec.chines) == 0:
-        return None
-    corners = plane.to_3d(sec.points[sec.chines])
-    return corners[int(np.argmin(np.linalg.norm(corners[:, 1:] - near_yz, axis=1)))]
-
-
-def chine_planform_direction(mesh: pv.PolyData, origin) -> tuple[float, float] | None:
-    """Planform (dx, dy) direction of the chine line nearest ``origin``, from the sections before and after it."""
-    ox, oy, oz = (float(c) for c in origin)
-    b = mesh.bounds
-    half = ALIGN_HALF_SPAN_FRACTION * (b[1] - b[0])
-    mid = _nearest_chine_3d(mesh, ox, np.array([oy, oz]))
-    if mid is None:
-        return None
-    fore = _nearest_chine_3d(mesh, ox - half, mid[1:])
-    aft = _nearest_chine_3d(mesh, ox + half, mid[1:])
-    if fore is None or aft is None:
-        return None
-    dx, dy = aft[0] - fore[0], aft[1] - fore[1]
-    norm = math.hypot(dx, dy)
-    return (dx / norm, dy / norm) if norm > 0 else None
-
-
-def sweep_for_direction(dx: float, dy: float) -> float:
-    """The sweep (deg, within +-90) that makes the opening's u axis parallel to the planform direction (dx, dy).
-
-    u = R_z(sweep) . (-Y) = (sin sweep, -cos sweep, 0) is independent of pitch.
-    """
-    if abs(dy) < 1e-12:
-        return 90.0
-    return math.degrees(math.atan2(-math.copysign(1.0, dy) * dx, abs(dy)))
-
-
-def align_sweep_to_chine(mesh: pv.PolyData, origin) -> tuple[float, tuple[float, float]] | None:
-    """(sweep in degrees, planform direction) aligning the opening with the local chine line, or None."""
-    direction = chine_planform_direction(mesh, origin)
-    if direction is None:
-        return None
-    return sweep_for_direction(*direction), direction

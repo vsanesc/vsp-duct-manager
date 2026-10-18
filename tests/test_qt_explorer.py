@@ -26,7 +26,6 @@ from ductmgr import qt_explorer as qe  # noqa: E402
 from ductmgr import qt_sketch as qs  # noqa: E402
 from ductmgr.config import EXAMPLE_CONFIG, load_config  # noqa: E402
 from ductmgr.explore_model import InletModel, Readout  # noqa: E402
-from ductmgr.section import sweep_for_direction  # noqa: E402
 from ductmgr.viz import ACCENT, BACKGROUND, load_scene  # noqa: E402
 
 
@@ -111,7 +110,7 @@ def test_the_panel_has_the_plane_controls_and_no_shape_or_skin_fit_widgets(make_
         assert isinstance(box, qe.FocusSpinBox)
     for axis, box in w.spin_pos.items():
         assert box.decimals() == 3 and box.suffix() == " m"  # 3 decimals, in metres
-    assert w.btn_align.text() == "Align to chine"
+    assert w.btn_align.text() == "Align to edge…"
     for gone in ("spin_shape", "spin_tilt", "combo_fit"):  # the parametric shape / skin fit controls are removed
         assert not hasattr(w, gone)
     for grp in (w.grp_place, w.grp_position, w.grp_readouts):
@@ -291,7 +290,7 @@ def test_groups_collapse(make_window):
     assert grp.expanded and not grp.body.isHidden()
 
 
-# ---- fit area and align to chine -------------------------------------------------------------------------------
+# ---- fit area -------------------------------------------------------------------------------
 def test_the_fit_area_button_restores_the_target(make_window):
     w = make_window()
     m = w.model
@@ -301,31 +300,136 @@ def test_the_fit_area_button_restores_the_target(make_window):
     assert abs(m.opening.delta) < 0.005 and "Area fitted" in w.message_label.text()
 
 
-def test_align_to_chine_sets_the_sweep_spin_box():
-    taper = bodies.tapered_chined_body()
-    scene = SimpleNamespace(fuselage=taper, sizing=SimpleNamespace(capture_area_per_inlet=0.05), engine_check=None,
-                            warnings=[], face_center=None)
-    cfg = {"ducts": {"inlet": {"origin": [4.0, 1.0, 0.6]}}}
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    win = qe.ExploreWindow(scene, InletModel(scene, cfg, EXAMPLE_CONFIG, None), with_3d=False)
-    try:
-        win.btn_align.click()
-        expected = sweep_for_direction(1.0, 0.125)
-        assert win.spin_sweep.value() == pytest.approx(expected, abs=0.01)  # the resulting sweep is shown...
-        assert "Aligned to the chine" in win.message_label.text()
-        win.spin_sweep.setValue(10.0)  # ...and stays editable
-        assert win.model.state.plane.sweep_deg == 10.0
-    finally:
-        win.ask_unsaved = lambda: "discard"
-        win.model._listeners.clear()
-        win.close()
+# ---- align to edge ---------------------------------------------------------------------------------------------
+def wings():
+    from ductmgr import vspio
+
+    two = (vspio.WingSection(0.0, 0.9, 35.0, 12.0), vspio.WingSection(0.9, 2.5, 15.0, 15.0))
+    return [vspio.WingPlanform("a", "Wing", two, False), vspio.WingPlanform("b", "Fins", two[:1], True),
+            vspio.WingPlanform("c", "Fins", two[1:], False)]
 
 
-def test_align_without_a_chine_says_so_in_the_status_bar(make_window):
-    w = make_window()  # the default example fuselage has no sharp chine near the dorsal origin
+def stand_in_scene(wing_list):
+    return SimpleNamespace(fuselage=bodies.cylinder(1.0), sizing=SimpleNamespace(capture_area_per_inlet=0.1),
+                           engine_check=None, warnings=[], face_center=None, wings=wing_list)
+
+
+def test_wing_names_are_numbered_only_when_repeated():
+    assert qe.wing_display_names(wings()) == ["Wing", "Fins #1", "Fins #2"]
+    assert qe.wing_display_names([]) == []
+
+
+def test_the_dialog_offers_the_wings_and_reads_their_edges_at_the_inlet_y(qapp):
+    dlg = qe.AlignEdgeDialog(wings(), y=0.4, pitch_deg=0.0)
+    assert dlg.radio_wing.isChecked() and dlg.radio_le.isChecked()
+    assert [dlg.combo_wing.itemText(i) for i in range(3)] == ["Wing", "Fins #1", "Fins #2"]
+    assert dlg.choice() == (35.0, "Wing LE")  # section 1 spans y = 0.4
+    dlg.radio_te.setChecked(True)
+    assert dlg.choice() == (12.0, "Wing TE")
+    assert "Section 1 of 2" in dlg.info.text() and "LE Λ = 35.0°" in dlg.info.text() and "TE Λ = 12.0°" in dlg.info.text()
+    dlg.radio_le.setChecked(True)
+    dlg.combo_wing.setCurrentIndex(2)  # the second "Fins": a single outer section, the inlet is outside its span
+    assert dlg.choice() == (15.0, "Fins LE")
+    assert "outside the wing span" in dlg.info.text()
+    dlg.combo_wing.setCurrentIndex(1)
+    assert "rotated" in dlg.info.text()  # the rotated wing is flagged
+
+
+def test_the_dialog_uses_the_section_at_the_inlet_y(qapp):
+    dlg = qe.AlignEdgeDialog(wings(), y=1.4, pitch_deg=0.0)
+    assert dlg.choice() == (15.0, "Wing LE") and "Section 2 of 2" in dlg.info.text()
+
+
+def test_the_manual_angle(qapp):
+    dlg = qe.AlignEdgeDialog(wings(), y=0.4, pitch_deg=0.0)
+    dlg.radio_manual.setChecked(True)
+    assert not dlg.combo_wing.isEnabled() and dlg.spin_manual.isEnabled()
+    dlg.spin_manual.setValue(42.5)
+    assert dlg.choice() == (42.5, "manual")
+    assert "gives sweep -42.50°" in dlg.preview.text()
+
+
+def test_without_wings_only_the_manual_angle_is_possible(qapp):
+    dlg = qe.AlignEdgeDialog([], y=0.4, pitch_deg=0.0)
+    assert not dlg.radio_wing.isEnabled() and dlg.radio_manual.isChecked()
+    assert dlg.choice() == (qe.MANUAL_ANGLE_DEFAULT_DEG, "manual") and "no Wing geom" in dlg.info.text()
+
+
+def test_the_dialog_blocks_an_alignment_that_leaves_n_dot_x_below_0_2(qapp):
+    ok = lambda d: d.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)  # noqa: E731
+    dlg = qe.AlignEdgeDialog(wings(), y=0.4, pitch_deg=0.0)
+    dlg.radio_manual.setChecked(True)
+    dlg.spin_manual.setValue(75.0)
+    assert ok(dlg).isEnabled() and dlg.blocked_reason() is None
+    dlg.spin_manual.setValue(80.0)  # cos 80 = 0.17
+    assert not ok(dlg).isEnabled()
+    assert "|n.X| would be 0.17" in dlg.blocked_reason() and "Blocked" in dlg.preview.text()
+    assert qe.COLORS["error"].lower() in dlg.preview.styleSheet().lower()
+    steep = qe.AlignEdgeDialog(wings(), y=0.4, pitch_deg=60.0)  # the pitch counts too: 0.5 * cos 35
+    assert steep.choice()[0] == 35.0 and ok(steep).isEnabled()
+    steep.radio_manual.setChecked(True)
+    steep.spin_manual.setValue(70.0)  # 0.5 * 0.342 = 0.171
+    assert not ok(steep).isEnabled()
+
+
+def test_the_align_button_asks_for_an_edge_and_applies_it(make_window, monkeypatch):
+    w = make_window()
+    assert w.btn_align.text() == "Align to edge…" and w.act_align.text() == "Align to edge…"
+    asked = []
+    monkeypatch.setattr(w, "ask_edge", lambda: asked.append(1) or (35.0, "Wing LE"))
     w.btn_align.click()
-    text = w.message_label.text()
-    assert "Aligned" in text or "No chine" in text  # either outcome is reported, never silent
+    assert asked == [1] and w.spin_sweep.value() == -35.0  # the sweep shows the result and stays editable
+    assert "Aligned to Wing LE (Λ = 35.0°)" in w.message_label.text()
+    assert "aligned to: Wing LE (Λ = 35.0°)" in w.readout_view.toPlainText()
+    w.spin_sweep.setValue(-34.0)  # editing the sweep afterwards: custom
+    line = next(l for l in w.readout_view.toPlainText().splitlines() if l.startswith("Sweep source"))
+    assert line.split(None, 2)[2] == "custom"
+    assert "aligned to:" not in w.readout_view.toPlainText()
+
+
+def test_cancelling_the_picker_changes_nothing(make_window, monkeypatch):
+    w = make_window()
+    monkeypatch.setattr(w, "ask_edge", lambda: None)
+    state = w.model.state
+    w.btn_align.click()
+    assert w.model.state == state and not w.windowTitle().endswith("*")
+
+
+def test_a_blocked_alignment_is_explained_in_the_status_bar(make_window, monkeypatch):
+    w = make_window()
+    monkeypatch.setattr(w, "ask_edge", lambda: (82.0, "manual"))
+    state = w.model.state
+    w.btn_align.click()
+    assert w.model.state == state
+    assert "Not aligned" in w.message_label.text() and "< 0.2" in w.message_label.text()
+
+
+def test_the_button_does_nothing_before_an_inlet_exists(make_window, example_env, monkeypatch):
+    w = make_window(cfg=unplaced(example_env))
+    monkeypatch.setattr(w, "ask_edge", lambda: pytest.fail("no inlet: the picker must not open"))
+    assert not w.btn_align.isEnabled()
+    w._on_align()  # the action / slot is guarded as well
+
+
+def test_the_picker_dialog_is_built_for_the_inlet_y_and_pitch(make_window, monkeypatch):
+    scene = stand_in_scene(wings())
+    cfg = {"ducts": {"inlet": {"origin": [4.0, 1.4, 1.0], "pitch_deg": 12.0}}}
+    w = make_window(cfg=cfg, the_scene=scene)
+    built = {}
+    real = qe.AlignEdgeDialog
+
+    class Spy(real):
+        def __init__(self, wing_list, y, pitch, parent=None):
+            built.update(y=y, pitch=pitch, n=len(wing_list))
+            super().__init__(wing_list, y, pitch, parent)
+
+        def exec(self):
+            built["choice"] = self.choice()
+            return QtWidgets.QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(qe, "AlignEdgeDialog", Spy)
+    assert w.ask_edge() is None  # rejected
+    assert built == {"y": 1.4, "pitch": 12.0, "n": 3, "choice": (15.0, "Wing LE")}  # section 2 at y = 1.4
 
 
 # ---- readouts ---------------------------------------------------------------------------------------------------

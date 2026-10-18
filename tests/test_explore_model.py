@@ -18,7 +18,7 @@ from ductmgr import sketch as sk
 from ductmgr.config import EXAMPLE_CONFIG, load_config
 from ductmgr.explore_model import InletModel, legacy_notice, state_from_config
 from ductmgr.geometry import InletPlane
-from ductmgr.section import distance_to_section, sweep_for_direction
+from ductmgr.section import distance_to_section
 from ductmgr.viz import load_scene
 
 
@@ -76,10 +76,10 @@ def unplaced_cfg(example_env):
     return cfg, path
 
 
-def body_scene(body, area=0.1):
+def body_scene(body, area=0.1, wings=()):
     """A stand-in scene around an analytic body (no OpenVSP)."""
     return SimpleNamespace(fuselage=body, sizing=SimpleNamespace(capture_area_per_inlet=area), engine_check=None,
-                           warnings=[], face_center=np.array([6.0, 0.0, 0.0]))
+                           warnings=[], face_center=np.array([6.0, 0.0, 0.0]), wings=list(wings))
 
 
 def body_model(body, origin, area=0.1, pitch=0.0, sweep=0.0, clock=None):
@@ -291,23 +291,132 @@ def test_a_new_change_clears_the_redo_history_and_listeners_hear_everything(scen
     assert len(calls) == 3
 
 
-# ---- chine alignment -----------------------------------------------------------------------------------------------------
-def test_align_to_chine_sets_the_sweep_and_keeps_the_sketch_valid():
-    taper = bodies.tapered_chined_body()
-    m = body_model(taper, (4.0, 1.0, 0.6), area=0.05)
-    assert m.align_to_chine()
-    expected = sweep_for_direction(1.0, 0.125)
-    assert m.state.plane.sweep_deg == pytest.approx(expected, abs=1e-3)
-    assert "Aligned to the chine" in m.message and f"{m.state.plane.sweep_deg:.2f}" in m.message
-    assert m.opening is not None
-    m.set_param("sweep_deg", 10.0)  # it remains editable
-    assert m.state.plane.sweep_deg == 10.0
-    assert m.undo() and m.undo() and m.state.plane.sweep_deg == 0.0  # and every step is undoable
+# ---- planform edge alignment ----------------------------------------------------------------------------------------------------
+def sweep_text(m):
+    return {r.label: r.value for r in m.readouts() if r.label}["Sweep source"]
 
 
-def test_align_to_chine_without_a_chine_says_so():
-    m = body_model(bodies.cylinder(1.0), (4.0, 0.0, 1.0))
-    assert not m.align_to_chine() and "No chine" in m.message and m.state.plane.sweep_deg == 0.0
+def test_aligning_to_an_angle_sets_the_sweep_to_the_negative_edge_angle(scene, example_env, clock):
+    from ductmgr.geometry import planform_trace_direction
+
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    assert sweep_text(m) == "custom"  # nothing aligned yet
+    clock.advance(10.0)
+    assert m.align_to_edge(30.0, "manual")
+    assert m.state.plane.sweep_deg == -30.0 and m.dirty
+    assert "Aligned to manual (Λ = 30.0°)" in m.message
+    dx, dy = planform_trace_direction(m.state.plane)
+    assert dy > 0 and dx > 0 and math.degrees(math.atan2(dx, dy)) == pytest.approx(30.0, abs=1e-9)  # trails aft
+    assert sweep_text(m) == "aligned to: manual (Λ = 30.0°)"
+    assert m.opening.projection_factor == pytest.approx(math.cos(math.radians(30.0)))
+
+
+def test_editing_the_sweep_afterwards_shows_custom_and_undo_restores_the_alignment_text(scene, example_env, clock):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    clock.advance(10.0)
+    m.align_to_edge(30.0, "Wing LE")
+    assert sweep_text(m) == "aligned to: Wing LE (Λ = 30.0°)"
+    clock.advance(10.0)
+    m.set_param("sweep_deg", -29.0)  # not persistent: any edit is "custom"
+    assert sweep_text(m) == "custom"
+    m.undo()
+    assert sweep_text(m) == "aligned to: Wing LE (Λ = 30.0°)"  # the sweep is the aligned one again
+    m.undo()
+    assert m.state.plane.sweep_deg == 0.0 and sweep_text(m) == "custom"
+
+
+def test_the_alignment_is_not_saved_and_is_forgotten_on_revert(scene, writable, clock):
+    m = make(scene, writable, writable, clock=clock)
+    clock.advance(10.0)
+    m.align_to_edge(25.0, "Wing LE")
+    assert m.save()
+    saved = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlet"]
+    assert saved["sweep_deg"] == -25.0 and not any("align" in k for k in saved)  # only the sweep is stored
+    fresh = make(scene, writable, writable)
+    assert sweep_text(fresh) == "custom"  # a reloaded sweep is just a number
+    clock.advance(10.0)
+    m.set_param("sweep_deg", 5.0)
+    m.align_to_edge(40.0, "Wing LE")
+    m.revert()
+    assert sweep_text(m) == "custom"
+
+
+@pytest.mark.parametrize("pitch, edge, blocked", [
+    (0.0, 70.0, False),  # |n.X| = 0.34: allowed (the < 0.5 warning stays)
+    (0.0, 78.0, False),  # 0.208
+    (0.0, 79.0, True),   # 0.191
+    (0.0, 80.0, True),
+    (60.0, 60.0, False),  # cos 60 cos 60 = 0.25
+    (60.0, 70.0, True),   # 0.171
+    (-60.0, 70.0, True),
+])
+def test_an_alignment_that_would_leave_n_dot_x_below_0_2_is_blocked(scene, example_env, clock, pitch, edge, blocked):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    clock.advance(10.0)
+    m.set_param("pitch_deg", pitch)
+    before, history = m.state, m.can_undo
+    clock.advance(10.0)
+    ok = m.align_to_edge(edge, "manual")
+    factor = math.cos(math.radians(pitch)) * math.cos(math.radians(edge))
+    if blocked:
+        assert not ok and m.state == before and m.can_undo == history  # nothing changed, no history entry
+        assert f"|n.X| would be {factor:.2f}" in m.message and "< 0.2" in m.message and "off the flow" in m.message
+        assert sweep_text(m) == "custom"
+    else:
+        assert ok and m.state.plane.sweep_deg == -edge
+
+
+def test_the_flow_angle_warning_stays_for_an_allowed_but_steep_alignment(scene, example_env):
+    _, path, _ = example_env
+    m = make(scene, path)
+    assert m.align_to_edge(65.0, "manual")  # |n.X| = 0.42: allowed, but still below 0.5
+    assert any("off the flow" in r.value and r.level == "warn" for r in m.readouts())
+    rows = {r.label: r for r in m.readouts() if r.label}
+    assert rows["|n.X|"].level == "warn"
+
+
+def test_the_wing_edge_is_read_in_the_section_spanning_the_inlet_y(scene, example_env, clock):
+    wing = vspio_wing()
+    cfg = {"ducts": {"inlet": {"origin": [4.0, 0.3, 1.0]}}}
+    m = InletModel(body_scene(bodies.cylinder(1.0), wings=[wing]), cfg, EXAMPLE_CONFIG, None, clock=clock)
+    inner = m.wing_edge(0, "LE")
+    assert (inner.section_index, inner.angle_deg) == (0, 35.0)
+    assert m.wing_edge(0, "TE").angle_deg == 12.0
+    clock.advance(10.0)
+    m.set_origin(4.0, 1.2, 1.0)  # an inlet further out: the second section applies
+    assert m.wing_edge(0, "LE").angle_deg == 15.0 and m.wing_edge(0, "LE").section_index == 1
+    assert m.align_to_edge(m.wing_edge(0, "LE").angle_deg, "Wing LE")
+    assert m.state.plane.sweep_deg == -15.0 and sweep_text(m) == "aligned to: Wing LE (Λ = 15.0°)"
+
+
+def test_aligning_needs_a_placed_inlet(scene, example_env):
+    cfg, path = unplaced_cfg(example_env)
+    m = InletModel(scene, cfg, path, None)
+    assert not m.align_to_edge(30.0, "manual") and not m.can_undo
+
+
+def test_the_left_inlet_follows_the_mirrored_edge_after_an_alignment(scene, example_env):
+    from ductmgr.geometry import planform_trace_direction
+
+    _, path, _ = example_env
+    m = make(scene, path)
+    m.align_to_edge(35.0, "manual")
+    left = m.state.plane.mirrored()
+    assert left.sweep_deg == 35.0 and left.origin[1] == -m.state.plane.origin[1]
+    dx, dy = planform_trace_direction(left)  # oriented outboard (+y), so compare as lines
+    right_dx, right_dy = planform_trace_direction(m.state.plane)
+    assert (dx, dy) == pytest.approx((-right_dx, right_dy), abs=1e-12) or (dx, dy) == pytest.approx((right_dx, -right_dy), abs=1e-12)
+
+
+def vspio_wing():
+    """A two-section planform: LE 35 / TE 12 degrees out to y = 0.9, then LE 15 / TE 15 degrees."""
+    from ductmgr import vspio
+
+    return vspio.WingPlanform("id", "Wing", (vspio.WingSection(0.0, 0.9, 35.0, 12.0),
+                                             vspio.WingSection(0.9, 2.5, 15.0, 15.0)), False)
 
 
 # ---- place mode --------------------------------------------------------------------------------------------------------------------

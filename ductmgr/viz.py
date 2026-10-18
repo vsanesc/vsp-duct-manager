@@ -55,6 +55,7 @@ class Scene:
     envelope_diameter: float | None = None  # engine Geom bounding box (casing), when the Geom is known
     engine_check: vspio.FaceEnvelopeCheck | None = None
     warnings: list[str] = field(default_factory=list)
+    wings: list[vspio.WingPlanform] = field(default_factory=list)  # planform edges, from the VSP parameters
 
 
 def load_scene(cfg: dict, config_path: Path) -> Scene:
@@ -119,6 +120,7 @@ def load_scene(cfg: dict, config_path: Path) -> Scene:
         envelope_diameter=envelope_diameter,
         engine_check=engine_check,
         warnings=msgs,
+        wings=vspio.read_wings(geoms),
     )
 
 

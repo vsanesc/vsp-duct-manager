@@ -8,12 +8,15 @@ The window only translates between widgets and ``explore_model.InletModel``; all
 live in the model. The 3D view (pyvistaqt ``QtInteractor``) draws no widgets of its own.
 """
 import html
+import math
 import sys
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ductmgr.explore_model import MODE_PLACING, InletModel, Readout
+from ductmgr import vspio
+from ductmgr.explore_model import MIN_ALIGN_PROJECTION, MODE_PLACING, InletModel, Readout
+from ductmgr.geometry import InletPlane, sweep_for_edge_angle
 from ductmgr.qt_sketch import SketchDock
 from ductmgr.viz import ACCENT, BACKGROUND, Scene, SceneView
 
@@ -32,6 +35,7 @@ POSITION_MARGIN = 0.05  # of the fuselage size, beyond its bounds, for the posit
 PITCH_RANGE_DEG = (-85.0, 85.0)
 SWEEP_RANGE_DEG = (-90.0, 90.0)
 CLICK_TOLERANCE_PX = 4  # a press-release further apart than this is a camera drag, not a click
+MANUAL_ANGLE_DEFAULT_DEG = 30.0  # the edge picker's starting manual angle
 COLORS = {"info": "#C9D1D9", "pass": "#4CAF50", "warn": "#E0A030", "error": "#F85149"}  # readout text colours
 
 STYLESHEET = f"""
@@ -125,6 +129,126 @@ class CollapsibleGroup(QtWidgets.QWidget):
         return self.header.isChecked()
 
 
+def wing_display_names(wings) -> list[str]:
+    """Wing names for the picker; a repeated name gets its running number (several geoms may share a name)."""
+    totals = {}
+    for w in wings:
+        totals[w.name] = totals.get(w.name, 0) + 1
+    seen = {}
+    out = []
+    for w in wings:
+        seen[w.name] = seen.get(w.name, 0) + 1
+        out.append(f"{w.name} #{seen[w.name]}" if totals[w.name] > 1 else w.name)
+    return out
+
+
+class AlignEdgeDialog(QtWidgets.QDialog):
+    """Picks the edge to align the opening's planform trace with: a wing's leading / trailing edge (read from its
+    VSP parameters in the section spanning the inlet's y) or a manual angle."""
+
+    def __init__(self, wings, y: float, pitch_deg: float, parent=None):
+        super().__init__(parent)
+        self.wings, self.y, self.pitch_deg = list(wings), float(y), float(pitch_deg)
+        self.setWindowTitle("Align to edge")
+        self.radio_wing = QtWidgets.QRadioButton("Wing edge (from the VSP parameters)")
+        self.combo_wing = QtWidgets.QComboBox()
+        self.combo_wing.addItems(wing_display_names(self.wings))
+        self.radio_le = QtWidgets.QRadioButton("Leading edge")
+        self.radio_te = QtWidgets.QRadioButton("Trailing edge")
+        self.radio_le.setChecked(True)
+        edge_group = QtWidgets.QButtonGroup(self)
+        edge_group.addButton(self.radio_le)
+        edge_group.addButton(self.radio_te)
+        self.radio_manual = QtWidgets.QRadioButton("Manual angle (swept back is positive)")
+        self.spin_manual = FocusSpinBox()
+        self.spin_manual.setRange(-89.0, 89.0)
+        self.spin_manual.setDecimals(2)
+        self.spin_manual.setSingleStep(1.0)
+        self.spin_manual.setSuffix(" deg")
+        self.spin_manual.setValue(MANUAL_ANGLE_DEFAULT_DEG)
+        self.spin_manual.setLocale(QtCore.QLocale(QtCore.QLocale.Language.English))
+        source = QtWidgets.QButtonGroup(self)
+        source.addButton(self.radio_wing)
+        source.addButton(self.radio_manual)
+        has_wings = bool(self.wings)
+        self.radio_wing.setEnabled(has_wings)
+        self.combo_wing.setEnabled(has_wings)
+        (self.radio_wing if has_wings else self.radio_manual).setChecked(True)
+        self.info = QtWidgets.QLabel()
+        self.info.setWordWrap(True)
+        self.preview = QtWidgets.QLabel()
+        self.preview.setWordWrap(True)
+        self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok
+                                                  | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+        form = QtWidgets.QVBoxLayout(self)
+        form.addWidget(self.radio_wing)
+        row = QtWidgets.QHBoxLayout()
+        row.addSpacing(18)
+        row.addWidget(self.combo_wing, 1)
+        row.addWidget(self.radio_le)
+        row.addWidget(self.radio_te)
+        form.addLayout(row)
+        form.addWidget(self.radio_manual)
+        row = QtWidgets.QHBoxLayout()
+        row.addSpacing(18)
+        row.addWidget(self.spin_manual)
+        row.addStretch(1)
+        form.addLayout(row)
+        form.addWidget(self.info)
+        form.addWidget(self.preview)
+        form.addWidget(self.buttons)
+        for w in (self.radio_wing, self.radio_manual, self.radio_le, self.radio_te):
+            w.toggled.connect(self.refresh)
+        self.combo_wing.currentIndexChanged.connect(self.refresh)
+        self.spin_manual.valueChanged.connect(self.refresh)
+        self.refresh()
+
+    def choice(self) -> tuple[float, str] | None:
+        """(edge sweep in degrees, label), or None when no wing is available for a wing choice."""
+        if self.radio_manual.isChecked() or not self.wings:
+            return float(self.spin_manual.value()), "manual"
+        wing = self.wings[self.combo_wing.currentIndex()]
+        edge = "LE" if self.radio_le.isChecked() else "TE"
+        return vspio.edge_sweep_at(wing, self.y, edge).angle_deg, f"{wing.name} {edge}"
+
+    def blocked_reason(self) -> str | None:
+        angle, _ = self.choice()
+        factor = InletPlane((0.0, 0.0, 0.0), self.pitch_deg, sweep_for_edge_angle(angle)).projection_factor
+        if factor < MIN_ALIGN_PROJECTION:
+            return (f"Blocked: |n.X| would be {factor:.2f} (< {MIN_ALIGN_PROJECTION:g}): the opening would be more "
+                    f"than {math.degrees(math.acos(MIN_ALIGN_PROJECTION)):.0f} deg off the flow")
+        return None
+
+    def refresh(self) -> None:
+        wing_mode = self.radio_wing.isChecked() and bool(self.wings)
+        self.combo_wing.setEnabled(wing_mode)
+        self.radio_le.setEnabled(wing_mode)
+        self.radio_te.setEnabled(wing_mode)
+        self.spin_manual.setEnabled(not wing_mode)
+        notes = []
+        if wing_mode:
+            wing = self.wings[self.combo_wing.currentIndex()]
+            le, te = vspio.edge_sweep_at(wing, self.y, "LE"), vspio.edge_sweep_at(wing, self.y, "TE")
+            notes.append(f"Section {le.section_index + 1} of {le.n_sections} (y {le.y0:.2f} .. {le.y1:.2f} m): "
+                         f"LE Λ = {le.angle_deg:.1f}°, TE Λ = {te.angle_deg:.1f}°")
+            if le.outside:
+                notes.append("The inlet's y is outside the wing span: the nearest section is used.")
+            if wing.rotated:
+                notes.append("This wing is rotated: its sweeps are given in its own frame.")
+        elif not self.wings:
+            notes.append("There is no Wing geom in the model: enter an angle.")
+        self.info.setText("\n".join(notes))
+        angle, label = self.choice()
+        reason = self.blocked_reason()
+        sweep = sweep_for_edge_angle(angle)
+        self.preview.setText(reason or f"{label}: Λ = {angle:.1f}° gives sweep {sweep:.2f}°")
+        self.preview.setStyleSheet(f"color: {COLORS['error' if reason else 'info']};")
+        self.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setEnabled(reason is None)
+
+
 class ExploreWindow(QtWidgets.QMainWindow):
     def __init__(self, scene: Scene, model: InletModel, with_3d: bool = True, parent=None):
         super().__init__(parent)
@@ -179,8 +303,9 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.act_save = self._action("Save to config", m.save, ["Ctrl+S"], tip="Save to config (Ctrl+S)")
         self.act_revert = self._action("Revert to saved", m.revert, tip="Re-read the inlet from the config file")
         self.act_fit_area = self._action("Fit area", m.fit_area, tip="Scale the free vertices to the target area")
-        self.act_align = self._action("Align to chine", m.align_to_chine,
-                                      tip="Set the sweep so the opening's u axis is parallel to the local chine line")
+        self.act_align = self._action("Align to edge…", self._on_align,
+                                      tip="Set the sweep so the opening's planform trace is parallel to a wing "
+                                          "edge or to a given angle")
         self.view_actions = {
             name: self._action(name.capitalize(), lambda n=name: self._set_view(n), [str(i + 1)],
                                tip=f"{name.capitalize()} view ({i + 1})")
@@ -271,9 +396,9 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.spin_sweep.valueChanged.connect(lambda v: self._on_param("sweep_deg", v))
         self.grp_position.form.addRow("Pitch", self.spin_pitch)
         self.grp_position.form.addRow("Sweep", self.spin_sweep)
-        self.btn_align = QtWidgets.QPushButton("Align to chine")
+        self.btn_align = QtWidgets.QPushButton("Align to edge…")
         self.btn_align.setToolTip(self.act_align.toolTip())
-        self.btn_align.clicked.connect(lambda *_: self.model.align_to_chine())
+        self.btn_align.clicked.connect(lambda *_: self._on_align())
         self.grp_position.form.addRow(self.btn_align)
         col.addWidget(self.grp_position)
 
@@ -338,6 +463,19 @@ class ExploreWindow(QtWidgets.QMainWindow):
     def _on_lock(self, locked: bool) -> None:
         if not self._syncing:
             self.model.set_locked(locked)
+
+    def ask_edge(self) -> tuple[float, str] | None:
+        """Show the edge picker; (edge sweep in degrees, label) or None when cancelled."""
+        plane = self.model.state.plane
+        dialog = AlignEdgeDialog(self.scene.wings, plane.origin[1], plane.pitch_deg, self)
+        return dialog.choice() if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted else None
+
+    def _on_align(self) -> None:
+        if not self.model.placed:
+            return
+        choice = self.ask_edge()
+        if choice is not None:
+            self.model.align_to_edge(*choice)
 
     def _on_step(self) -> None:
         step = self.combo_step.currentData()

@@ -112,10 +112,18 @@ and `u = v x n` (seen from the front, `u` to the right and `v` up, so the aircra
 sketch vertices are stored as `(u, v)` in metres relative to `O`, never as `(y, z)`. The left inlet is the exact
 mirror image of the right one about XZ (origin mirrored, sweep negated, `u` negated). The capture area is the
 opening area projected normal to the freestream, `area_in_plane * |n . X|`; the readouts show both, and warn when
-`|n . X| < 0.5` (the opening is more than 60 degrees off the flow). **Align to chine** looks at the chine line
-nearest `O` in planform and sets the sweep so the opening's `u` axis is parallel to it; the sweep stays editable.
-(A chine running along X gives a sweep of 90 degrees, a plane parallel to the flow, which the `|n . X|` warning
-flags; the alignment is meant for chines swept well away from X.)
+`|n . X| < 0.5` (the opening is more than 60 degrees off the flow).
+
+**Align to edge...** sets the sweep so the opening's *planform trace* (the plane's intersection with the
+horizontal plane through `O`; its direction does not depend on the pitch) is parallel to a chosen edge. The picker
+offers any Wing-type Geom of the model, with its leading or trailing edge, or a manual angle. A wing's sweep is
+read from its VSP parameters (not from the mesh) in the section that spans the inlet's y: the section `Sweep` is
+measured at the chord fraction `Sweep_Location`, so the leading edge follows from it, the taper and the dihedral
+(`tan LE = tan(sweep) + s (root - tip) / span`, divided by `cos(dihedral)` for the planform; the trailing edge adds
+`(tip - root) / span`). For an edge swept back by an angle L the result is `sweep_deg = -L`, which makes the right
+inlet's outer edge trail aft (the left inlet is the mirror image). The readouts show `aligned to: <geom> LE
+(Λ = xx.x°)` while the sweep is the aligned one and `custom` as soon as you edit it; the alignment itself is not
+saved, only the sweep. An alignment that would leave `|n . X|` below 0.2 is refused, with the reason.
 
 **The sketcher.** The curve where the plane cuts the fuselage skin is computed in `(u, v)`, with chine corners
 (turning angle above 30 degrees) marked. The opening is a 5-vertex polygon that you drag with the mouse:
@@ -143,7 +151,7 @@ Other controls:
 - **Lock inlet** disables placement and nudges (the origin).
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) cover every change, placement, origin, angles and sketch drags alike (up
   to 200 steps; a drag or rapid edits of one value merge into one step).
-- **Panel**: origin x/y/z with a nudge-step selector, pitch, sweep, Align to chine, and read-only monospace
+- **Panel**: origin x/y/z with a nudge-step selector, pitch, sweep, Align to edge..., and read-only monospace
   readouts with PASS in green, WARN in amber and ERROR in red. Spin boxes take the mouse wheel only while focused.
 - **Save to config** (`Ctrl+S`) writes the inlet into `duct_config.yaml`, keeping its comments and every other
   key; **Revert to saved** re-reads it. The title bar shows `*` while there are unsaved changes, and closing the

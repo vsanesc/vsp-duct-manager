@@ -7,6 +7,7 @@ Surfaces are obtained through the OpenVSP API: the wanted geoms are put in a tem
 temporary STL, and loaded with PyVista. The temporary set is restored and the STL deleted afterwards.
 Nothing here saves the model.
 """
+import math
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,6 +179,98 @@ def check_face_to_envelope(
         f"{face.envelope_diameter:.4f} m (model) = {ratio:.3f}  [{status}: expected {lo:g}-{hi:g}]"
     )
     return FaceEnvelopeCheck(face_diameter, face.envelope_diameter, ratio, (lo, hi), status, message)
+
+
+# ---- wing planform edges (from VSP parameters, not from the mesh) ------------------------------------------
+ROTATION_TOLERANCE_DEG = 1e-6  # a wing rotated more than this is reported (its sweeps are in its own frame)
+WING_TYPE_NAME = "Wing"
+
+
+@dataclass(frozen=True)
+class WingSection:
+    y0: float  # spanwise extent in aircraft coordinates (planform), y0 <= y1
+    y1: float
+    le_deg: float  # planform sweep of the leading edge, positive = swept back
+    te_deg: float  # planform sweep of the trailing edge, positive = swept back
+
+
+@dataclass(frozen=True)
+class WingPlanform:
+    geom_id: str
+    name: str
+    sections: tuple[WingSection, ...]
+    rotated: bool  # the wing has a non-zero relative rotation
+
+
+@dataclass(frozen=True)
+class EdgeSweep:
+    angle_deg: float
+    section_index: int  # 0-based
+    n_sections: int
+    y0: float
+    y1: float
+    outside: bool  # the requested y is outside the wing's span: the nearest section was used
+
+
+def section_edge_sweeps(sweep_deg: float, sweep_location: float, root_chord: float, tip_chord: float,
+                        span: float, dihedral_deg: float) -> tuple[float, float]:
+    """(leading-edge, trailing-edge) planform sweep in degrees of one VSP wing section.
+
+    The section's Sweep is measured at the chord fraction ``Sweep_Location`` in the wing plane, so the leading edge
+    differs from it by the taper: tan(LE) = tan(sweep) + s (root - tip) / span, and the trailing edge adds the chord
+    change (tip - root) / span. The wing plane is tilted by the dihedral, which stretches the spanwise axis of the
+    planform: tan(planform) = tan(wing plane) / cos(dihedral). (``Sec_Sweep_Location`` does not enter; checked
+    against the exported surface.)
+    """
+    if span <= 0.0:
+        raise ValueError("wing section span must be positive")
+    tan_le = math.tan(math.radians(sweep_deg)) + sweep_location * (root_chord - tip_chord) / span
+    tan_te = tan_le + (tip_chord - root_chord) / span
+    c = math.cos(math.radians(dihedral_deg))
+    return math.degrees(math.atan(tan_le / c)), math.degrees(math.atan(tan_te / c))
+
+
+def read_wings(geoms: list[GeomInfo] | None = None) -> list[WingPlanform]:
+    """Planform edge sweeps of every Wing-type geom, per section, straight from the VSP parameters."""
+    geoms = geoms if geoms is not None else list_geoms()
+    wings = []
+    for g in geoms:
+        if g.type_name != WING_TYPE_NAME:
+            continue
+        surf = vsp.GetXSecSurf(g.id, 0)
+        y = float(vsp.GetParmVal(g.id, "Y_Rel_Location", "XForm"))
+        sections = []
+        for i in range(1, vsp.GetNumXSec(surf)):  # XSec i holds the parameters of the section ending at it
+            xs = vsp.GetXSec(surf, i)
+
+            def parm(name, xs=xs):
+                return float(vsp.GetParmVal(vsp.GetXSecParm(xs, name)))
+
+            proj = parm("ProjectedSpan")
+            le, te = section_edge_sweeps(parm("Sweep"), parm("Sweep_Location"), parm("Root_Chord"),
+                                         parm("Tip_Chord"), parm("Span"), parm("Dihedral"))
+            sections.append(WingSection(y, y + proj, le, te))
+            y += proj
+        rotated = any(abs(float(vsp.GetParmVal(g.id, k, "XForm"))) > ROTATION_TOLERANCE_DEG
+                      for k in ("X_Rel_Rotation", "Y_Rel_Rotation", "Z_Rel_Rotation"))
+        wings.append(WingPlanform(g.id, g.name, tuple(sections), rotated))
+    return wings
+
+
+def edge_sweep_at(wing: WingPlanform, y: float, edge: str = "LE") -> EdgeSweep:
+    """Sweep of the leading ('LE') or trailing ('TE') edge in the section that spans ``y`` (the nearest section
+    when ``y`` is outside the wing)."""
+    if edge not in ("LE", "TE"):
+        raise ValueError("edge must be 'LE' or 'TE'")
+    if not wing.sections:
+        raise ValueError(f"wing '{wing.name}' has no sections")
+    y = abs(float(y))  # the right-hand side; a symmetric wing has the same sweep on the left
+    index = next((i for i, s in enumerate(wing.sections) if s.y0 <= y <= s.y1), None)
+    outside = index is None
+    if outside:
+        index = 0 if y < wing.sections[0].y0 else len(wing.sections) - 1
+    s = wing.sections[index]
+    return EdgeSweep(s.le_deg if edge == "LE" else s.te_deg, index, len(wing.sections), s.y0, s.y1, outside)
 
 
 # ---- surface queries ---------------------------------------------------------------------------------

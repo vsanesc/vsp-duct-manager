@@ -76,6 +76,27 @@ class InletPlane:
         return InletPlane((x, -y, z), self.pitch_deg, -self.sweep_deg)
 
 
+def planform_trace_direction(plane: "InletPlane") -> tuple[float, float]:
+    """Unit planform direction (dx, dy), outboard (dy >= 0), of the trace of the plane on the horizontal plane
+    through its origin. The trace is n x Z; it does not depend on the pitch."""
+    n = plane.normal
+    dx, dy = float(n[1]), float(-n[0])  # n x Z = (n_y, -n_x, 0)
+    norm = math.hypot(dx, dy)
+    if norm == 0.0:
+        raise ValueError("the plane is horizontal: it has no planform trace")
+    dx, dy = dx / norm, dy / norm
+    return (-dx, -dy) if dy < 0.0 else (dx, dy)
+
+
+def sweep_for_edge_angle(edge_sweep_deg: float) -> float:
+    """The plane sweep that makes the planform trace parallel to an edge swept back by ``edge_sweep_deg``.
+
+    The right inlet's outer (+Y) edge then trails aft. The trace direction is (-sin(sweep), cos(sweep)), the edge
+    direction (sin(edge), cos(edge)), hence sweep = -edge.
+    """
+    return -float(edge_sweep_deg)
+
+
 def mirror_vertices(vertices, flags=None):
     """The left inlet's (u, v) vertices (and optional per-vertex flags): u negated, order reversed."""
     mirrored = [(-float(u), float(v)) for u, v in vertices][::-1]

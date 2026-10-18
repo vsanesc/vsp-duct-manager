@@ -24,11 +24,6 @@ def prism():
     return bodies.chined_prism()
 
 
-@pytest.fixture(scope="module")
-def taper():
-    return bodies.tapered_chined_body()
-
-
 def rot_y(a):
     c, s = math.cos(a), math.sin(a)
     return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
@@ -231,26 +226,80 @@ def test_signed_distance_is_negative_inside_and_positive_outside(cyl):
     assert sd[0] < 0 and sd[1] > 0 and sd[2] < 0 and sd[3] > 0
 
 
-# ---- aligning to the chine ---------------------------------------------------------------------------------------------
-def test_sweep_for_a_planform_direction_makes_u_parallel_to_it():
-    for dx, dy in ((1.0, 0.125), (1.0, -0.3), (0.2, 1.0), (1.0, 0.0), (-1.0, 0.4)):
-        d = np.array([dx, dy]) / math.hypot(dx, dy)
-        sweep = sec.sweep_for_direction(dx, dy)
-        assert -90.0 <= sweep <= 90.0
-        for pitch in (0.0, 25.0, -40.0):  # u does not depend on the pitch
-            u = plane_frame(pitch, sweep)[0]
-            assert abs(u[0] * d[1] - u[1] * d[0]) < 1e-12 and abs(u[2]) < 1e-12  # parallel in planform
+# ---- planform edge alignment -------------------------------------------------------------------------------------------
+def trace_by_intersection(plane):
+    """Direction (dx, dy) of plane ∩ horizontal plane through the origin. A point of the trace has p_z = o_z and
+    (p - o) . n = 0, i.e. n_x dx + n_y dy = 0: the direction spans the null space of the row (n_x, n_y), found by
+    SVD (independent of the n x Z shortcut used by the module, and valid when n_y = 0)."""
+    n = plane.normal
+    _, _, vt = np.linalg.svd(np.array([[n[0], n[1]]]))
+    d = vt[1]
+    assert abs(d[0] * n[0] + d[1] * n[1]) < 1e-12  # it lies in the plane
+    return d / np.linalg.norm(d)
 
 
-def test_align_to_chine_on_a_tapered_body(taper):
-    origin = (4.0, 1.0, 0.6)  # on the top chine line y = 0.5 * (1 + 0.25 x), z = 0.6, at x = 4
-    sweep, (dx, dy) = sec.align_sweep_to_chine(taper, origin)
-    d = np.array([1.0, 0.125]) / math.hypot(1.0, 0.125)  # the chine direction in planform, analytic
-    assert (dx, dy) == pytest.approx(tuple(d), abs=1e-6)  # float32 mesh
-    assert sweep == pytest.approx(math.degrees(math.atan2(-1.0, 0.125)), abs=1e-4)
-    u = plane_frame(0.0, sweep)[0]
-    assert abs(u[0] * d[1] - u[1] * d[0]) < 1e-6  # the opening's u axis is parallel to the chine
+def angle_between_lines(a, b):
+    """Angle in degrees between two lines (directions up to sign)."""
+    c = abs(float(np.dot(a, b))) / (np.linalg.norm(a) * np.linalg.norm(b))
+    return math.degrees(math.acos(min(1.0, c)))
 
 
-def test_align_to_chine_finds_none_without_a_chine(cyl):
-    assert sec.align_sweep_to_chine(cyl, (4.0, 0.0, 1.0)) is None
+EDGE_SWEEPS = [0.0, 5.0, 15.0, 35.0, 60.0, -20.0]
+PITCHES = [0.0, 20.0, -30.0]
+
+
+@pytest.mark.parametrize("pitch", PITCHES)
+@pytest.mark.parametrize("edge", EDGE_SWEEPS)
+def test_the_planform_trace_is_parallel_to_the_edge_within_0_01_degrees(edge, pitch):
+    from ductmgr.geometry import planform_trace_direction, sweep_for_edge_angle
+
+    plane = InletPlane((3.0, 0.6, 0.3), pitch, sweep_for_edge_angle(edge))
+    edge_dir = np.array([math.sin(math.radians(edge)), math.cos(math.radians(edge))])  # swept back: x grows with y
+    assert angle_between_lines(trace_by_intersection(plane), edge_dir) < 0.01
+    assert angle_between_lines(np.array(planform_trace_direction(plane)), edge_dir) < 0.01
+    assert plane.projection_factor == pytest.approx(math.cos(math.radians(pitch)) * math.cos(math.radians(edge)))
+
+
+def test_the_sweep_is_the_negative_edge_angle():
+    from ductmgr.geometry import sweep_for_edge_angle
+
+    assert sweep_for_edge_angle(35.0) == -35.0 and sweep_for_edge_angle(-12.5) == 12.5
+
+
+@pytest.mark.parametrize("pitch", PITCHES)
+def test_the_right_inlets_outer_edge_trails_aft_for_a_swept_back_edge(pitch):
+    from ductmgr.geometry import planform_trace_direction, sweep_for_edge_angle
+
+    for edge in (10.0, 35.0, 60.0):
+        dx, dy = planform_trace_direction(InletPlane((3.0, 0.6, 0.3), pitch, sweep_for_edge_angle(edge)))
+        assert dy > 0 and dx > 0  # going outboard (+Y) the trace goes aft (+X)
+        assert math.degrees(math.atan2(dx, dy)) == pytest.approx(edge, abs=1e-9)
+    dx, dy = planform_trace_direction(InletPlane((3.0, 0.6, 0.3), pitch, sweep_for_edge_angle(-25.0)))
+    assert dy > 0 and dx < 0  # a forward-swept edge: outboard goes forward
+
+
+@pytest.mark.parametrize("pitch", PITCHES)
+@pytest.mark.parametrize("edge", [10.0, 35.0, 60.0])
+def test_the_left_inlet_is_aligned_with_the_mirrored_edge_exactly(edge, pitch):
+    from ductmgr.geometry import sweep_for_edge_angle
+
+    right = InletPlane((3.0, 0.6, 0.3), pitch, sweep_for_edge_angle(edge))
+    left = right.mirrored()
+    assert left.sweep_deg == -right.sweep_deg and left.origin == (3.0, -0.6, 0.3)
+    r, l_ = trace_by_intersection(right), trace_by_intersection(left)
+    # mirrored about XZ: x unchanged, y negated (directions are lines, so compare up to sign)
+    assert abs(l_[0] * r[1] + l_[1] * r[0]) < 1e-12 or abs(l_[0] * r[1] - l_[1] * r[0]) < 1e-12
+    mirrored_r = np.array([r[0], -r[1]])
+    assert angle_between_lines(l_, mirrored_r) < 1e-9
+    # the left wing's leading edge, swept back, goes outboard (-Y) and aft: direction (sin, -cos)
+    left_edge = np.array([math.sin(math.radians(edge)), -math.cos(math.radians(edge))])
+    assert angle_between_lines(l_, left_edge) < 0.01
+    assert left.projection_factor == pytest.approx(right.projection_factor, abs=1e-15)
+
+
+def test_a_steeply_pitched_plane_still_has_a_unit_planform_trace():
+    from ductmgr.geometry import MAX_PITCH_DEG, planform_trace_direction
+
+    plane = InletPlane((0.0, 0.0, 0.0), MAX_PITCH_DEG, 0.0)  # almost horizontal: the trace still exists
+    dx, dy = planform_trace_direction(plane)
+    assert math.hypot(dx, dy) == pytest.approx(1.0) and (dx, dy) == pytest.approx((0.0, 1.0))  # along Y at sweep 0

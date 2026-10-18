@@ -15,12 +15,15 @@ from pathlib import Path
 
 import numpy as np
 
-from ductmgr import sketch
+import math
+
+from ductmgr import sketch, vspio
 from ductmgr.config import PRIVATE_CONFIG, load_config, save_inlet_definition
 from ductmgr.engine import EngineSizingWarning, size_from_config
-from ductmgr.geometry import InletPlane, inlet_readout
-from ductmgr.section import Section, align_sweep_to_chine, compute_section
+from ductmgr.geometry import InletPlane, inlet_readout, sweep_for_edge_angle
+from ductmgr.section import Section, compute_section
 
+MIN_ALIGN_PROJECTION = 0.2  # |n.X| below this blocks an edge alignment
 UNDO_LIMIT = 200  # history entries kept (the requirement is at least 50)
 MERGE_WINDOW_S = 0.8  # consecutive edits of one parameter / vertex within this window share one undo step
 PLANE_KEYS = ("pitch_deg", "sweep_deg")
@@ -101,6 +104,7 @@ class InletModel:
         self.locked = False
         self.message = ""
         self.notice = legacy_notice(cfg)
+        self.alignment: tuple[str, float, float] | None = None  # (edge label, edge sweep, applied plane sweep)
         self.section: Section | None = None
         self.opening: sketch.Opening | None = None
         loaded = state_from_config(cfg)
@@ -291,20 +295,40 @@ class InletModel:
         self._notify()
         return ok
 
-    def align_to_chine(self) -> bool:
-        """Set the sweep so the opening's u axis is parallel to the local chine line (planform)."""
+    def wing_edge(self, wing_index: int, edge: str) -> vspio.EdgeSweep:
+        """The planform edge sweep of a wing in the section that spans the inlet's y."""
+        return vspio.edge_sweep_at(self.scene.wings[wing_index], self.state.plane.origin[1], edge)
+
+    def align_to_edge(self, edge_sweep_deg: float, label: str) -> bool:
+        """Set the sweep so the opening's planform trace (plane ∩ horizontal plane through O) is parallel to an
+        edge swept back by ``edge_sweep_deg``; the right inlet's outer edge then trails aft.
+
+        Refused when the resulting |n.X| would be below MIN_ALIGN_PROJECTION. The alignment is not persistent:
+        editing the sweep afterwards shows "custom".
+        """
         if self.state.plane is None:
             return False
-        found = align_sweep_to_chine(self.scene.fuselage, self.state.plane.origin)
-        if found is None:
-            self._say("No chine found near the origin")
+        sweep = sweep_for_edge_angle(edge_sweep_deg)
+        candidate = replace(self.state.plane, sweep_deg=sweep)
+        factor = candidate.projection_factor
+        if factor < MIN_ALIGN_PROJECTION:
+            self._say(f"Not aligned: |n.X| would be {factor:.2f} (< {MIN_ALIGN_PROJECTION:g}), the opening would be "
+                      f"more than {math.degrees(math.acos(MIN_ALIGN_PROJECTION)):.0f} deg off the flow")
             self._notify()
             return False
-        sweep, (dx, dy) = found
-        self._with_plane(replace(self.state.plane, sweep_deg=sweep), None)
-        self._say(f"Aligned to the chine: sweep {sweep:.2f} deg")
+        self._with_plane(candidate, None)
+        self.alignment = (label, float(edge_sweep_deg), sweep)
+        self._say(f"Aligned to {label} (Λ = {edge_sweep_deg:.1f}°): sweep {sweep:.2f} deg")
         self._notify()
         return True
+
+    @property
+    def alignment_text(self) -> str:
+        """"aligned to: <edge> (Λ = xx.x°)" while the sweep is still the aligned one, else "custom"."""
+        a = self.alignment
+        if a is not None and self.state.plane is not None and abs(self.state.plane.sweep_deg - a[2]) < 1e-9:
+            return f"aligned to: {a[0]} (Λ = {a[1]:.1f}°)"
+        return "custom"
 
     # ---- place mode -----------------------------------------------------------------------------------------------
     def begin_place(self) -> bool:
@@ -399,6 +423,7 @@ class InletModel:
             return False
         self.scene.sizing = sizing
         self.notice = legacy_notice(cfg)
+        self.alignment = None
         self._section_cache = None  # the capture area (hence the default sketch) may have changed
         normalised = self._normalised(stored)
         self._commit(normalised)
@@ -434,6 +459,7 @@ class InletModel:
         out += [
             Readout("Origin x y z", f"{x:.4f} {y:.4f} {z:.4f} m"),
             Readout("Pitch / sweep", f"{plane.pitch_deg:.2f} / {plane.sweep_deg:.2f} deg"),
+            Readout("Sweep source", self.alignment_text),
             Readout("|n.X|", f"{op.projection_factor:.3f}",
                     "warn" if op.projection_factor < sketch.MIN_PROJECTION else "info"),
             Readout("Area in plane", f"{op.area_plane:.5f} m^2"),
