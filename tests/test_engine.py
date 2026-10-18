@@ -193,7 +193,7 @@ def test_specific_thrust_sls_static_hand_calculation():
 def test_specific_thrust_independent_of_design_point():
     kwargs = dict(reference_thrust=10000.0, specific_thrust_range=(250.0, 300.0))
     a = engine.size_engine(**BASE, **kwargs)
-    b = engine.size_engine(**{**BASE, "mach": 0.8, "altitude": 9000.0}, **kwargs)
+    b = engine.size_engine(**{**BASE, "mach": 0.7, "altitude": 3000.0}, **kwargs)
     assert a.mass_flow != pytest.approx(b.mass_flow)  # design-point flow differs...
     assert a.specific_thrust == pytest.approx(b.specific_thrust, rel=1e-12)  # ...the check does not
 
