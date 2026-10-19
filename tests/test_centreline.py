@@ -108,3 +108,11 @@ def test_handle_points_are_the_inner_control_points():
     # the three junction points are collinear (G1)
     a, b = h["junction"] - h["junction_in"], h["junction_out"] - h["junction"]
     assert np.cross(a, b) == pytest.approx(np.zeros(3), abs=1e-12)
+
+
+def test_a_branch_end_offset_moves_the_end_but_keeps_the_junction_tangent():
+    off = np.array([0.0, 0.12, 0.03])
+    c = Centreline(START, START_DIR, FACE, AXIS, CentrelineParams(junction=(3.0, 0.4)), branch_end_offset=off)
+    assert c.branch.ctrl[3] == pytest.approx(c.junction + off) and c.trunk.ctrl[0] == pytest.approx(c.junction)
+    assert c.branch.tangents([1.0])[0] == pytest.approx(c.trunk.tangents([0.0])[0], abs=1e-12)  # still G1
+    assert c.s_junction == pytest.approx(c.length_branch / c.length)

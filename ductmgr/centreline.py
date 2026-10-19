@@ -112,7 +112,9 @@ class Centreline:
     """Branch + trunk Béziers for one inlet (the other inlet is the mirror image about y = 0)."""
 
     def __init__(self, start, start_dir, face_centre, face_axis, params: CentrelineParams,
-                 default_junction_fraction: float = 0.5):
+                 default_junction_fraction: float = 0.5, branch_end_offset=None):
+        """``branch_end_offset``: the branch ends at the junction plus this vector (the centroid of its half of the
+        trunk start section) instead of at the junction itself; its tangent there is still the junction tangent."""
         self.start = np.asarray(start, dtype=float)
         self.start_dir = _unit(start_dir)
         self.face_centre = np.asarray(face_centre, dtype=float)
@@ -127,7 +129,9 @@ class Centreline:
             d = self.face_centre - junction
             phi = math.atan2(d[2], d[0]) if (d[0] or d[2]) else 0.0
         t = np.array([math.cos(phi), 0.0, math.sin(phi)])
-        chord_b = float(np.linalg.norm(junction - self.start))
+        self.branch_end_offset = np.zeros(3) if branch_end_offset is None else np.asarray(branch_end_offset, dtype=float)
+        branch_end = junction + self.branch_end_offset
+        chord_b = float(np.linalg.norm(branch_end - self.start))
         chord_t = float(np.linalg.norm(self.face_centre - junction))
         f = p.handle_fraction
         h0 = f * chord_b if p.start_handle is None else p.start_handle
@@ -141,7 +145,7 @@ class Centreline:
                                  float(h_end))
         self.junction = junction
         self.junction_tangent = t
-        self.branch = Bezier3([self.start, self.start + h0 * self.start_dir, junction - h_in * t, junction])
+        self.branch = Bezier3([self.start, self.start + h0 * self.start_dir, branch_end - h_in * t, branch_end])
         self.trunk = Bezier3([junction, junction + h_out * t, self.face_centre - h_end * self.face_axis,
                               self.face_centre])
         lb, lt = self.branch.length, self.trunk.length

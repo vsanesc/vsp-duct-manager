@@ -169,6 +169,15 @@ and the same undo history as the section editor, and the 3D view follows at once
 
 - **Topology.** Two branches (the right inlet and its mirror image) join in a Y junction on `y = 0`, and one trunk
   runs to the engine face (centre from the engine Geom, axis `ducts.engine_face.normal`, default +X).
+- **The Y junction.** The trunk start section is made mirror symmetric and split by the plane `y = 0` into two
+  halves; each branch ends with exactly its half (same shape, position and half the area), so the two branch ends
+  tile the trunk start section with no overlap and no gap. That branch end is a fixed key section in the list
+  (like the engine face): derived, not editable, and the branch interpolation morphs into it. The branch
+  centrelines end at the halves' centroids rather than on `y = 0`, with the junction tangent (G1). For clean
+  booleans each branch negative continues into the trunk by `ducts.junction.overlap` (default 0.02 m) as a
+  half-section and the trunk negative starts as far upstream, all inside the duct. With
+  `ducts.junction.splitter_length` above 0 the branch negatives stay apart for that length, separated by a wall of
+  `wall_thickness` on `y = 0` (the trunk negative then starts where the splitter ends).
 - **Centrelines** (SIDE x-z and TOP x-y tabs). A cubic Bezier per branch, from the inlet section centroid
   (starting along the inward plane normal) to the junction, and one for the trunk, from the junction to the face
   centre (ending along the engine axis). The junction tangent lies in the XZ plane, so the branches and the trunk

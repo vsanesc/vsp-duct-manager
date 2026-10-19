@@ -519,5 +519,7 @@ def test_the_dock_title_names_the_active_section(qapp, model):
     model.add_key_section(0.4)
     assert "s = 0.400" in dock.title.text() and "A(s)" in dock.title.text()
     assert "A(s)" in dock.info.text()
-    model.select_section(model.n_sections)
+    model.select_section(model.n_sections)  # the fixed junction section
+    assert "junction" in dock.title.text() and not dock.btn_fit_area.isEnabled()
+    model.select_section(model.n_sections + 1)
     assert "engine face" in dock.title.text() and not dock.btn_fit_area.isEnabled()

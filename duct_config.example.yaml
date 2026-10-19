@@ -55,6 +55,10 @@ ducts:
     # The engine face (s = 1) is a fixed circle and is not listed.
   junction:
     point: [4.0, 0.0, 0.2]         # [x, 0, z] where the branches merge (drag it in the SIDE / TOP tabs)
+    splitter_length: 0.0           # m, the branch negatives stay apart (a wall of wall_thickness on y = 0) this far
+                                   # into the trunk; 0 = they merge at the junction plane
+    overlap: 0.02                  # m, each branch negative reaches this far past the junction plane and the trunk
+                                   # negative starts this far before it (inside the duct, for clean booleans)
   centreline:                      # cubic Bezier centrelines; null = default (handle_fraction x chord length)
     junction_pitch_deg: null       # tangent direction at the junction in the XZ plane (0 = +X, + up)
     start_handle: null             # m, handle at the inlet section centroid, along the inward plane normal

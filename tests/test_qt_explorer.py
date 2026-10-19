@@ -586,8 +586,8 @@ def list_rows(w):
 def test_the_key_section_list_shows_the_inlet_and_the_fixed_engine_face(make_window):
     w = make_window()
     rows = list_rows(w)
-    assert len(rows) == 2 and "s = 0.000" in rows[0] and "inlet" in rows[0]
-    assert "s = 1.000" in rows[1] and "fixed" in rows[1]
+    assert len(rows) == 3 and "s = 0.000" in rows[0] and "inlet" in rows[0]
+    assert "junction" in rows[1] and "fixed" in rows[1] and "s = 1.000" in rows[2] and "fixed" in rows[2]
     assert w.section_list.currentRow() == 0
     assert w.btn_add_section.isEnabled() and not w.btn_remove_section.isEnabled()  # the inlet cannot be removed
 
@@ -598,7 +598,7 @@ def test_adding_a_key_section_from_the_panel_opens_it_in_the_editor(make_window,
     w.btn_add_section.click()
     assert [ks.s for ks in w.model.state.sections] == [0.0, 0.4] and w.model.active == 1
     rows = list_rows(w)
-    assert len(rows) == 3 and "s = 0.400" in rows[1] and w.section_list.currentRow() == 1
+    assert len(rows) == 4 and "s = 0.400" in rows[1] and w.section_list.currentRow() == 1
     assert w.btn_remove_section.isEnabled()
     assert "s = 0.400" in w.sketch.title.text()  # the editor shows it
     assert w.model.dirty and w.windowTitle().endswith("*")
@@ -624,12 +624,14 @@ def test_selecting_a_row_changes_the_edited_section_and_remove_deletes_it(make_w
     w.btn_add_section.click()
     w.section_list.setCurrentRow(0)
     assert w.model.active == 0 and "s = 0.000" in w.sketch.title.text() and not w.btn_remove_section.isEnabled()
-    w.section_list.setCurrentRow(2)  # the engine face
+    w.section_list.setCurrentRow(3)  # the engine face
     assert w.model.active_is_face and not w.btn_remove_section.isEnabled()
     assert not w.sketch.btn_fit_area.isEnabled()
+    w.section_list.setCurrentRow(2)  # the fixed junction section
+    assert w.model.active_is_junction and not w.btn_remove_section.isEnabled() and "junction" in w.sketch.title.text()
     w.section_list.setCurrentRow(1)
     w.btn_remove_section.click()
-    assert len(w.model.state.sections) == 1 and len(list_rows(w)) == 2
+    assert len(w.model.state.sections) == 1 and len(list_rows(w)) == 3
     assert not w.model.state.sections[0].s
 
 
@@ -643,7 +645,7 @@ def test_undo_restores_the_list_after_an_add(make_window, monkeypatch):
     monkeypatch.setattr(w, "ask_section_s", lambda: 0.4)
     w.btn_add_section.click()
     w.act_undo.trigger()
-    assert len(list_rows(w)) == 2 and w.model.active == 0
+    assert len(list_rows(w)) == 3 and w.model.active == 0
 
 
 # ---- Phase 3b: the duct tabs, wall / lip, heavy refresh ----------------------------------------------------------

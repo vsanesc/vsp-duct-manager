@@ -199,7 +199,7 @@ class PathCanvas(Canvas2D):
 
     def anchors(self) -> dict[str, np.ndarray]:
         cl = self.model.duct.centreline
-        a = {"start": cl.start, "junction_in": cl.junction, "junction_out": cl.junction, "end": cl.face_centre}
+        a = {"start": cl.start, "junction_in": cl.branch.ctrl[3], "junction_out": cl.junction, "end": cl.face_centre}
         return {k: self.project(v)[0] for k, v in a.items()}
 
     def hit(self, pos) -> str | None:
@@ -263,7 +263,8 @@ class PathCanvas(Canvas2D):
             d = self.project(cl.face_axis)[0]
             return self._slide(m, "end_handle", "cl:end", q, a, d, -1.0)
         # junction handles: the tangent lies in the XZ plane
-        j = np.array([cl.junction[0], cl.junction[self.across]])
+        anchor = cl.branch.ctrl[3] if name == "junction_in" else cl.junction  # the branch ends at its half's centroid
+        j = np.array([anchor[0], anchor[self.across]])
         sign = -1.0 if name == "junction_in" else 1.0
         w = (q - j) * sign
         key = "junction_in_handle" if name == "junction_in" else "junction_out_handle"

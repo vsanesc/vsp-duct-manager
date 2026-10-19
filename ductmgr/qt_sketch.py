@@ -79,7 +79,7 @@ class SketchCanvas(QtWidgets.QWidget):
     @property
     def editable(self) -> bool:
         m = self.model
-        return m.placed and not m.active_is_face
+        return m.placed and not m.active_is_fixed
 
     @property
     def shape(self):
@@ -421,7 +421,7 @@ class SketchCanvas(QtWidgets.QWidget):
         for e, (path, snapped) in enumerate(zip(op.edge_paths, op.snapped_edges)):
             if not op.valid:
                 p.setPen(self._pen(ERROR_COLOR, 3.0))
-            elif m.active_is_face:
+            elif m.active_is_fixed:
                 p.setPen(self._pen(FIXED_COLOR, 2.0))
             elif snapped:
                 p.setPen(self._pen(ACCENT, 3.0))
@@ -433,7 +433,8 @@ class SketchCanvas(QtWidgets.QWidget):
         if not self.editable:
             p.setPen(self._pen(TEXT_COLOR))
             p.setFont(QtGui.QFont("Consolas", 9))
-            p.drawText(QtCore.QPointF(10, 18), "Engine face (s = 1): a fixed circle")
+            p.drawText(QtCore.QPointF(10, 18), "Engine face (s = 1): a fixed circle" if m.active_is_face
+                       else "Junction: this branch's half of the trunk start section (derived, fixed)")
             return
         # Bézier handles of free curved edges: tangent line and a small square
         for (e, which), hp in self.handle_positions().items():
@@ -551,7 +552,10 @@ class SketchDock(QtWidgets.QWidget):
             self.title.setText("")
             self.info.setText("")
             return
-        if m.active_is_face:
+        if m.active_is_junction:
+            self.title.setText(f"Section s = {m.active_s:.3f}  -  junction: the branch end, exactly its half of the "
+                               "trunk start section (derived, fixed)")
+        elif m.active_is_face:
             self.title.setText("Section s = 1.000  -  engine face (fixed circle)")
         elif m.active_is_inlet:
             self.title.setText("Section s = 0.000  -  inlet (in the inlet plane, snaps to the skin)")

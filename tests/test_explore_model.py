@@ -881,16 +881,59 @@ def cyl_model(clock):
     return body_model(bodies.cylinder(1.0), (4.0, 0.3, 0.9), area=0.12, clock=clock)
 
 
-def test_the_engine_face_is_listed_last_and_is_fixed(cyl_model):
+def test_the_junction_and_the_engine_face_are_listed_last_and_are_fixed(cyl_model):
     m = cyl_model
-    assert m.section_list() == [(0.0, "inlet", True), (1.0, "engine face (fixed)", False)]
-    assert m.select_section(m.n_sections) and m.active_is_face and m.active_s == 1.0
+    rows = m.section_list()
+    assert [r[1:] for r in rows] == [("inlet", True), ("junction: branch end (fixed)", False), ("engine face (fixed)", False)]
+    assert rows[1][0] == pytest.approx(m.junction_s) and rows[2][0] == 1.0
+    assert m.select_section(len(rows) - 1) and m.active_is_face and m.active_s == 1.0 and m.active_is_fixed
     assert m.active_shape.n >= 3 and all(e == "curved" for e in m.active_shape.edges)  # a circle
     face = m.active_opening
     assert face.area_plane == pytest.approx(m.face_area, rel=2e-3)
     before = m.state
     assert not m.drag_vertex(0, (0.0, 0.0), None) and not m.delete_vertex(0) and not m.fit_area()
+    assert m.state == before and not m.select_section(len(rows))
+
+
+def test_the_junction_section_is_the_derived_half_of_the_trunk_start_and_cannot_be_edited(cyl_model, clock):
+    m = cyl_model
+    assert m.select_section(m.n_sections) and m.active_is_junction and not m.active_is_face and m.active_is_fixed
+    assert m.active_s == pytest.approx(m.junction_s)
+    op = m.active_opening
+    assert op.area_plane == pytest.approx(0.5 * m.areas.junction_area, rel=2e-3)  # half the trunk area
+    shape = m.active_shape
+    pts = np.array(shape.vertices)
+    cut = pts[:, 0].max() if (np.abs(pts[:, 0] - pts[:, 0].max()) < 1e-9).sum() > 3 else pts[:, 0].min()
+    assert (np.abs(pts[:, 0] - cut) < 1e-9).sum() > 3  # one side is the straight cut on the symmetry plane
+    before = m.state
+    clock.advance(10.0)
+    assert not m.drag_vertex(0, (0.0, 0.0), None) and not m.insert_vertex(0, (0.0, 0.0)) and not m.fit_area()
     assert m.state == before
+    # it follows the centreline / area law and is identical to the branch end of the built duct
+    m.set_area_points(m.areas.with_junction_area(0.3), None)
+    assert m.active_opening.area_plane == pytest.approx(0.15, rel=2e-3)
+    ring = m.duct.branch[-1].ring
+    assert np.array(m.active_shape.vertices) == pytest.approx(ring, abs=1e-12)
+
+
+def test_the_junction_row_survives_undo_and_the_selection_follows_it(cyl_model, clock):
+    m = cyl_model
+    clock.advance(10.0)
+    m.add_key_section(0.3)
+    assert m.select_section(2) and m.active_is_junction
+    clock.advance(10.0)
+    assert m.set_wall_thickness(0.01) and m.active_is_junction  # an edit keeps the fixed row selected
+    m.undo()
+    m.undo()  # the added key section goes away: the junction row moves up one place
+    assert m.n_sections == 1 and m.active_is_junction
+
+
+def test_a_single_inlet_has_no_junction_row(clock):
+    cfg = {"ducts": {"inlet": {"origin": [4.0, 0.3, 0.9]}}}
+    scene = body_scene(bodies.cylinder(1.0), 0.12)
+    scene.sizing.n_inlets = 1
+    m = InletModel(scene, cfg, EXAMPLE_CONFIG, None, clock=clock)
+    assert [r[1] for r in m.section_list()] == ["inlet", "engine face (fixed)"] and not m.junction_row
 
 
 def test_adding_a_key_section_copies_the_previous_shape_at_the_area_law_size(cyl_model, clock):
@@ -911,6 +954,7 @@ def test_key_section_areas_follow_the_area_law_before_and_after_the_junction(cyl
     for s in (sj * 0.5, (1 + sj) / 2):
         clock.advance(10.0)
         m.add_key_section(round(s, 4))
+    sj = m.junction_s  # the junction section is derived from the key sections: it moves a little with them
     s_branch, s_trunk = (ks.s for ks in m.state.sections[1:])
     assert s_branch < sj < s_trunk
     for ks, ev in zip(m.state.sections[1:], m.evaluations[1:]):
@@ -930,6 +974,7 @@ def test_a_key_section_keeps_its_shape_when_edited_but_not_its_size(cyl_model, c
         m.drag_vertex(2, (start[0] + 0.01 * (k + 1), start[1] + 0.02 * (k + 1)), None)
     m.finish_edit()
     assert m.active_shape.n == n
+    target = m.area_at(0.4)  # (the junction, hence A(0.4), follows the edited shape)
     assert m.active_opening.area_plane == pytest.approx(target, rel=1e-9)  # resized back to A(s)
     assert m.active_shape.vertices[2] != start  # but the shape did change
 
@@ -1292,3 +1337,34 @@ def test_revert_restores_the_duct_parameters(scene, writable, clock):
     clock.advance(10.0)
     m.set_wall_thickness(0.04)
     assert m.dirty and m.revert() and not m.dirty and m.state.duct == saved
+
+
+# ---- the Y junction settings ----------------------------------------------------------------------------------------------------
+def test_the_junction_settings_come_from_the_config_with_defaults(example_env):
+    cfg, _, _ = example_env
+    s = em.duct_settings(cfg)
+    assert s.splitter_length == 0.0 and s.overlap == cfg["ducts"]["junction"]["overlap"]
+    bare = copy.deepcopy(cfg)
+    bare["ducts"]["junction"].pop("overlap")
+    bare["ducts"]["junction"].pop("splitter_length")
+    s = em.duct_settings(bare)
+    assert s.splitter_length == 0.0 and s.overlap == em.dm.DEFAULT_OVERLAP
+    bare["ducts"]["junction"]["overlap"] = -0.01
+    with pytest.raises(ValueError, match="overlap"):
+        em.duct_settings(bare)
+    bare["ducts"]["junction"].update(overlap=0.02, splitter_length=-1.0)
+    with pytest.raises(ValueError, match="splitter_length"):
+        em.duct_settings(bare)
+
+
+def test_the_settings_reach_the_duct_spec_and_a_splitter_that_is_too_long_is_reported(scene, example_env):
+    cfg, path, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    cfg["ducts"]["junction"].update(splitter_length=0.1, overlap=0.03)
+    m = InletModel(scene, cfg, path, None)
+    assert m.duct_spec().splitter_length == 0.1 and m.duct_spec().overlap == 0.03
+    assert m.duct.bodies()["neg_trunk"].dist[0] == pytest.approx(m.centreline.length_branch + 0.1, abs=1e-9)
+    cfg["ducts"]["junction"]["splitter_length"] = 50.0
+    bad = InletModel(scene, cfg, path, None)
+    assert bad.duct is None and "shorter than the trunk" in bad.duct_error
+    assert bad.centreline is None  # no centreline without a valid junction; the model still loads

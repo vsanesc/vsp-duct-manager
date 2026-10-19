@@ -8,6 +8,8 @@ Every outline is oriented counter-clockwise and parametrised by arc length start
 the vertex whose direction from the section's centroid is closest to the section's local +v. The N samples are
 equally spaced in arc length from there, so sample k of one section corresponds to sample k of another.
 """
+import math
+
 import numpy as np
 
 from ductmgr.geometry import polygon_area, polygon_centroid
@@ -54,3 +56,38 @@ def correspond(sections, n: int = DEFAULT_SAMPLES) -> list[np.ndarray]:
 def blend(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     """Point-by-point linear blend of two corresponding resampled sections."""
     return (1.0 - t) * np.asarray(a) + t * np.asarray(b)
+
+
+def resample_keep(poly: np.ndarray, corners, n: int) -> np.ndarray:
+    """``n`` points along the closed counter-clockwise polygon ``poly`` that include every corner in ``corners``
+    (indices into ``poly``). The points are equally spaced in arc length within each side between corners, the
+    count per side being proportional to its length. The first sample is the corner with the largest v."""
+    pts = np.asarray(poly, dtype=float)
+    idx = sorted(set(int(c) for c in corners))
+    if len(idx) < 2 or n < len(idx):
+        raise ValueError("at least two corners and as many samples as corners are needed")
+    start = max(idx, key=lambda i: (pts[i, 1], -pts[i, 0]))
+    order = idx[idx.index(start):] + idx[:idx.index(start)]
+    m = len(pts)
+    sides = []
+    for a, b in zip(order, order[1:] + order[:1]):
+        path = [pts[a]]
+        k = (a + 1) % m
+        while k != b:
+            path.append(pts[k])
+            k = (k + 1) % m
+        path.append(pts[b])
+        path = np.array(path)
+        sides.append((path, float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum())))
+    total = sum(length for _, length in sides)
+    counts = [max(1, int(round(n * length / total))) for _, length in sides]
+    while sum(counts) != n:  # settle the rounding on the longest sides
+        j = int(np.argmax([length / c for (_, length), c in zip(sides, counts)])) if sum(counts) < n \
+            else int(np.argmin([length / c if c > 1 else math.inf for (_, length), c in zip(sides, counts)]))
+        counts[j] += 1 if sum(counts) < n else -1
+    out = []
+    for (path, length), c in zip(sides, counts):
+        cum = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+        t = np.linspace(0.0, cum[-1], c, endpoint=False)
+        out.append(np.c_[np.interp(t, cum, path[:, 0]), np.interp(t, cum, path[:, 1])])
+    return np.vstack(out)

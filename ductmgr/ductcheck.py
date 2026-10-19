@@ -198,13 +198,10 @@ def wall_left(duct: dm.Duct, bodies: dict, fuselage: Solid, c: DuctChecks, s: Ch
         skin_pts = fuselage.closest_points(pts)
         covered = solid_p.signed(skin_pts) < -COVERED_TOL
         ext_vertex = ((d_f > 0.0) | covered | (d_ext <= wall_f)).reshape(r, n)
-        # rings in the opening plane (the positive's start cap) and at the face (its end cap) are on a cap of the
-        # positive and are not part of the wall
-        lead = r - pos.rings.shape[0]  # negative rings upstream of the positive's first ring (the lip ring)
-        first = lead + 1 if neg_name == "neg_branch_R" else 1
-        keep = np.ones(r, dtype=bool)
-        keep[:first] = False
-        keep[-1] = False
+        # rings upstream of / in the plane of the positive's start cap, and in its end cap (the face, or the junction
+        # plane of a branch), are not part of the wall; the branch overlap and splitter rings beyond the junction are
+        # covered by the trunk's own rings
+        keep = (neg.dist > pos.dist[0] + 1e-9) & (neg.dist < pos.dist[-1] - 1e-9)
         internal = keep[:, None] & ~ext_vertex
         external = keep[:, None] & ext_vertex
         if internal.any():

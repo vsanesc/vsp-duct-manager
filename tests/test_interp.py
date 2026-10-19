@@ -159,3 +159,17 @@ def test_an_irregular_inlet_like_pentagon_morphs_into_the_circle_without_folding
     for t in np.linspace(0.0, 1.0, 11):
         m = interp.blend(a, b, t)
         assert polygon_area(m) > 0 and not self_crossing(m)  # a valid simple outline all the way
+
+
+# ---- resampling that keeps corners (the D-shaped half sections of the Y junction) ------------------------------------
+def test_resample_keep_includes_every_corner_and_starts_at_the_upper_one():
+    d = np.array([(0.0, 1.0), (-0.8, 0.6), (-0.8, -0.6), (0.0, -1.0)])  # a D: the straight side is x = 0
+    r = interp.resample_keep(d, [0, 3], 32)
+    assert len(r) == 32 and r[0] == pytest.approx([0.0, 1.0])
+    for corner in d[[0, 3]]:
+        assert np.linalg.norm(r - corner, axis=1).min() < 1e-12
+    assert polygon_area(r) < polygon_area(d)  # a bend that is not declared a corner is cut a little ...
+    full = interp.resample_keep(d, [0, 1, 2, 3], 32)
+    assert polygon_area(full) == pytest.approx(polygon_area(d), rel=1e-12)  # ... declared corners are exact
+    with pytest.raises(ValueError):
+        interp.resample_keep(d, [0], 8)
