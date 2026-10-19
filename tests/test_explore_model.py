@@ -21,6 +21,8 @@ from ductmgr.geometry import InletPlane
 from ductmgr.section import distance_to_section
 from ductmgr.viz import load_scene
 
+import cfgutil
+
 
 class Clock:
     def __init__(self):
@@ -80,8 +82,7 @@ def sn(state):
 def unplaced_cfg(example_env):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
-    cfg["ducts"]["inlet"]["origin"] = None
-    cfg["ducts"]["key_sections"] = None
+    cfgutil.unplace(cfg)
     return cfg, path
 
 
@@ -101,8 +102,8 @@ def body_model(body, origin, area=0.1, pitch=0.0, sweep=0.0, clock=None):
 def test_the_inlet_is_loaded_from_the_config(scene, example_env):
     cfg, path, _ = example_env
     m = make(scene, path)
-    ref = cfg["ducts"]["inlet"]
-    section = cfg["ducts"]["key_sections"][0]
+    ref = cfgutil.first(cfg)
+    section = ref["key_sections"][0]
     assert m.state.plane == InletPlane(tuple(ref["origin"]), 0.0, 0.0)
     assert list(sn(m.state)) == section["snapped"] and len(m.state.sections) == 1
     assert np.array(vs(m.state)) == pytest.approx(np.array(section["vertices"]), abs=1e-5)
@@ -121,10 +122,11 @@ def test_the_loaded_sketch_matches_the_phase_1_capture_area(scene, example_env):
 
 def test_old_keys_are_ignored_with_a_one_line_notice(scene, example_env):
     cfg, path = unplaced_cfg(example_env)
+    cfgutil.to_legacy(cfg)
     cfg["ducts"]["inlet"].update({"shape": {"width_top": 0.7}, "skin_fit": "flush", "centroid": [2, 0.5, 1.4],
-                                  "tilt_deg": 5.0})
+                                  "tilt_deg": 5.0, "origin": None})
     notice = legacy_notice(cfg)
-    assert "\n" not in notice and "ducts.inlet" in notice
+    assert "\n" not in notice and "ducts" in notice
     for key in ("shape", "skin_fit", "centroid", "tilt_deg"):
         assert key in notice
     m = InletModel(scene, cfg, path, None)
@@ -134,9 +136,11 @@ def test_old_keys_are_ignored_with_a_one_line_notice(scene, example_env):
 
 def test_null_old_keys_give_no_notice(example_env):
     cfg, _, _ = example_env
-    cfg = copy.deepcopy(cfg)
+    cfg = cfgutil.to_legacy(copy.deepcopy(cfg))
     cfg["ducts"]["inlet"].update({"centroid": None, "normal": None, "polygon": None, "tilt_deg": None})
-    assert legacy_notice(cfg) == ""
+    assert "migrated" in legacy_notice(cfg)  # the old single-inlet format is migrated (only that is reported)
+    assert "ignoring" not in legacy_notice(cfg)
+    assert legacy_notice(copy.deepcopy(example_env[0])) == ""  # the new format has nothing to say
     assert legacy_notice({}) == ""
 
 
@@ -147,7 +151,7 @@ def test_null_old_keys_give_no_notice(example_env):
 def test_malformed_inlet_planes_are_rejected_clearly(example_env, patch, message):
     cfg, _, _ = example_env
     cfg = copy.deepcopy(cfg)
-    cfg["ducts"]["inlet"].update(patch)
+    cfgutil.first(cfg).update(patch)
     with pytest.raises(ValueError, match=message):
         state_from_config(cfg)
 
@@ -165,7 +169,7 @@ def test_malformed_inlet_planes_are_rejected_clearly(example_env, patch, message
 def test_malformed_key_sections_are_rejected_clearly(example_env, patch, message):
     cfg, _, _ = example_env
     cfg = copy.deepcopy(cfg)
-    cfg["ducts"]["key_sections"][0].update(patch)
+    cfgutil.first(cfg)["key_sections"][0].update(patch)
     with pytest.raises(ValueError, match=message):
         state_from_config(cfg)
 
@@ -173,9 +177,9 @@ def test_malformed_key_sections_are_rejected_clearly(example_env, patch, message
 def test_two_key_sections_too_close_in_s_are_rejected(example_env):
     cfg, _, _ = example_env
     cfg = copy.deepcopy(cfg)
-    second = copy.deepcopy(cfg["ducts"]["key_sections"][0])
+    second = copy.deepcopy(cfgutil.first(cfg)["key_sections"][0])
     second["s"] = 0.005
-    cfg["ducts"]["key_sections"].append(second)
+    cfgutil.first(cfg)["key_sections"].append(second)
     with pytest.raises(ValueError, match="closer"):
         state_from_config(cfg)
 
@@ -183,7 +187,7 @@ def test_two_key_sections_too_close_in_s_are_rejected(example_env):
 def test_an_origin_without_key_sections_gets_a_default_sketch_and_is_dirty(scene, example_env):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
-    cfg["ducts"]["key_sections"] = None
+    cfgutil.first(cfg)["key_sections"] = None
     m = InletModel(scene, cfg, path, None)
     assert sn(m.state)[:2] == (True, True) and m.valid
     assert m.dirty  # the sketch was created, not read from the file
@@ -368,7 +372,7 @@ def test_the_alignment_is_not_saved_and_is_forgotten_on_revert(scene, writable, 
     clock.advance(10.0)
     m.align_to_edge(25.0, "Wing LE")
     assert m.save()
-    saved = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlet"]
+    saved = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlets"][0]
     assert saved["sweep_deg"] == -25.0 and not any("align" in k for k in saved)  # only the sweep is stored
     fresh = make(scene, writable, writable)
     assert sweep_text(fresh) == "custom"  # a reloaded sweep is just a number
@@ -594,10 +598,10 @@ def test_save_writes_the_inlet_and_round_trips_uv_vertices(scene, writable, cloc
     assert m.dirty and m.save() and not m.dirty
     assert m.message == f"Saved inlet to {writable.name}."
     after = yaml.safe_load(writable.read_text(encoding="utf-8"))
-    inlet = after["ducts"]["inlet"]
+    inlet = after["ducts"]["inlets"][0]
     assert inlet["origin"] == pytest.approx([round(c, 6) for c in m.state.plane.origin])
     assert inlet["pitch_deg"] == -6.0 and inlet["sweep_deg"] == 12.0
-    saved = after["ducts"]["key_sections"][0]
+    saved = inlet["key_sections"][0]
     assert np.array(saved["vertices"]) == pytest.approx(np.array([[round(u, 6), round(v, 6)] for u, v in vs(m.state)]))
     assert saved["snapped"] == list(sn(m.state)) and all(isinstance(f, bool) for f in saved["snapped"])
     assert "vertices" not in inlet and "snapped" not in inlet
@@ -632,7 +636,7 @@ def test_save_before_an_inlet_is_placed_does_nothing(scene, example_env, writabl
     cfg, path = unplaced_cfg(example_env)
     before = writable.read_bytes()
     m = InletModel(scene, cfg, writable, writable)
-    assert m.inlet_definition() is None
+    assert m.inlets_definition() == []
     assert not m.save() and m.message.startswith("Nothing to save") and writable.read_bytes() == before
 
 
@@ -667,7 +671,7 @@ def test_revert_reads_the_file_again_including_the_capture_area(scene, writable)
     area = m.area
     cfg = yaml.safe_load(writable.read_text(encoding="utf-8"))
     cfg["design_point"]["mach"] = 0.5
-    cfg["ducts"]["inlet"]["sweep_deg"] = 7.0
+    cfg["ducts"]["inlets"][0]["sweep_deg"] = 7.0
     writable.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     assert m.revert()
     assert m.area != pytest.approx(area) and m.state.plane.sweep_deg == 7.0 and not m.dirty
@@ -754,13 +758,10 @@ def test_without_an_engine_face_the_readouts_say_so(scene, example_env):
 
 # ---- Phase 3a: the general section editor --------------------------------------------------------------------------------------------------
 def legacy_cfg(example_env):
-    """The old 5-vertex format: ducts.inlet.vertices / snapped and no key_sections."""
+    """The oldest format: ducts.inlet.vertices / snapped and no key_sections (no ducts.inlets either)."""
     cfg, path, _ = example_env
-    cfg = copy.deepcopy(cfg)
-    section = cfg["ducts"].pop("key_sections")[0]
-    cfg["ducts"]["inlet"]["vertices"] = section["vertices"]
-    cfg["ducts"]["inlet"]["snapped"] = section["snapped"]
-    return cfg, path, section
+    section = cfgutil.first(cfg)["key_sections"][0]
+    return cfgutil.to_five_vertex(copy.deepcopy(cfg)), path, section
 
 
 def test_an_old_five_vertex_config_loads_as_a_straight_inlet_section_with_a_notice(scene, example_env):
@@ -776,25 +777,45 @@ def test_an_old_five_vertex_config_loads_as_a_straight_inlet_section_with_a_noti
     assert m.valid
 
 
-def test_saving_a_legacy_config_migrates_it_to_key_sections(scene, example_env, writable):
-    cfg, _, _ = legacy_cfg(example_env)
-    inlet = cfg["ducts"]["inlet"]
-    text = yaml.safe_load(writable.read_text(encoding="utf-8"))
-    text["ducts"].pop("key_sections")
-    text["ducts"]["inlet"].update(vertices=inlet["vertices"], snapped=inlet["snapped"])
-    writable.write_text(yaml.safe_dump(text, sort_keys=False), encoding="utf-8")
+def test_a_single_inlet_config_migrates_to_a_one_item_list_with_mirror_and_symmetry_xz(scene, example_env):
+    cfg, _, _ = example_env
+    legacy = cfgutil.to_legacy(copy.deepcopy(cfg))
+    state = state_from_config(legacy)
+    assert len(state.inlets) == 1 and state.symmetry == "xz" and state.inlets[0].mirror is True
+    assert state.inlets[0].plane == state_from_config(cfg).inlets[0].plane
+    notice = legacy_notice(legacy)
+    assert "\n" not in notice and "migrated to ducts.inlets" in notice and "mirror true" in notice and "xz" in notice
+    legacy["ducts"]["n_inlets"] = 1  # a single inlet that is not mirrored
+    assert state_from_config(legacy).inlets[0].mirror is False and "mirror false" in legacy_notice(legacy)
+
+
+def test_the_migrated_config_gives_the_same_ducts_as_the_new_format(scene, example_env):
+    cfg, path, _ = example_env
+    old = InletModel(scene, cfgutil.to_legacy(copy.deepcopy(cfg)), path, None)
+    new = InletModel(scene, copy.deepcopy(cfg), path, None)
+    assert old.state.inlets[0].sections == new.state.inlets[0].sections and old.state.symmetry == new.state.symmetry
+    assert old.n_branches == new.n_branches == 2 and old.duct.n_branches == 2
+    assert old.centreline.length == pytest.approx(new.centreline.length)
+
+
+def test_saving_a_legacy_config_migrates_it_to_the_inlets_list(scene, example_env, writable):
+    cfg, _, _ = example_env
+    legacy = cfgutil.to_five_vertex(copy.deepcopy(cfg))
+    writable.write_text(yaml.safe_dump(legacy, sort_keys=False), encoding="utf-8")
     m = make(scene, writable, writable)
     assert m.notice and m.save() and m.notice == ""
     saved = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]
-    assert "vertices" not in saved["inlet"] and "snapped" not in saved["inlet"]
-    assert saved["key_sections"][0]["s"] == 0.0 and saved["key_sections"][0]["edges"] == ["straight"] * 5
+    assert "inlet" not in saved and "key_sections" not in saved
+    assert saved["symmetry"] == "xz" and len(saved["inlets"]) == 1 and saved["inlets"][0]["mirror"] is True
+    section = saved["inlets"][0]["key_sections"][0]
+    assert section["s"] == 0.0 and section["edges"] == ["straight"] * 5
     assert make(scene, writable, writable).notice == ""
 
 
-def test_key_sections_next_to_old_vertices_say_so(example_env):
+def test_old_vertices_next_to_the_new_inlets_list_are_ignored_with_a_notice(example_env):
     cfg, _, _ = example_env
     cfg = copy.deepcopy(cfg)
-    cfg["ducts"]["inlet"]["vertices"] = [[0, 0]] * 5
+    cfg["ducts"]["inlet"] = {"vertices": [[0, 0]] * 5}
     assert "superseded" in legacy_notice(cfg)
 
 
@@ -929,9 +950,8 @@ def test_the_junction_row_survives_undo_and_the_selection_follows_it(cyl_model, 
 
 
 def test_a_single_inlet_has_no_junction_row(clock):
-    cfg = {"ducts": {"inlet": {"origin": [4.0, 0.3, 0.9]}}}
+    cfg = {"ducts": {"n_inlets": 1, "inlet": {"origin": [4.0, 0.3, 0.9]}}}  # one inlet, not mirrored
     scene = body_scene(bodies.cylinder(1.0), 0.12)
-    scene.sizing.n_inlets = 1
     m = InletModel(scene, cfg, EXAMPLE_CONFIG, None, clock=clock)
     assert [r[1] for r in m.section_list()] == ["inlet", "engine face (fixed)"] and not m.junction_row
 
@@ -1098,7 +1118,7 @@ def test_the_duct_parameters_are_loaded_from_the_config(scene, example_env):
 
 def test_lip_extension_is_still_read_from_its_old_place_and_defaults_apply(scene, example_env):
     cfg, path, _ = example_env
-    cfg = copy.deepcopy(cfg)
+    cfg = cfgutil.to_legacy(copy.deepcopy(cfg))
     ducts = cfg["ducts"]
     ducts.pop("lip_extension")
     ducts["inlet"]["lip_extension"] = 0.123
@@ -1170,7 +1190,7 @@ def test_handle_edits_and_their_defaults(scene, example_env, clock):
     with pytest.raises(KeyError):
         m.set_centreline("h", bogus=1.0)
     clock.advance(10.0)
-    assert m.reset_centreline() and m.state.duct.centreline.start_handle is None
+    assert m.reset_centreline() and m.state.inlet.start_handle is None
     assert m.centreline.resolved.start_handle == pytest.approx(default.start_handle)
 
 
@@ -1199,7 +1219,7 @@ def test_area_points_can_be_moved_added_and_removed(cyl_model, clock):
     m = cyl_model
     default = m.areas.branch_interior
     clock.advance(10.0)
-    assert m.area_move_point("branch", 1, 0.55, 0.115) and m.state.duct.area.branch is not None
+    assert m.area_move_point("branch", 1, 0.55, 0.115) and m.state.inlet.area_branch is not None
     assert m.areas.branch_interior[1] == (0.55, 0.115) and m.areas.trunk_interior == m.areas.trunk_interior
     clock.advance(10.0)
     m.area_move_point("branch", 1, 5.0, 0.115)  # dragged far right: kept between its neighbours
@@ -1210,7 +1230,7 @@ def test_area_points_can_be_moved_added_and_removed(cyl_model, clock):
     n = len(m.areas.trunk_interior)
     assert m.area_remove_point("trunk", 0) and len(m.areas.trunk_interior) == n - 1
     assert not m.area_remove_point("trunk", 99)
-    assert m.reset_area() and m.state.duct.area == AreaPoints()
+    assert m.reset_area() and m.state.duct.area == AreaPoints() and m.state.inlet.area_branch is None
 
 
 def test_dragging_an_area_point_is_one_undo_step(cyl_model, clock):
@@ -1241,9 +1261,9 @@ def test_the_duct_spec_uses_the_sketched_sections_and_the_scene(cyl_model):
     m = cyl_model
     m.add_key_section(0.5)
     spec = m.duct_spec()
-    assert [k.s for k in spec.keys] == [0.0, 0.5] and spec.n_branches == 2
+    assert [k.s for k in spec.inlets[0].keys] == [0.0, 0.5] and m.duct.n_branches == 2 and spec.symmetry == "xz"
     assert spec.face_centre == pytest.approx([6.0, 0.0, 0.0]) and spec.face_diameter == 0.5
-    assert spec.inlet_area == pytest.approx(m.opening.area_plane)
+    assert spec.inlets[0].inlet_area == pytest.approx(m.opening.area_plane)
     assert m.duct.areas.a_in == pytest.approx(m.opening.area_plane)
 
 
@@ -1259,8 +1279,8 @@ def test_bodies_and_checks_are_built_on_demand_and_cached_per_state(cyl_model, c
     assert m.checks is not first and m.checks_current
 
 
-def dm_names():
-    return [f"{k}_{p}" for k in ("neg", "pos") for p in ("branch_R", "branch_L", "trunk")]
+def dm_names(name="inlet 1"):
+    return [f"{k}_{p}" for k in ("neg", "pos") for p in (f"branch_{name}", f"branch_{name}_mirror", "trunk")]
 
 
 def test_there_is_no_duct_without_an_engine_face(example_env):
@@ -1302,15 +1322,17 @@ def test_duct_parameters_survive_a_save_and_a_reload(scene, writable, clock):
     assert m.save()
     ducts = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]
     assert ducts["junction"]["point"] == [3.4, 0.0, 0.35]
-    assert ducts["centreline"]["start_handle"] == 0.7 and ducts["centreline"]["junction_pitch_deg"] == 12.0
+    assert ducts["inlets"][0]["start_handle"] == 0.7 and ducts["centreline"]["junction_pitch_deg"] == 12.0
+    assert "start_handle" not in ducts["centreline"]  # the inlet handles belong to their inlet
     assert ducts["centreline"]["end_handle"] is None  # defaults stay null
-    assert ducts["area_points"]["junction_area"] == 0.19 and ducts["area_points"]["branch"][1] == [0.5, 0.1]
+    assert ducts["area_points"]["junction_area"] == 0.19 and ducts["inlets"][0]["area_points"][1] == [0.5, 0.1]
     assert ducts["wall_thickness"] == 0.03 and ducts["lip_extension"] == 0.06 and ducts["lip_mode"] == "blunt"
     after = yaml.safe_load(writable.read_text(encoding="utf-8"))
     for section in ("model", "engine", "design_point", "checks"):
         assert after[section] == before[section]
     again = make(scene, writable, writable)
     assert not again.dirty and again.state.duct.centreline == m.state.duct.centreline
+    assert again.state.inlet.start_handle == 0.7
     assert again.state.duct.wall_thickness == 0.03 and again.state.duct.lip_extension == 0.06
     for got, want in zip(again.areas.branch_interior + again.areas.trunk_interior,
                          m.areas.branch_interior + m.areas.trunk_interior):
@@ -1318,7 +1340,7 @@ def test_duct_parameters_survive_a_save_and_a_reload(scene, writable, clock):
 
 
 def test_saving_moves_a_legacy_lip_extension_out_of_the_inlet_block(scene, example_env, writable):
-    text = yaml.safe_load(writable.read_text(encoding="utf-8"))
+    text = cfgutil.to_legacy(yaml.safe_load(writable.read_text(encoding="utf-8")))
     text["ducts"].pop("lip_extension")
     text["ducts"]["inlet"]["lip_extension"] = 0.09
     writable.write_text(yaml.safe_dump(text, sort_keys=False), encoding="utf-8")
@@ -1326,7 +1348,7 @@ def test_saving_moves_a_legacy_lip_extension_out_of_the_inlet_block(scene, examp
     assert m.state.duct.lip_extension == 0.09
     assert m.save()
     saved = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]
-    assert "lip_extension" not in saved["inlet"] and saved["lip_extension"] == 0.09
+    assert "inlet" not in saved and saved["lip_extension"] == 0.09
 
 
 def test_revert_restores_the_duct_parameters(scene, writable, clock):

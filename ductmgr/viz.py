@@ -42,7 +42,8 @@ POSITIVE_COLOR, POSITIVE_OPACITY = "#c8b9a0", 0.55  # the positive bodies (the w
 EXTERNAL_COLOR = "#f0883e"  # the part of the positive outside the fuselage skin
 VIOLATION_COLOR = "#e5534b"  # wall left below the minimum clearance / body intersecting another Geom
 CENTRELINE_COLOR, CENTRELINE_WIDTH = "#3fb950", 3
-BODY_NAMES = tuple(f"{k}_{p}" for k in ("neg", "pos") for p in ("branch_R", "branch_L", "trunk"))
+TWIN_COLOR, TWIN_OPACITY = "#7d8590", 0.3  # mirrored twins: not editable, greyed
+OTHER_INLET_COLOR = "#8b6b3a"  # the openings of the inlets that are not selected
 PICK_TOLERANCE = 0.0005  # vtkCellPicker tolerance (fraction of the render window diagonal)
 
 VIEWS = {"side": "xz", "top": "xy", "front": "yz", "iso": "iso"}
@@ -157,6 +158,8 @@ class SceneView:
         self.plotter = plotter
         self.scene = scene
         self.actors: dict[str, object] = {}
+        self._other_inlet_actors: set[str] = set()
+        self._duct_actors: set[str] = set()
         self._draw_static()
 
     # ---- static scene ----------------------------------------------------------------------------------
@@ -205,9 +208,29 @@ class SceneView:
 
     # ---- inlets ------------------------------------------------------------------------------------------
     def update_inlet(self, model) -> None:
-        """Redraw both openings (the left one is the exact mirror image), the section curve, the plane frame at
-        the origin and the guide line to the engine face. A red opening means the sketch is invalid."""
+        """Redraw the selected inlet's opening and its mirrored twin (greyed when it is a generated twin), the other
+        inlets' openings, the section curve, the plane frame at the origin and the guide line to the engine face.
+        A red opening means the sketch is invalid."""
         p = self.plotter
+        for name in self._other_inlet_actors:  # the others are redrawn every time
+            p.remove_actor(name, render=False)
+        self._other_inlet_actors = set()
+        for k, ins in enumerate(model.state.inlets):
+            evs = model._evals[k] if k < len(model._evals) else []
+            if k == model.selected or not evs:
+                continue
+            twin = model.has_twin(k)
+            for tag, mirror in (("", False), ("m", True)) if twin else (("", False),):
+                pts = ins.plane.to_3d(evs[0].outline)
+                pts = (pts * np.array([1.0, -1.0, 1.0]))[::-1] if mirror else pts
+                fill, outline = _polygon_mesh(pts)
+                bad = not evs[0].valid
+                for part, mesh, kw in (("fill", fill, {"opacity": INLET_OPACITY * 0.6, "show_edges": False}),
+                                       ("edge", outline, {"line_width": 2})):
+                    name = f"inlet_other{k}{tag}_{part}"
+                    colour = ERROR_COLOR if bad else (TWIN_COLOR if mirror else OTHER_INLET_COLOR)
+                    p.add_mesh(mesh, color=colour, name=name, pickable=False, render=False, **kw)
+                    self._other_inlet_actors.add(name)
         op = model.opening
         if op is None:
             for name in self.INLET_ACTORS:
@@ -216,7 +239,12 @@ class SceneView:
         plane = model.state.plane
         right = plane.to_3d(op.outline)
         left = (right * np.array([1.0, -1.0, 1.0]))[::-1]  # mirror about XZ; reversed to stay counter-clockwise
+        twin = model.has_twin(model.selected)
         for side, pts, color in (("right", right, RIGHT_COLOR), ("left", left, LEFT_COLOR)):
+            if side == "left" and not twin:
+                p.remove_actor("inlet_left_fill", render=False)
+                p.remove_actor("inlet_left_edge", render=False)
+                continue
             fill, outline = _polygon_mesh(pts)
             p.add_mesh(fill, color=ERROR_COLOR if not op.valid else color, opacity=INLET_OPACITY,
                        name=f"inlet_{side}_fill", pickable=False, show_edges=False, render=False)
@@ -247,57 +275,69 @@ class SceneView:
             p.remove_actor("to_face", render=False)
 
     # ---- ducts ---------------------------------------------------------------------------------------------
-    DUCT_ACTORS = ("cl_right", "cl_left", "cl_trunk") + tuple(f"duct_{n}" for n in BODY_NAMES)
-
     def update_ducts(self, model) -> None:
         """Draw the centrelines (cheap) and, once the model has built them for its current state, the negative
         and positive bodies: the positive's external part in its own colour, wall below the clearance and bodies
-        intersecting other Geoms in red."""
+        intersecting other Geoms in red. The selected inlet's centreline is the bright one; mirrored twins are
+        greyed."""
         p = self.plotter
         duct = model.duct if model.placed else None
-        if duct is None:
-            for name in self.DUCT_ACTORS:
-                p.remove_actor(name, render=False)
-            return
-        cl = duct.centreline
-        for name, curve, mirror in (("cl_right", cl.branch, False), ("cl_left", cl.branch, True),
-                                    ("cl_trunk", cl.trunk, False)):
-            pts = curve.points(np.linspace(0.0, 1.0, 60))
-            if mirror:
-                pts = pts * np.array([1.0, -1.0, 1.0])
-            p.add_mesh(pv.lines_from_points(pts), color=CENTRELINE_COLOR, line_width=CENTRELINE_WIDTH, name=name,
-                       pickable=False, render=False)
-        if not model.checks_current:
-            return
-        checks, bodies = model.checks, model.bodies
-        for name, body in bodies.items():
-            mesh = body.mesh.copy()
-            colour_kwargs = {}
-            if body.kind == "positive":
-                flags = checks.external_cells.get(name)
-                if name in checks.intersecting:
-                    colour_kwargs = {"color": VIOLATION_COLOR}
-                elif flags is not None and flags.any():
-                    mesh.cell_data["external"] = flags.astype(float)
-                    colour_kwargs = {"scalars": "external", "cmap": [POSITIVE_COLOR, EXTERNAL_COLOR],
-                                     "clim": [0.0, 1.0], "show_scalar_bar": False}
-                else:
-                    colour_kwargs = {"color": POSITIVE_COLOR}
-                opacity = POSITIVE_OPACITY
-            else:
-                wall = checks.wall_points.get("neg_branch_R" if name == "neg_branch_L" else name)
-                limit = model.settings.checks.min_clearance
-                if name in checks.intersecting:
-                    colour_kwargs = {"color": VIOLATION_COLOR}
-                elif wall is not None and np.isfinite(wall).any() and (wall < limit).any():
-                    bad = np.where(wall < limit, 1.0, 0.0)
-                    mesh.point_data["violation"] = bad
-                    colour_kwargs = {"scalars": "violation", "cmap": [NEGATIVE_COLOR, VIOLATION_COLOR],
-                                     "clim": [0.0, 1.0], "show_scalar_bar": False}
-                else:
-                    colour_kwargs = {"color": NEGATIVE_COLOR}
-                opacity = NEGATIVE_OPACITY
-            p.add_mesh(mesh, opacity=opacity, name=f"duct_{name}", pickable=False, render=False, **colour_kwargs)
+        wanted: set[str] = set()
+        if duct is not None:
+            selected = model.branch_index()
+            trunk_curve = duct.branches[0].centreline.trunk
+            for i, bg in enumerate(duct.branches):
+                pts = bg.centreline.branch.points(np.linspace(0.0, 1.0, 60))
+                name = f"cl_{bg.name}"
+                chosen = i == selected
+                p.add_mesh(pv.lines_from_points(pts), color=TWIN_COLOR if bg.twin else CENTRELINE_COLOR,
+                           line_width=CENTRELINE_WIDTH if chosen else max(CENTRELINE_WIDTH - 1, 1), name=name,
+                           pickable=False, render=False)
+                wanted.add(name)
+            p.add_mesh(pv.lines_from_points(trunk_curve.points(np.linspace(0.0, 1.0, 60))), color=CENTRELINE_COLOR,
+                       line_width=CENTRELINE_WIDTH, name="cl_trunk", pickable=False, render=False)
+            wanted.add("cl_trunk")
+            if model.checks_current:
+                checks, bodies = model.checks, model.bodies
+                for name, body in bodies.items():
+                    twin = body.side.endswith("_mirror")
+                    mesh = body.mesh.copy()
+                    if body.kind == "positive":
+                        flags = checks.external_cells.get(name)
+                        if name in checks.intersecting:
+                            colour_kwargs = {"color": VIOLATION_COLOR}
+                        elif flags is not None and flags.any():
+                            mesh.cell_data["external"] = flags.astype(float)
+                            colour_kwargs = {"scalars": "external", "cmap": [TWIN_COLOR if twin else POSITIVE_COLOR,
+                                                                             EXTERNAL_COLOR],
+                                             "clim": [0.0, 1.0], "show_scalar_bar": False}
+                        else:
+                            colour_kwargs = {"color": TWIN_COLOR if twin else POSITIVE_COLOR}
+                        opacity = TWIN_OPACITY + 0.1 if twin else POSITIVE_OPACITY
+                    else:
+                        wall = checks.wall_points.get(name)
+                        limit = model.settings.checks.min_clearance
+                        if name in checks.intersecting:
+                            colour_kwargs = {"color": VIOLATION_COLOR}
+                        elif wall is not None and np.isfinite(wall).any() and (wall < limit).any():
+                            mesh.point_data["violation"] = np.where(wall < limit, 1.0, 0.0)
+                            colour_kwargs = {"scalars": "violation", "cmap": [TWIN_COLOR if twin else NEGATIVE_COLOR,
+                                                                              VIOLATION_COLOR],
+                                             "clim": [0.0, 1.0], "show_scalar_bar": False}
+                        else:
+                            colour_kwargs = {"color": TWIN_COLOR if twin else NEGATIVE_COLOR}
+                        opacity = TWIN_OPACITY if twin else NEGATIVE_OPACITY
+                    p.add_mesh(mesh, opacity=opacity, name=f"duct_{name}", pickable=False, render=False,
+                               **colour_kwargs)
+                    wanted.add(f"duct_{name}")
+        if duct is not None and not model.checks_current:  # the bodies of the last build stay until the next one
+            gone = {n for n in self._duct_actors if n.startswith("cl_")} - wanted
+            wanted |= {n for n in self._duct_actors if n.startswith("duct_")}
+        else:
+            gone = self._duct_actors - wanted
+        for name in gone:
+            p.remove_actor(name, render=False)
+        self._duct_actors = wanted
 
     # ---- view controls --------------------------------------------------------------------------------------
     def has(self, name: str) -> bool:

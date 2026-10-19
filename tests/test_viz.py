@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import pyvista as pv
 
+import cfgutil  # noqa: E402
 from ductmgr.explore_model import InletModel
 from ductmgr.config import load_config
 from ductmgr.viz import BACKGROUND, ERROR_COLOR, VIEWS, SceneView, load_scene
@@ -32,7 +33,7 @@ def model_for(scene, example_env, placed=True):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
     if not placed:
-        cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["key_sections"] = None
+        cfgutil.unplace(cfg)
     return InletModel(scene, cfg, path, None)
 
 
@@ -260,11 +261,11 @@ def test_the_centrelines_are_drawn_without_building_the_bodies(plotter, scene, e
     model = model_for(scene, example_env)
     view.update_ducts(model)
     acts = plotter.renderer.actors
-    for name in ("cl_right", "cl_left", "cl_trunk"):
+    for name in ("cl_right", "cl_right_mirror", "cl_trunk"):
         assert name in acts
     assert not any(n.startswith("duct_") for n in acts) and not model.checks_current  # the heavy part waits
     right = np.asarray(acts["cl_right"].GetMapper().GetInput().points)
-    left = np.asarray(acts["cl_left"].GetMapper().GetInput().points)
+    left = np.asarray(acts["cl_right_mirror"].GetMapper().GetInput().points)
     assert left == pytest.approx(right * np.array([1.0, -1.0, 1.0]), abs=1e-5)  # the exact mirror image
     assert right[0] == pytest.approx(model.centreline.start, abs=1e-5)
 
@@ -275,9 +276,8 @@ def test_the_six_bodies_are_drawn_once_they_are_built(plotter, scene, example_en
     model.ensure_built()
     view.update_ducts(model)
     acts = plotter.renderer.actors
-    from ductmgr.viz import BODY_NAMES
-
-    for name in BODY_NAMES:
+    names = [f"{k}_{p}" for k in ("neg", "pos") for p in ("branch_right", "branch_right_mirror", "trunk")]
+    for name in names:
         assert f"duct_{name}" in acts
     neg = acts["duct_neg_trunk"].GetProperty().GetOpacity()
     assert neg < 0.5 and acts["duct_pos_trunk"].GetProperty().GetOpacity() > neg
@@ -287,9 +287,9 @@ def test_the_external_part_of_the_positive_gets_its_own_colour(plotter, scene, e
     view = SceneView(plotter, scene)
     model = model_for(scene, example_env)
     model.ensure_built()
-    assert model.checks.external_cells["pos_branch_R"].any()  # the example duct leaves the skin near the opening
+    assert model.checks.external_cells["pos_branch_right"].any()  # the example duct leaves the skin near the opening
     view.update_ducts(model)
-    mapper = plotter.renderer.actors["duct_pos_branch_R"].GetMapper()
+    mapper = plotter.renderer.actors["duct_pos_branch_right"].GetMapper()
     assert mapper.GetScalarVisibility() and mapper.GetScalarModeAsString() == "UseCellData"
     assert mapper.GetArrayName() == "external"
     assert mapper.GetScalarRange() == (0.0, 1.0)

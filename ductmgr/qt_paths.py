@@ -31,6 +31,8 @@ FUSELAGE_FILL, FUSELAGE_LINE = "#1B2A36", "#6f9bb8"
 CONTEXT_LINE, ENGINE_LINE, FACE_LINE = "#4A525A", "#aab4bd", "#e5534b"
 OPENING_COLOR, CENTRE_COLOR, HANDLE_COLOR = "#f0a030", "#3fb950", "#58a6ff"
 MIRROR_COLOR = "#2B6B5A"
+OTHER_COLOR = "#8b6b3a"  # the inlets that are not selected
+TWIN_COLOR = "#5b636b"  # a generated mirrored twin: not editable, greyed
 KEY_COLOR, POINT_COLOR, BAD_COLOR = "#d29922", "#E6EDF3", "#e5534b"
 HIT_PX = 10  # hit radius of a handle / control point
 MARKER_PX = 5
@@ -178,8 +180,9 @@ class PathCanvas(Canvas2D):
         pts = [self._fuselage] if len(self._fuselage) else [np.zeros((1, 2))]
         duct = self.model.duct if self.model.placed else None
         if duct is not None:
-            pts.append(self.project(duct.centreline.branch.ctrl))
-            pts.append(self.project(duct.centreline.trunk.ctrl))
+            for bg in duct.branches:
+                pts.append(self.project(bg.centreline.branch.ctrl))
+            pts.append(self.project(duct.branches[0].centreline.trunk.ctrl))
         allp = np.vstack(pts)
         lo, hi = allp.min(axis=0), allp.max(axis=0)
         size = np.maximum(hi - lo, 1e-3) * (1.0 + 2.0 * FIT_MARGIN)
@@ -191,14 +194,20 @@ class PathCanvas(Canvas2D):
     # ---- handles ---------------------------------------------------------------------------------------------------
     def handles(self) -> dict[str, np.ndarray]:
         """World 2D position of each draggable item: the junction and the four tangent handles."""
-        duct = self.model.duct if self.model.placed else None
-        if duct is None:
+        cl = self.selected_centreline()
+        if cl is None:
             return {}
-        pts = duct.centreline.handle_points()
-        return {name: self.project(p)[0] for name, p in pts.items()}
+        return {name: self.project(p)[0] for name, p in cl.handle_points().items()}
+
+    def selected_centreline(self):
+        """The centreline of the selected inlet's primary branch (None without a duct)."""
+        m = self.model
+        duct = m.duct if m.placed else None
+        k = m.branch_index()
+        return None if duct is None or k is None else duct.branches[k].centreline
 
     def anchors(self) -> dict[str, np.ndarray]:
-        cl = self.model.duct.centreline
+        cl = self.selected_centreline()
         a = {"start": cl.start, "junction_in": cl.branch.ctrl[3], "junction_out": cl.junction, "end": cl.face_centre}
         return {k: self.project(v)[0] for k, v in a.items()}
 
@@ -215,11 +224,30 @@ class PathCanvas(Canvas2D):
     def press(self, pos, button=QtCore.Qt.MouseButton.LeftButton) -> bool:
         if button == QtCore.Qt.MouseButton.LeftButton:
             self._drag = self.hit(pos)
-            return self._drag is not None
+            if self._drag is None:
+                return self.select_at(pos)
+            return True
         if button in (QtCore.Qt.MouseButton.MiddleButton, QtCore.Qt.MouseButton.RightButton):
             self.pan_start(pos)
             return True
         return False
+
+    def branch_starts(self) -> list[tuple[int, np.ndarray]]:
+        """(inlet index, 2D start point) of every branch, mirrored twins included (a twin selects its inlet)."""
+        duct = self.model.duct if self.model.placed else None
+        if duct is None:
+            return []
+        return [(bg.inlet, self.project(bg.centreline.start)[0]) for bg in duct.branches]
+
+    def select_at(self, pos) -> bool:
+        """Select the inlet whose opening is under ``pos``."""
+        best, best_d = None, 1.6 * HIT_PX
+        for inlet, hv in self.branch_starts():
+            q = self.to_screen(hv)
+            d = math.hypot(q.x() - pos.x(), q.y() - pos.y())
+            if d <= best_d:
+                best, best_d = inlet, d
+        return best is not None and self.model.select_inlet(best) or best is not None
 
     def move(self, pos) -> None:
         if self._drag is not None:
@@ -240,20 +268,23 @@ class PathCanvas(Canvas2D):
             changes = {fields[name]: None}
             if name in ("junction_in", "junction_out"):
                 changes["junction_pitch_deg"] = None
+                changes["junction_yaw_deg"] = None
             return self.model.set_centreline(f"cl:{name}", **changes)
         return False
 
     def drag_to(self, name: str, q: np.ndarray) -> bool:
         """Move the handle ``name`` towards the world point ``q`` (h, v) of this view, within its constraint."""
         m = self.model
-        cl = m.duct.centreline if m.duct is not None else None
+        cl = self.selected_centreline()
         if cl is None:
             return False
         r = cl.resolved
+        free = m.state.symmetry != "xz"  # without symmetry the junction and its tangent are free in 3D
         if name == "junction":
             h, v = float(q[0]), float(q[1])
-            x, z = (h, v) if self.view == "side" else (h, r.junction[1])
-            return m.drag_junction(x, z)
+            if self.view == "side":
+                return m.drag_junction(h, v)
+            return m.drag_junction(h, r.junction[1], v if free else None)
         if name == "start":
             a = self.project(cl.start)[0]
             d = self.project(cl.start_dir)[0]
@@ -262,21 +293,28 @@ class PathCanvas(Canvas2D):
             a = self.project(cl.face_centre)[0]
             d = self.project(cl.face_axis)[0]
             return self._slide(m, "end_handle", "cl:end", q, a, d, -1.0)
-        # junction handles: the tangent lies in the XZ plane
+        # junction handles: the tangent lies in the XZ plane (symmetry xz) or points anywhere
         anchor = cl.branch.ctrl[3] if name == "junction_in" else cl.junction  # the branch ends at its half's centroid
         j = np.array([anchor[0], anchor[self.across]])
         sign = -1.0 if name == "junction_in" else 1.0
         w = (q - j) * sign
         key = "junction_in_handle" if name == "junction_in" else "junction_out_handle"
+        cos_psi = math.cos(math.radians(r.junction_yaw_deg))
+        cos_phi = math.cos(math.radians(r.junction_pitch_deg))
         if self.view == "side":
-            length = float(np.hypot(*w))
+            length = float(np.hypot(*w)) / max(abs(cos_psi), 1e-6)
             if length < 1e-9 or w[0] <= 0.0:
                 return False
             phi = math.degrees(math.atan2(w[1], w[0]))
             return m.set_centreline(f"cl:{name}", **{key: length, "junction_pitch_deg": phi})
-        cos_phi = math.cos(math.radians(r.junction_pitch_deg))
         if abs(cos_phi) < 1e-6:
             return False
+        if free:  # top view: yaw and length
+            if w[0] <= 0.0:
+                return False
+            psi = math.degrees(math.atan2(w[1] * cos_phi, w[0]))
+            length = math.hypot(w[0] / cos_phi, w[1])
+            return m.set_centreline(f"cl:{name}", **{key: length, "junction_yaw_deg": psi})
         return m.set_centreline(f"cl:{name}", **{key: max(float(w[0]) / cos_phi, 0.0)})
 
     @staticmethod
@@ -337,7 +375,8 @@ class PathCanvas(Canvas2D):
                 p.setPen(self._pen(BAD_COLOR))
                 p.drawText(QtCore.QPointF(10, 18), m.duct_error)
             return
-        cl = duct.centreline
+        sel = m.branch_index()
+        cl = duct.branches[sel if sel is not None else 0].centreline
         # engine face
         r = 0.5 * duct.spec.face_diameter
         ax = duct.spec.face_axis / np.linalg.norm(duct.spec.face_axis)
@@ -347,24 +386,22 @@ class PathCanvas(Canvas2D):
             a, b = cl.face_centre + r * perp, cl.face_centre - r * perp
             p.setPen(self._pen(FACE_LINE, 3.0))
             self._polyline(p, self.project(np.array([a, b])))
-        # opening
-        st0 = duct.branch[0]
-        ring = duct.place(st0, st0.ring)
-        p.setPen(self._pen(OPENING_COLOR, 2.5))
-        self._polyline(p, self.project(ring), close=True)
-        if self.view == "top":
-            p.setPen(self._pen(MIRROR_COLOR, 1.5))
-            self._polyline(p, self.project(ring * np.array([1.0, -1.0, 1.0])), close=True)
-        # centrelines
         t = np.linspace(0.0, 1.0, CURVE_SAMPLES)
-        branch, trunk = cl.branch.points(t), cl.trunk.points(t)
-        if self.view == "top":
-            p.setPen(self._pen(MIRROR_COLOR, 2.0))
-            self._polyline(p, self.project(branch * np.array([1.0, -1.0, 1.0])))
+        order = sorted(range(len(duct.branches)), key=lambda i: (not duct.branches[i].twin, i != sel))  # twins first
+        for i in order:  # every branch: the selected one bright, twins greyed, on top of nothing else
+            bg = duct.branches[i]
+            chosen = i == sel
+            colour = TWIN_COLOR if bg.twin else (CENTRE_COLOR if chosen else OTHER_COLOR)
+            st0 = bg.stations[0]
+            ring = duct.place(st0, st0.ring)
+            p.setPen(self._pen(TWIN_COLOR if bg.twin else (OPENING_COLOR if chosen else OTHER_COLOR),
+                               2.5 if chosen else 1.5))
+            self._polyline(p, self.project(ring), close=True)
+            p.setPen(self._pen(colour, 2.5 if chosen else 1.5))
+            self._polyline(p, self.project(bg.centreline.branch.points(t)))
         p.setPen(self._pen(CENTRE_COLOR, 2.5))
-        self._polyline(p, self.project(branch))
-        self._polyline(p, self.project(trunk))
-        # key section positions along the path
+        self._polyline(p, self.project(duct.branches[0].centreline.trunk.points(t)))
+        # key section positions along the selected inlet's path
         p.setPen(self._pen(KEY_COLOR, 1.5))
         for ks in m.state.sections[1:]:
             c = self.project(cl.point_at(ks.s))[0]
@@ -439,7 +476,7 @@ class AreaCanvas(Canvas2D):
             out.append(("branch", "point", k, s, v))
         for k, (s, v) in enumerate(a.trunk_interior):
             out.append(("trunk", "point", k, s, v))
-        out.append(("branch", "junction", -1, 1.0, a.junction_area / a.n))
+        out.append(("branch", "junction", -1, 1.0, a.junction_area * a.share))
         out.append(("trunk", "junction", -1, 0.0, a.junction_area))
         return out
 
@@ -470,7 +507,7 @@ class AreaCanvas(Canvas2D):
         plot, kind, index = self._drag[0], self._drag[1], self._drag[2]
         s, area = self.from_px(plot, pos)
         if kind == "junction":
-            self.model.area_set_junction(area * (self.model.areas.n if plot == "branch" else 1.0))
+            self.model.area_set_junction(area / self.model.areas.share if plot == "branch" else area)
         else:
             self.model.area_move_point(plot, index, s, area)
 
@@ -526,7 +563,8 @@ class AreaCanvas(Canvas2D):
             v = fn(s)
             length = 1.0
             if duct is not None:
-                length = duct.centreline.length_branch if which == "branch" else duct.centreline.length_trunk
+                cl_sel = duct.branches[m.branch_index() or 0].centreline
+                length = cl_sel.length_branch if which == "branch" else cl_sel.length_trunk
             radius = np.sqrt(v / math.pi)
             slope = np.diff(radius) / (np.diff(s) * max(length, 1e-9))
             bad = (np.diff(v) < -1e-12) | (np.degrees(np.arctan(slope)) > limit)
@@ -535,7 +573,7 @@ class AreaCanvas(Canvas2D):
                 p.drawLine(self.to_px(which, s[i], v[i]), self.to_px(which, s[i + 1], v[i + 1]))
             # key sections of this part
             if duct is not None:
-                sj = duct.s_junction
+                sj = duct.branches[m.branch_index() or 0].s_junction
                 for ks in m.state.sections:
                     in_branch = ks.s <= sj
                     if (which == "branch") != in_branch:

@@ -28,8 +28,10 @@ CURVATURE_SAMPLES = 200
 class CentrelineParams:
     """The editable part of the centrelines. ``None`` means "default" (derived from the other inputs)."""
 
-    junction: tuple[float, float] | None = None  # (x, z) of the junction on y = 0
+    junction: tuple[float, float] | None = None  # (x, z) of the junction (y = 0 unless the layout is not symmetric)
     junction_pitch_deg: float | None = None  # tangent direction at the junction in the XZ plane (0 = +X, + up)
+    junction_y: float | None = None  # y of the junction; only without symmetry (else 0)
+    junction_yaw_deg: float | None = None  # tangent yaw towards +Y; only without symmetry (else 0)
     start_handle: float | None = None  # length of the handle at the inlet (along -n)
     junction_in_handle: float | None = None  # branch side of the junction
     junction_out_handle: float | None = None  # trunk side of the junction
@@ -106,13 +108,23 @@ class Resolved:
     junction_in_handle: float
     junction_out_handle: float
     end_handle: float
+    junction_y: float = 0.0
+    junction_yaw_deg: float = 0.0
+
+
+def default_junction(start, face_centre, fraction: float = 0.5) -> tuple[float, float, float]:
+    """The default junction: ``fraction`` of the way from ``start`` to the face centre."""
+    p = np.asarray(start, dtype=float) + fraction * (np.asarray(face_centre, dtype=float) - np.asarray(start, dtype=float))
+    return float(p[0]), float(p[1]), float(p[2])
 
 
 class Centreline:
-    """Branch + trunk Béziers for one inlet (the other inlet is the mirror image about y = 0)."""
+    """Branch + trunk Béziers for one inlet. With ``symmetric`` (the default) the junction lies on y = 0 with its
+    tangent in the XZ plane, so a mirrored branch joins the same trunk G1; without it the junction point and tangent
+    are free in 3D."""
 
     def __init__(self, start, start_dir, face_centre, face_axis, params: CentrelineParams,
-                 default_junction_fraction: float = 0.5, branch_end_offset=None):
+                 default_junction_fraction: float = 0.5, branch_end_offset=None, symmetric: bool = True):
         """``branch_end_offset``: the branch ends at the junction plus this vector (the centroid of its half of the
         trunk start section) instead of at the junction itself; its tangent there is still the junction tangent."""
         self.start = np.asarray(start, dtype=float)
@@ -121,14 +133,23 @@ class Centreline:
         self.face_axis = _unit(face_axis)
         self.params = params
         p = params
-        jx, jz = p.junction if p.junction is not None else self._default_junction(default_junction_fraction)
-        junction = np.array([jx, 0.0, jz])
+        dj = default_junction(self.start, self.face_centre, default_junction_fraction)
+        jx, jz = p.junction if p.junction is not None else (dj[0], dj[2])
+        jy = 0.0 if symmetric else (dj[1] if p.junction_y is None else float(p.junction_y))
+        junction = np.array([jx, jy, jz])
+        d = self.face_centre - junction
         if p.junction_pitch_deg is not None:
             phi = math.radians(p.junction_pitch_deg)
         else:
-            d = self.face_centre - junction
             phi = math.atan2(d[2], d[0]) if (d[0] or d[2]) else 0.0
-        t = np.array([math.cos(phi), 0.0, math.sin(phi)])
+        if symmetric:
+            psi = 0.0
+        elif p.junction_yaw_deg is not None:
+            psi = math.radians(p.junction_yaw_deg)
+        else:
+            psi = math.atan2(d[1], math.hypot(d[0], d[2]))
+        t = np.array([math.cos(psi) * math.cos(phi), math.sin(psi), math.cos(psi) * math.sin(phi)])
+        self.symmetric = symmetric
         self.branch_end_offset = np.zeros(3) if branch_end_offset is None else np.asarray(branch_end_offset, dtype=float)
         branch_end = junction + self.branch_end_offset
         chord_b = float(np.linalg.norm(branch_end - self.start))
@@ -142,7 +163,7 @@ class Centreline:
             if h < 0.0:
                 raise ValueError(f"the {name} handle length must not be negative")
         self.resolved = Resolved((float(jx), float(jz)), math.degrees(phi), float(h0), float(h_in), float(h_out),
-                                 float(h_end))
+                                 float(h_end), float(jy), math.degrees(psi))
         self.junction = junction
         self.junction_tangent = t
         self.branch = Bezier3([self.start, self.start + h0 * self.start_dir, branch_end - h_in * t, branch_end])
@@ -151,10 +172,6 @@ class Centreline:
         lb, lt = self.branch.length, self.trunk.length
         self.length_branch, self.length_trunk = lb, lt
         self.s_junction = lb / (lb + lt) if lb + lt > 0 else 0.5
-
-    def _default_junction(self, fraction: float) -> tuple[float, float]:
-        p = self.start + fraction * (self.face_centre - self.start)
-        return float(p[0]), float(p[2])
 
     # ---- by global s ---------------------------------------------------------------------------------------------------
     def locate(self, s) -> tuple[np.ndarray, np.ndarray]:

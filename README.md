@@ -216,10 +216,36 @@ and the same undo history as the section editor, and the 3D view follows at once
   half-angle per part; A(s) must not decrease. The cheap numbers update with every edit; the bodies and the mesh
   checks are rebuilt a moment after the last one.
 
-The config keeps the junction in `ducts.junction.point`, the handle lengths and tangent in `ducts.centreline`
-(`null` = default), the area law in `ducts.area_points` (`junction_area`, interior `branch` / `trunk` points,
-`null` = derived from `ducts.area_law`), and `ducts.wall_thickness`, `ducts.lip_extension` (formerly
-`ducts.inlet.lip_extension`, still read) and `ducts.lip_mode`; Save writes them all, keeping comments.
+The config keeps the junction in `ducts.junction.point` `[x, y, z]` (y is 0 with symmetry xz), the shared tangent and
+handles in `ducts.centreline` (`null` = default), the junction and trunk area points in `ducts.area_points`
+(`junction_area`, interior `trunk` points; `null` = derived from `ducts.area_law`), and `ducts.wall_thickness`,
+`ducts.lip_extension` (formerly `ducts.inlet.lip_extension`, still read) and `ducts.lip_mode`. Each inlet keeps its own
+handles and branch area points in `ducts.inlets`. Save writes them all, keeping comments.
+
+**Inlets (1..N).** The design has any number of inlets, listed in the **Inlets** group of the panel (add, duplicate,
+remove, rename); the section editor, the 2D views and the panel edit the *selected* one (click an opening in a 2D
+view to select it). Each inlet has its own plane and key sections, a **flow share** (the fraction of the total flow
+its branch carries; default an equal split over all physical branches, always normalised to sum to 1 with a notice)
+and a **mirrored twin** box. Its capture area is its flow share of the total of Phase 1, and its area law scales
+accordingly. The global **symmetry** is `xz` or `none`:
+
+- `xz`: an inlet with the mirror box set gets an automatic mirrored twin about y = 0 (generated, greyed, not
+  editable); the junction, the trunk and all centrelines are held on y = 0. An inlet centred on y = 0 (origin y = 0,
+  no sweep) is its own mirror image: it is never mirrored and its sections are kept symmetric about u = 0, so you edit
+  one side and the other follows.
+- `none`: every inlet is independent and the junction position and tangent are free (also in the top view).
+
+What happens where the branches meet depends on their number (twins counted): one branch is one continuous duct with
+the junction point as an intermediate G1 point; two branches split the trunk start section by the plane through the
+trunk axis equidistant to both branches (y = 0 when symmetric), offset to give each its flow share of the area; three
+or more split it into sectors by rays from its centroid, ordered by each branch's angular position around the trunk
+axis, with the ray angles solved so every sector has its flow share. Each branch ends exactly on its piece, so the
+pieces tile the section with no gap and no overlap.
+
+The config holds `ducts.symmetry` and `ducts.inlets`, a list of `{name, origin, pitch_deg, sweep_deg, flow_fraction,
+mirror, start_handle, junction_in_handle, area_points, key_sections}`. The old single-inlet format (`ducts.inlet` +
+`ducts.key_sections`) still loads, as one mirrored inlet with symmetry xz, with a one-line notice; Save migrates it.
+Key sections beyond the junction shape the trunk and are taken from the first inlet.
 
 The 3D view draws both openings on their planes, the section curve and the plane's `u`/`v`/`n` arrows at `O`.
 
@@ -240,13 +266,13 @@ Other controls:
 - **View** toolbar: side / top / front / iso (`1`-`4`), toggles for the context components, the engine envelope
   and the section editor dock.
 
-The config stores the inlet plane as `ducts.inlet.origin` `[x, y, z]`, `pitch_deg` and `sweep_deg`, and the
-sections as `ducts.key_sections`, a list of `{s, vertices, snapped, edges, handles, continuity}` (`vertices` as
-`[u, v]` pairs, `edges` per edge `straight` / `curved`, `handles` per edge `null` or two `[du, dv]` offsets from its
-two vertices, `continuity` per vertex `corner` / `smooth` / `symmetric`); see `duct_config.example.yaml`. The old
-5-vertex `ducts.inlet.vertices` / `snapped` format still loads, as a straight-edged inlet section with a one-line
-notice, and Save migrates it. Other older keys (`shape`, `skin_fit`, `centroid`, `normal`, `tilt_deg`,
-`attach_point`, `station_x`, `polygon`) are ignored with a one-line notice.
+Each inlet in `ducts.inlets` stores its plane as `origin` `[x, y, z]`, `pitch_deg` and `sweep_deg` and its sections as
+`key_sections`, a list of `{s, vertices, snapped, edges, handles, continuity}` (`vertices` as `[u, v]` pairs, `edges` per
+edge `straight` / `curved`, `handles` per edge `null` or two `[du, dv]` offsets from its two vertices, `continuity`
+per vertex `corner` / `smooth` / `symmetric`); see `duct_config.example.yaml`. The older formats (a single
+`ducts.inlet` with `ducts.key_sections`, and the 5-vertex `ducts.inlet.vertices` / `snapped`) still load as one
+inlet with a one-line notice, and Save migrates them. Other old keys (`shape`, `skin_fit`, `centroid`, `normal`,
+`tilt_deg`, `attach_point`, `station_x`, `polygon`) are ignored with a one-line notice.
 
 The engine face is centred on the front (min-x) end of the Geom named by `engine.geom_name`. Its diameter is
 `engine.face_diameter` from the config (the fan); the Geom's bounding box is only the engine envelope (casing),

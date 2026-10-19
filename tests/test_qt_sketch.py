@@ -17,6 +17,7 @@ pytest.importorskip("PySide6")
 from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 import bodies  # noqa: E402
+import cfgutil  # noqa: E402
 from ductmgr import qt_sketch as qs  # noqa: E402
 from ductmgr import sketch as sk  # noqa: E402
 from ductmgr.config import EXAMPLE_CONFIG  # noqa: E402
@@ -271,7 +272,7 @@ def test_the_painter_copes_with_a_swept_pitched_plane_and_no_inlet(qapp, model, 
     c.resize(*SIZE)
     assert pixels(c).size > 0
     cfg = copy.deepcopy(example_env[0])
-    cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["inlet"]["vertices"] = cfg["ducts"]["inlet"]["snapped"] = None
+    cfgutil.unplace(cfg)
     empty = qs.SketchCanvas(InletModel(scene, cfg, EXAMPLE_CONFIG, None))
     empty.resize(*SIZE)
     assert pixels(empty).size > 0 and empty.vertex_positions() == [] and empty.hit_vertex(QtCore.QPointF(5, 5)) is None
@@ -327,7 +328,7 @@ def test_fit_view_button_reframes(qapp, model):
 
 def test_fit_area_is_disabled_before_an_inlet_exists(qapp, scene, example_env):
     cfg = copy.deepcopy(example_env[0])
-    cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["inlet"]["vertices"] = cfg["ducts"]["inlet"]["snapped"] = None
+    cfgutil.unplace(cfg)
     dock = qs.SketchDock(InletModel(scene, cfg, EXAMPLE_CONFIG, None))
     assert not dock.btn_fit_area.isEnabled() and dock.info.text() == ""
 

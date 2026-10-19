@@ -22,6 +22,7 @@ pytest.importorskip("PySide6")
 from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 import bodies  # noqa: E402
+import cfgutil  # noqa: E402
 from ductmgr import qt_explorer as qe  # noqa: E402
 from ductmgr import qt_sketch as qs  # noqa: E402
 from ductmgr.config import EXAMPLE_CONFIG, load_config  # noqa: E402
@@ -80,8 +81,7 @@ def skin_point(scene, x=3.0, y=0.4):
 def unplaced(example_env):
     cfg, _, _ = example_env
     cfg = copy.deepcopy(cfg)
-    inlet = cfg["ducts"]["inlet"]
-    inlet["origin"] = cfg["ducts"]["key_sections"] = None
+    cfgutil.unplace(cfg)
     return cfg
 
 
@@ -477,10 +477,10 @@ def test_save_button_and_shortcut_write_the_config_and_clear_the_star(make_windo
     assert w.windowTitle().endswith("*")
     w.btn_save.click()
     assert not w.windowTitle().endswith("*")
-    assert yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlet"]["sweep_deg"] == 9.0
+    assert yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlets"][0]["sweep_deg"] == 9.0
     w.spin_pitch.setValue(5.0)
     w.act_save.trigger()  # Ctrl+S
-    assert yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlet"]["pitch_deg"] == 5.0
+    assert yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlets"][0]["pitch_deg"] == 5.0
 
 
 def test_revert_button_restores_the_saved_inlet(make_window, writable):
@@ -513,7 +513,7 @@ def test_closing_with_save_writes_the_file(make_window, writable, monkeypatch):
     w.spin_sweep.setValue(10.0)
     monkeypatch.setattr(w, "ask_unsaved", lambda: "save")
     assert w.close()
-    assert yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlet"]["sweep_deg"] == 10.0
+    assert yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]["inlets"][0]["sweep_deg"] == 10.0
 
 
 def test_a_failed_save_keeps_the_window_open(make_window, writable, monkeypatch):
@@ -679,7 +679,7 @@ def test_the_reset_buttons(make_window):
     w.model.area_move_point("branch", 0, 0.25, 0.1)
     w.btn_reset_cl.click()
     w.btn_reset_area.click()
-    assert w.model.state.duct.centreline.start_handle is None and w.model.state.duct.area.branch is None
+    assert w.model.state.inlet.start_handle is None and w.model.state.duct.area.branch is None
 
 
 def test_2d_edits_and_the_model_stay_in_step(make_window):

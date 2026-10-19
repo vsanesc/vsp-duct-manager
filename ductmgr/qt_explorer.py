@@ -37,6 +37,7 @@ PITCH_RANGE_DEG = (-85.0, 85.0)
 SWEEP_RANGE_DEG = (-90.0, 90.0)
 CLICK_TOLERANCE_PX = 4  # a press-release further apart than this is a camera drag, not a click
 SECTION_LIST_HEIGHT = 110
+INLET_LIST_HEIGHT = 96
 PATHS_HEIGHT = 300  # the 2D duct tabs dock at the bottom
 HEAVY_DELAY_MS = 150  # bodies and checks are rebuilt this long after the last change (the rest updates at once)
 WALL_RANGE_M = (0.0005, 0.2)
@@ -365,6 +366,56 @@ class ExploreWindow(QtWidgets.QMainWindow):
         col.setContentsMargins(6, 4, 6, 6)
         col.setSpacing(4)
 
+        # Inlets: the list, add / duplicate / remove / rename, mirror, flow fraction, global symmetry
+        self.grp_inlets = CollapsibleGroup("Inlets")
+        self.inlet_list = QtWidgets.QListWidget()
+        self.inlet_list.setMaximumHeight(INLET_LIST_HEIGHT)
+        self.inlet_list.setToolTip("The inlet the section editor, the 2D views and the panel edit. Mirrored twins are "
+                                   "generated and not listed.")
+        self.inlet_list.currentRowChanged.connect(self._on_inlet_row)
+        self.btn_add_inlet = QtWidgets.QPushButton("Add")
+        self.btn_dup_inlet = QtWidgets.QPushButton("Duplicate")
+        self.btn_del_inlet = QtWidgets.QPushButton("Remove")
+        self.btn_ren_inlet = QtWidgets.QPushButton("Rename…")
+        self.btn_add_inlet.setToolTip("Add an inlet, then click on the fuselage to place it")
+        self.btn_dup_inlet.setToolTip("Copy the selected inlet (same plane and sections); then move the copy")
+        self.btn_add_inlet.clicked.connect(lambda *_: self.model.add_inlet())
+        self.btn_dup_inlet.clicked.connect(lambda *_: self.model.duplicate_inlet())
+        self.btn_del_inlet.clicked.connect(lambda *_: self.model.remove_inlet())
+        self.btn_ren_inlet.clicked.connect(lambda *_: self._on_rename_inlet())
+        row1, row2 = QtWidgets.QHBoxLayout(), QtWidgets.QHBoxLayout()
+        for b in (self.btn_add_inlet, self.btn_dup_inlet):
+            row1.addWidget(b)
+        for b in (self.btn_del_inlet, self.btn_ren_inlet):
+            row2.addWidget(b)
+        self.chk_mirror = QtWidgets.QCheckBox("Mirrored twin")
+        self.chk_mirror.setToolTip("With symmetry xz: also generate the mirror image of this inlet about y = 0 "
+                                   "(not for an inlet centred on y = 0, which is its own mirror image)")
+        self.chk_mirror.toggled.connect(self._on_mirror)
+        self.spin_flow = self._spin(0.1, 100.0, 1.0, decimals=2, suffix=" %")
+        self.spin_flow.setToolTip("Share of the total flow carried by this branch (each physical branch); all shares "
+                                  "are normalised to sum to 100 %")
+        self.spin_flow.valueChanged.connect(self._on_flow)
+        self.btn_flow_equal = QtWidgets.QPushButton("Equal")
+        self.btn_flow_equal.setToolTip("Back to an equal share")
+        self.btn_flow_equal.clicked.connect(lambda *_: self.model.set_flow_fraction(self.model.selected, None))
+        flow_row = QtWidgets.QHBoxLayout()
+        flow_row.addWidget(self.spin_flow, 1)
+        flow_row.addWidget(self.btn_flow_equal)
+        self.combo_symmetry = QtWidgets.QComboBox()
+        self.combo_symmetry.addItem("xz (mirror about y = 0)", "xz")
+        self.combo_symmetry.addItem("none (free layout)", "none")
+        self.combo_symmetry.setToolTip("xz: mirrored twins, junction and trunk held on y = 0. none: every inlet is "
+                                       "independent, no constraint on the junction")
+        self.combo_symmetry.currentIndexChanged.connect(self._on_symmetry)
+        self.grp_inlets.form.addRow(self.inlet_list)
+        self.grp_inlets.form.addRow(row1)
+        self.grp_inlets.form.addRow(row2)
+        self.grp_inlets.form.addRow(self.chk_mirror)
+        self.grp_inlets.form.addRow("Flow share", flow_row)
+        self.grp_inlets.form.addRow("Symmetry", self.combo_symmetry)
+        col.addWidget(self.grp_inlets)
+
         # Placement
         self.grp_place = CollapsibleGroup("Placement")
         self.btn_place = QtWidgets.QPushButton("Place inlet  (P)")
@@ -385,10 +436,10 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.grp_position = CollapsibleGroup("Inlet plane")
         self.spin_pos = {
             "x": self._spin(b[0] - pad, b[1] + pad, DEFAULT_NUDGE_STEP, suffix=" m"),
-            "y": self._spin(0.0, b[3] + pad, DEFAULT_NUDGE_STEP, suffix=" m"),
+            "y": self._spin(-(b[3] + pad), b[3] + pad, DEFAULT_NUDGE_STEP, suffix=" m"),
             "z": self._spin(b[4] - pad, b[5] + pad, DEFAULT_NUDGE_STEP, suffix=" m"),
         }
-        tips = {"x": "Origin X (aft), m", "y": "Origin Y (right inlet, y >= 0), m", "z": "Origin Z, m"}
+        tips = {"x": "Origin X (aft), m", "y": "Origin Y, m (a mirrored inlet is kept on the right, y >= 0)", "z": "Origin Z, m"}
         for axis, box in self.spin_pos.items():
             box.setToolTip(tips[axis])
             box.valueChanged.connect(lambda *_: self._on_position())
@@ -544,6 +595,32 @@ class ExploreWindow(QtWidgets.QMainWindow):
         else:
             self.model.set_lip_extension(value)
 
+    def _on_inlet_row(self, row: int) -> None:
+        if not self._syncing and row >= 0:
+            self.model.select_inlet(row)
+
+    def ask_inlet_name(self, current: str) -> str | None:
+        """Ask for a new name for the selected inlet; None when cancelled."""
+        text, ok = QtWidgets.QInputDialog.getText(self, "Rename inlet", "Name:", text=current)
+        return text if ok else None
+
+    def _on_rename_inlet(self) -> None:
+        name = self.ask_inlet_name(self.model.inlet.name)
+        if name is not None:
+            self.model.rename_inlet(self.model.selected, name)
+
+    def _on_mirror(self, flag: bool) -> None:
+        if not self._syncing:
+            self.model.set_mirror(self.model.selected, flag)
+
+    def _on_flow(self, value: float) -> None:
+        if not self._syncing:
+            self.model.set_flow_fraction(self.model.selected, value / 100.0)
+
+    def _on_symmetry(self, *_) -> None:
+        if not self._syncing:
+            self.model.set_symmetry(self.combo_symmetry.currentData())
+
     def _on_lock(self, locked: bool) -> None:
         if not self._syncing:
             self.model.set_locked(locked)
@@ -645,6 +722,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
             for box in (self.spin_pitch, self.spin_sweep):
                 box.setEnabled(placed)
             self.btn_align.setEnabled(placed)
+            self._sync_inlets(m)
             self._set_value(self.spin_wall, m.state.duct.wall_thickness)
             self._set_value(self.spin_lip, m.state.duct.lip_extension)
             self.lbl_lip_mode.setText(m.state.duct.lip_mode)
@@ -683,6 +761,31 @@ class ExploreWindow(QtWidgets.QMainWindow):
             self.plotter.setCursor(QtCore.Qt.CursorShape.CrossCursor if m.mode == MODE_PLACING
                                    else QtCore.Qt.CursorShape.ArrowCursor)
             self.plotter.render()
+
+    def _sync_inlets(self, m) -> None:
+        """The inlets list and its controls."""
+        st = m.state
+        fractions, _ = m._fractions(st)
+        self.inlet_list.clear()
+        for k, ins in enumerate(st.inlets):
+            if not ins.placed:
+                status = "not placed"
+            else:
+                tag = "self-symmetric" if ins.self_symmetric else "+ mirror" if m.has_twin(k) else ""
+                status = f"{100 * fractions[k]:.1f} %" + (f", {tag}" if tag else "")
+            self.inlet_list.addItem(f"{ins.name}   ({status})")
+        self.inlet_list.setCurrentRow(m.selected)
+        ins = m.inlet
+        self.btn_del_inlet.setEnabled(len(st.inlets) > 1)
+        self.btn_dup_inlet.setEnabled(ins.placed)
+        self.chk_mirror.setChecked(ins.mirror)
+        self.chk_mirror.setEnabled(st.symmetry == "xz" and not ins.self_symmetric)
+        f = fractions.get(m.selected)
+        self.spin_flow.setEnabled(f is not None)
+        if f is not None:
+            self._set_value(self.spin_flow, 100.0 * f)
+        self.btn_flow_equal.setEnabled(f is not None and ins.flow_fraction is not None)
+        self.combo_symmetry.setCurrentIndex(self.combo_symmetry.findData(st.symmetry))
 
     def refresh_heavy(self) -> None:
         """Build the bodies and run the checks for the current state, then redraw (called after a short pause

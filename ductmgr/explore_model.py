@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Víctor Sánchez Escalante
 
-"""State of the section editor, independent of any GUI toolkit.
+"""State of the inlet / duct explorer, independent of any GUI toolkit.
 
-Holds the inlet plane and the *key sections* along a branch: the inlet section (s = 0, in the inlet plane, with
-skin snapping) and any intermediate sections at chosen s; the engine face (s = 1) is a fixed circle. One of them is
-*active*, the one the editor shows. Every key section has its own shape (any number of vertices, straight or curved
-edges) but its size follows the area law A(s). One undo / redo history is shared by the 3D view, the panel and the
-editor; there are also the place-mode state machine, the lock, the dirty flag and save / revert. The Qt window and
-the headless screenshot both drive this class, so everything that matters is testable without a display.
+The design has 1..N inlets. Each has its own plane (origin, pitch, sweep), *key sections* along its branch (the
+inlet section at s = 0, in the inlet plane with skin snapping, and any intermediate sections; the fixed junction and
+engine face sections close the list), a flow fraction and a mirror flag. A global symmetry (``xz`` or ``none``) says
+whether mirrored twins are generated and whether the junction is constrained to y = 0. One inlet is *selected*: the
+section editor, the 2D views and the panel edit it. Every key section has its own shape (any number of vertices,
+straight or curved edges) but its size follows the area law A(s). One undo / redo history is shared by the 3D view,
+the panel and the editors; there are also the place-mode state machine, the lock, the dirty flag and save / revert.
+The Qt window and the headless screenshot both drive this class, so everything that matters is testable without a
+display.
 """
 import math
 import time
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +44,9 @@ MODE_VIEW, MODE_PLACING = "view", "placing"
 MODE_TEXT = {MODE_VIEW: "View", MODE_PLACING: "Placing inlet - click on fuselage, Esc to cancel"}
 
 LEGACY_INLET_KEYS = ("shape", "skin_fit", "attach_point", "centroid", "normal", "tilt_deg", "station_x", "polygon")
+SYMMETRIES = dm.SYMMETRIES
+DEFAULT_SYMMETRY = "xz"
+DEFAULT_INLET_NAME = "inlet"
 
 
 @dataclass(frozen=True)
@@ -56,22 +62,64 @@ HEAVY_KEYS = ("wall_thickness", "lip_extension")
 
 @dataclass(frozen=True)
 class DuctParams:
-    """The editable duct inputs besides the plane and the key sections (all part of the undo history)."""
+    """The editable duct inputs besides the inlets (all part of the undo history): the shared junction / trunk
+    centreline, the junction and trunk area points, the walls."""
 
     centreline: CentrelineParams = CentrelineParams()
-    area: AreaPoints = AreaPoints()
+    area: AreaPoints = AreaPoints()  # junction area and trunk points (the branch points belong to each inlet)
     wall_thickness: float = DEFAULT_WALL_THICKNESS
     lip_extension: float = DEFAULT_LIP_EXTENSION
     lip_mode: str = dm.DEFAULT_LIP_MODE
 
 
 @dataclass(frozen=True)
-class InletState:
-    """Everything the undo history tracks."""
+class Inlet:
+    name: str
+    plane: InletPlane | None = None  # None until the inlet has been placed
+    sections: tuple[KeySection, ...] = ()  # sorted by s; sections[0] is the inlet (s = 0) once placed
+    flow_fraction: float | None = None  # per physical branch; None = an equal share
+    mirror: bool = True  # a mirrored twin (only with symmetry xz; an inlet centred on y = 0 never gets one)
+    start_handle: float | None = None
+    junction_in_handle: float | None = None
+    area_branch: tuple | None = None  # interior points of this branch's area curve; None = from the area law
 
-    plane: InletPlane | None  # None until an inlet has been placed
-    sections: tuple[KeySection, ...]  # sorted by s; sections[0] is the inlet (s = 0) once placed
+    @property
+    def placed(self) -> bool:
+        return self.plane is not None
+
+    @property
+    def self_symmetric(self) -> bool:
+        return self.plane is not None and dm.self_symmetric(self.plane)
+
+
+@dataclass(frozen=True)
+class InletState:
+    """Everything the undo history tracks. ``selected`` is only the selection: it is not part of equality."""
+
+    inlets: tuple[Inlet, ...]
+    symmetry: str = DEFAULT_SYMMETRY
     duct: DuctParams = DuctParams()
+    selected: int = field(default=0, compare=False)
+
+    @property
+    def inlet(self) -> Inlet:
+        return self.inlets[min(self.selected, len(self.inlets) - 1)]
+
+    @property
+    def plane(self) -> InletPlane | None:
+        return self.inlet.plane
+
+    @property
+    def sections(self) -> tuple[KeySection, ...]:
+        return self.inlet.sections
+
+    def with_inlet(self, index: int, **changes) -> "InletState":
+        inlets = list(self.inlets)
+        inlets[index] = replace(inlets[index], **changes)
+        return replace(self, inlets=tuple(inlets))
+
+    def with_selected(self, **changes) -> "InletState":
+        return self.with_inlet(min(self.selected, len(self.inlets) - 1), **changes)
 
 
 @dataclass(frozen=True)
@@ -98,20 +146,23 @@ class DuctsSettings:
 
 # ---- config <-> state -----------------------------------------------------------------------------------------
 def legacy_notice(cfg: dict) -> str:
-    """One line naming old ducts.inlet keys / formats that are ignored or migrated; empty when there are none."""
+    """One line naming old formats that are migrated or ignored; empty when there are none."""
     ducts = cfg.get("ducts") or {}
     inlet = ducts.get("inlet") or {}
     notes = []
     old = [k for k in LEGACY_INLET_KEYS if inlet.get(k) is not None]
     if old:
         notes.append(f"ignoring old key(s) {', '.join(old)}")
-    if inlet.get("vertices") is not None:
-        if ducts.get("key_sections") is None:
-            notes.append("the 5-vertex ducts.inlet.vertices / snapped format is loaded as a straight-edged inlet "
-                         "section; Save writes ducts.key_sections")
-        else:
-            notes.append("ducts.inlet.vertices / snapped are superseded by ducts.key_sections and ignored")
-    return "ducts.inlet: " + "; ".join(notes) if notes else ""
+    if ducts.get("inlets") is None and inlet.get("origin") is not None:
+        mirror = ducts.get("n_inlets") != 1
+        what = "ducts.inlet / ducts.key_sections"
+        if inlet.get("vertices") is not None and ducts.get("key_sections") is None:
+            what = "the 5-vertex ducts.inlet.vertices / snapped format (a straight-edged inlet section)"
+        notes.append(f"{what} migrated to ducts.inlets (1 inlet, mirror {'true' if mirror else 'false'}, symmetry "
+                     "xz); Save writes the new format")
+    elif inlet.get("vertices") is not None:
+        notes.append("ducts.inlet.vertices / snapped are superseded by ducts.inlets and ignored")
+    return "ducts: " + "; ".join(notes) if notes else ""
 
 
 def duct_settings(cfg: dict) -> DuctsSettings:
@@ -151,8 +202,18 @@ def duct_settings(cfg: dict) -> DuctsSettings:
     )
 
 
-def duct_params_from_config(cfg: dict) -> DuctParams:
+def symmetry_from_config(cfg: dict) -> str:
+    value = (cfg.get("ducts") or {}).get("symmetry")
+    if value is None:
+        return DEFAULT_SYMMETRY
+    if value not in SYMMETRIES:
+        raise ValueError(f"ducts.symmetry must be one of {', '.join(SYMMETRIES)} (got {value!r})")
+    return value
+
+
+def duct_params_from_config(cfg: dict, symmetry: str | None = None) -> DuctParams:
     ducts = cfg.get("ducts") or {}
+    symmetry = symmetry or symmetry_from_config(cfg)
     c = ducts.get("centreline") or {}
     if not isinstance(c, dict):
         raise ValueError("ducts.centreline must be a mapping")
@@ -162,14 +223,17 @@ def duct_params_from_config(cfg: dict) -> DuctParams:
         return None if v is None else float(v)
 
     point = (ducts.get("junction") or {}).get("point")
-    junction = None
+    junction = junction_y = None
     if point is not None:
         if not (isinstance(point, (list, tuple)) and len(point) == 3):
             raise ValueError("ducts.junction.point must be [x, y, z]")
-        junction = (float(point[0]), float(point[2]))  # the junction lies on y = 0
+        junction = (float(point[0]), float(point[2]))
+        if symmetry == "none":
+            junction_y = float(point[1])  # else the junction lies on y = 0
     fraction = c.get("handle_fraction")
     centreline = CentrelineParams(
-        junction, opt("junction_pitch_deg"), opt("start_handle"), opt("junction_in_handle"),
+        junction, opt("junction_pitch_deg"), junction_y, opt("junction_yaw_deg") if symmetry == "none" else None,
+        None, None,  # the inlet handles belong to the inlets
         opt("junction_out_handle"), opt("end_handle"),
         CentrelineParams().handle_fraction if fraction is None else float(fraction),
     )
@@ -177,8 +241,9 @@ def duct_params_from_config(cfg: dict) -> DuctParams:
     lip = ducts.get("lip_extension")
     if lip is None:
         lip = (ducts.get("inlet") or {}).get("lip_extension")  # the old location
+    area = areacurve.points_from_config(ducts.get("area_points"))
     params = DuctParams(
-        centreline, areacurve.points_from_config(ducts.get("area_points")),
+        centreline, AreaPoints(area.junction_area, None, area.trunk),
         DEFAULT_WALL_THICKNESS if wall is None else float(wall),
         DEFAULT_LIP_EXTENSION if lip is None else float(lip),
         ducts.get("lip_mode") or dm.DEFAULT_LIP_MODE,
@@ -192,55 +257,113 @@ def duct_params_from_config(cfg: dict) -> DuctParams:
     return params
 
 
-def parse_key_sections(raw) -> tuple[KeySection, ...]:
+def parse_key_sections(raw, where: str = "ducts.key_sections") -> tuple[KeySection, ...]:
     if not isinstance(raw, (list, tuple)):
-        raise ValueError("ducts.key_sections must be a list")
+        raise ValueError(f"{where} must be a list")
     sections = []
     for k, entry in enumerate(raw):
-        where = f"ducts.key_sections[{k}]"
+        here = f"{where}[{k}]"
         if not isinstance(entry, dict) or entry.get("s") is None:
-            raise ValueError(f"{where}: needs an 's' (0 = inlet, between 0 and 1 for the others)")
+            raise ValueError(f"{here}: needs an 's' (0 = inlet, between 0 and 1 for the others)")
         s = float(entry["s"])
         if not 0.0 <= s < 1.0:
-            raise ValueError(f"{where}: s must be 0 (the inlet) or between 0 and 1, exclusive (the engine face "
+            raise ValueError(f"{here}: s must be 0 (the inlet) or between 0 and 1, exclusive (the engine face "
                              "at s = 1 is fixed)")
-        sections.append(KeySection(s, ol.shape_from_config(entry, where)))
+        sections.append(KeySection(s, ol.shape_from_config(entry, here)))
     sections.sort(key=lambda ks: ks.s)
     for a, b in zip(sections, sections[1:]):
         if b.s - a.s < MIN_S_SEPARATION:
-            raise ValueError(f"ducts.key_sections: s = {a.s:g} and {b.s:g} are closer than {MIN_S_SEPARATION:g}")
+            raise ValueError(f"{where}: s = {a.s:g} and {b.s:g} are closer than {MIN_S_SEPARATION:g}")
     return tuple(sections)
+
+
+def _plane_from(entry: dict, where: str) -> InletPlane | None:
+    origin = entry.get("origin")
+    if origin is None:
+        return None
+    if not (isinstance(origin, (list, tuple)) and len(origin) == 3):
+        raise ValueError(f"{where}.origin must be [x, y, z]")
+    plane = InletPlane(tuple(float(c) for c in origin), float(entry.get("pitch_deg") or 0.0),
+                       float(entry.get("sweep_deg") or 0.0))
+    plane.frame()  # validates the angles
+    return plane
+
+
+def _inlet_from(entry: dict, k: int, where: str) -> Inlet:
+    if not isinstance(entry, dict):
+        raise ValueError(f"{where} must be a mapping")
+    name = str(entry.get("name") or f"{DEFAULT_INLET_NAME} {k + 1}")
+    plane = _plane_from(entry, where)
+    raw = entry.get("key_sections")
+    sections = parse_key_sections(raw, f"{where}.key_sections") if raw is not None else ()
+    fraction = entry.get("flow_fraction")
+    if fraction is not None and float(fraction) <= 0.0:
+        raise ValueError(f"{where}.flow_fraction must be positive")
+    mirror = entry.get("mirror")
+    if mirror is not None and not isinstance(mirror, bool):
+        raise ValueError(f"{where}.mirror must be true or false")
+    handle = lambda key: None if entry.get(key) is None else float(entry[key])  # noqa: E731
+    return Inlet(name, plane, sections, None if fraction is None else float(fraction), bool(mirror),
+                 handle("start_handle"), handle("junction_in_handle"),
+                 areacurve.parse_points(entry.get("area_points"), f"{where}.area_points"))
 
 
 def state_from_config(cfg: dict) -> InletState:
     ducts = cfg.get("ducts") or {}
-    inlet = ducts.get("inlet") or {}
-    origin = inlet.get("origin")
-    params = duct_params_from_config(cfg)
-    if origin is None:
-        return InletState(None, (), params)
-    if not (isinstance(origin, (list, tuple)) and len(origin) == 3):
-        raise ValueError("ducts.inlet.origin must be [x, y, z]")
-    plane = InletPlane(
-        tuple(float(c) for c in origin), float(inlet.get("pitch_deg") or 0.0), float(inlet.get("sweep_deg") or 0.0)
-    )
-    plane.frame()  # validates the angles
-    raw = ducts.get("key_sections")
+    symmetry = symmetry_from_config(cfg)
+    params = duct_params_from_config(cfg, symmetry)
+    raw = ducts.get("inlets")
     if raw is not None:
-        return InletState(plane, parse_key_sections(raw), params)
-    if inlet.get("vertices") is not None:  # the old 5-vertex format: a straight-edged inlet section
-        flags = inlet.get("snapped")
-        data = {"vertices": inlet["vertices"], "snapped": flags}
-        return InletState(plane, (KeySection(0.0, ol.shape_from_config(data, "ducts.inlet")),), params)
-    return InletState(plane, (), params)
+        if not isinstance(raw, (list, tuple)) or not raw:
+            raise ValueError("ducts.inlets must be a non-empty list")
+        inlets = tuple(_inlet_from(e, k, f"ducts.inlets[{k}]") for k, e in enumerate(raw))
+        names = [i.name for i in inlets]
+        if len(set(names)) != len(names):
+            raise ValueError("ducts.inlets: the names must be unique")
+        return InletState(inlets, symmetry, params)
+    # the old single-inlet format: one inlet, mirrored, symmetry xz
+    inlet = ducts.get("inlet") or {}
+    plane = _plane_from(inlet, "ducts.inlet")
+    keys = ducts.get("key_sections")
+    sections: tuple[KeySection, ...] = ()
+    if plane is not None:
+        if keys is not None:
+            sections = parse_key_sections(keys)
+        elif inlet.get("vertices") is not None:  # the 5-vertex format: a straight-edged inlet section
+            data = {"vertices": inlet["vertices"], "snapped": inlet.get("snapped")}
+            sections = (KeySection(0.0, ol.shape_from_config(data, "ducts.inlet")),)
+    c = ducts.get("centreline") or {}
+    area = areacurve.points_from_config(ducts.get("area_points"))
+    handle = lambda key: None if c.get(key) is None else float(c[key])  # noqa: E731
+    first = Inlet(f"{DEFAULT_INLET_NAME} 1", plane, sections, None, ducts.get("n_inlets") != 1,
+                  handle("start_handle"), handle("junction_in_handle"), area.branch)
+    return InletState((first,), symmetry, params)
 
 
 class _Plan:
-    """Centreline (None when the engine face is unknown), area curves and the junction's arc-length fraction."""
+    """The planning result for a state: the plan-only Duct (None when it cannot be built), where each inlet's
+    primary branch is in it, and fallback area curves without a duct."""
 
-    def __init__(self, centreline, areas, s_junction, error: str = "", junction_ring=None):
-        self.centreline, self.areas, self.s_junction, self.error = centreline, areas, s_junction, error
-        self.junction_ring = junction_ring  # the branch end section (its half of the trunk start), centred
+    def __init__(self, duct, branch_of: dict, fallback: dict, error: str, s_fallback: float):
+        self.duct, self.branch_of, self.fallback, self.error, self.s_fallback = duct, branch_of, fallback, error, s_fallback
+
+    def areas(self, k: int) -> AreaCurves:
+        return self.duct.branches[self.branch_of[k]].areas if self.duct is not None else self.fallback[k]
+
+    def centreline(self, k: int):
+        return self.duct.branches[self.branch_of[k]].centreline if self.duct is not None else None
+
+    def s_junction(self, k: int) -> float:
+        return self.duct.branches[self.branch_of[k]].s_junction if self.duct is not None else self.s_fallback
+
+    def junction_ring(self, k: int):
+        if self.duct is None or self.duct.n_branches < 2:
+            return None
+        return self.duct.branches[self.branch_of[k]].branch_end
+
+    @property
+    def n_branches(self) -> int:
+        return self.duct.n_branches if self.duct is not None else len(self.fallback)
 
 
 PLAN_CACHE_SIZE = 16
@@ -259,26 +382,34 @@ class InletModel:
         self._future: list[InletState] = []
         self._last_key: str | None = None
         self._last_time = -1e9
-        self._section_cache: tuple[InletPlane, Section | None] | None = None
+        self._skin_cache: dict = {}
         self._plan_cache: dict = {}
         self._built: dict = {}  # state-keyed cache of the Duct, its bodies and checks
         self._solids: dict = {}
+        self._skins: list = []
+        self._evals: list = []
         self.mode = MODE_VIEW
         self.live_checks = False  # the window turns this on to show a pending note for the heavy checks
         self.locked = False
         self.message = ""
-        self.notice = legacy_notice(cfg)
         self.settings = duct_settings(cfg)
         self.alignment: tuple[str, float, float] | None = None  # (edge label, edge sweep, applied plane sweep)
-        self.section: Section | None = None  # the skin curve in the inlet plane
-        self.evaluations: list[sketch.Opening] = []  # one per key section
-        self.active = 0  # index of the section the editor shows; len(sections) is the engine face
+        self.active = 0  # index of the section the editor shows (of the selected inlet)
         loaded = state_from_config(cfg)
         self.state = self._normalised(loaded)
         # a state completed here (resnapped, default sketch added) differs from the file only by rounding: the
         # file is the saved state unless a sketch had to be created
-        self.saved_state = self.state if loaded.sections or loaded.plane is None else loaded
+        created = any(i.placed and not i.sections for i in loaded.inlets)
+        self.saved_state = loaded if created else self.state
+        self.notice = self._notice_for(cfg)
         self._recompute()
+
+    def _notice_for(self, cfg: dict) -> str:
+        notes = [legacy_notice(cfg)] if legacy_notice(cfg) else []
+        _, changed = self._fractions(self.state)
+        if changed:
+            notes.append("ducts.inlets: the flow fractions do not sum to 1 and are normalised")
+        return "; ".join(notes)
 
     # ---- observers ---------------------------------------------------------------------------------
     def add_listener(self, callback) -> None:
@@ -291,11 +422,67 @@ class InletModel:
     def _say(self, text: str) -> None:
         self.message = text
 
-    # ---- derived state --------------------------------------------------------------------------------
+    # ---- the inlets ---------------------------------------------------------------------------------------------
+    @property
+    def selected(self) -> int:
+        return min(self.state.selected, len(self.state.inlets) - 1)
+
+    @property
+    def inlet(self) -> Inlet:
+        return self.state.inlet
+
+    @property
+    def symmetry(self) -> str:
+        return self.state.symmetry
+
+    def _placed(self, state: InletState | None = None) -> list[int]:
+        st = state or self.state
+        return [k for k, i in enumerate(st.inlets) if i.placed and i.sections]
+
+    def has_twin(self, k: int, state: InletState | None = None) -> bool:
+        st = state or self.state
+        i = st.inlets[k]
+        return st.symmetry == "xz" and i.mirror and i.placed and not i.self_symmetric
+
+    def _fractions(self, state: InletState) -> tuple[dict, bool]:
+        """(flow fraction per physical branch of every placed inlet, whether given values were normalised)."""
+        placed = [k for k, i in enumerate(state.inlets) if i.placed]
+        if not placed:
+            return {}, False
+        f, changed = dm.flow_fractions([state.inlets[k].flow_fraction for k in placed],
+                                       [self.has_twin(k, state) for k in placed])
+        return dict(zip(placed, f)), changed
+
+    def flow_fraction(self, k: int | None = None) -> float | None:
+        """The normalised flow fraction of an inlet (per physical branch); None if it is not placed."""
+        k = self.selected if k is None else k
+        return self._fractions(self.state)[0].get(k)
+
+    @property
+    def fractions_normalised(self) -> bool:
+        return self._fractions(self.state)[1]
+
+    def total_capture(self) -> float:
+        """The total capture area (Phase 1), projected normal to the freestream, all inlets together."""
+        sizing = self.scene.sizing
+        total = getattr(sizing, "capture_area_total", None)
+        return float(total) if total is not None else float(sizing.capture_area_per_inlet * sizing.n_inlets)
+
+    def capture_target(self, k: int, state: InletState | None = None) -> float:
+        """The projected capture area of inlet ``k``: its flow fraction of the total."""
+        st = state or self.state
+        f = self._fractions(st)[0].get(k)
+        return self.total_capture() * (f if f is not None else 1.0 / max(len(st.inlets), 1))
+
     @property
     def area(self) -> float:
-        """The per-inlet capture area (projected normal to the freestream): the inlet section's target."""
-        return self.scene.sizing.capture_area_per_inlet
+        """The selected inlet's capture area (projected normal to the freestream): its inlet section's target."""
+        return self.capture_target(self.selected)
+
+    @property
+    def n_branches(self) -> int:
+        """The number of physical branches (mirrored twins counted)."""
+        return max(self._plan().n_branches, 1)
 
     @property
     def plane(self) -> InletPlane | None:
@@ -303,16 +490,28 @@ class InletModel:
 
     @property
     def placed(self) -> bool:
-        return self.state.plane is not None
+        return self.state.inlet.placed and bool(self.state.inlet.sections)
+
+    @property
+    def section(self) -> Section | None:
+        """The skin curve in the selected inlet's plane."""
+        return self._skins[self.selected] if self.selected < len(self._skins) else None
+
+    @property
+    def evaluations(self) -> list[sketch.Opening]:
+        """The evaluated key sections of the selected inlet."""
+        return self._evals[self.selected] if self.selected < len(self._evals) else []
 
     @property
     def opening(self) -> sketch.Opening | None:
-        """The evaluated inlet section (s = 0)."""
-        return self.evaluations[0] if self.evaluations else None
+        """The evaluated inlet section (s = 0) of the selected inlet."""
+        ev = self.evaluations
+        return ev[0] if ev else None
 
     @property
     def valid(self) -> bool:
-        return bool(self.evaluations) and all(e.valid for e in self.evaluations)
+        placed = [e for k, e in enumerate(self._evals) if self.state.inlets[k].placed and e]
+        return bool(placed) and all(o.valid for evs in placed for o in evs)
 
     @property
     def dirty(self) -> bool:
@@ -336,16 +535,12 @@ class InletModel:
 
     @property
     def opening_centroid(self) -> np.ndarray | None:
-        """3D centroid of the inlet opening."""
+        """3D centroid of the selected inlet's opening."""
         if self.opening is None:
             return None
         return self.state.plane.to_3d([self.opening.centroid_uv])[0]
 
     # ---- the area law -------------------------------------------------------------------------------------
-    @property
-    def n_branches(self) -> int:
-        return self.scene.sizing.n_inlets
-
     @property
     def inlet_plane_area(self) -> float:
         """A(0): the inlet section's in-plane area, the capture area divided by |n . X|."""
@@ -359,65 +554,88 @@ class InletModel:
 
     @property
     def junction_s(self) -> float:
-        """Where the branches merge along the path (arc-length fraction); from the centreline when it can be built."""
-        plan = self._plan()
-        return plan.s_junction
+        """Where the branches merge along the selected inlet's path (arc-length fraction)."""
+        return self._plan().s_junction(self.selected)
 
-    def area_at(self, s: float) -> float:
-        """A(s), the in-plane area every key section is held to."""
-        return float(self._plan().areas.area(s, self.junction_s)[0])
+    def area_at(self, s: float, inlet: int | None = None) -> float:
+        """A(s) of an inlet's branch (default: the selected one), the in-plane area its key sections are held to."""
+        k = self.selected if inlet is None else inlet
+        plan = self._plan()
+        return float(plan.areas(k).area(s, plan.s_junction(k))[0])
 
     @property
     def areas(self) -> AreaCurves:
-        return self._plan().areas
+        return self._plan().areas(self.selected)
 
     @property
     def centreline(self) -> Centreline | None:
-        return self._plan().centreline
+        return self._plan().centreline(self.selected)
 
-    def _plan(self, state: InletState | None = None):
-        """The centreline and the area curves for ``state``. They depend on the plane, the key section SHAPES (the
-        junction section is derived from them; the sizes do not matter) and the duct parameters."""
-        st = state or self.state
-        if st.plane is None:
-            return _Plan(None, AreaCurves(1.0, 1.0, st.duct.area, self.settings.law, self.n_branches), 0.5)
-        shape0 = st.sections[0].shape if st.sections else None
-        key = (st.plane, tuple(ks.shape for ks in st.sections), tuple(ks.s for ks in st.sections), st.duct,
-               self.settings, self.scene.face_diameter,
-               None if self.scene.face_center is None else tuple(np.asarray(self.scene.face_center).tolist()))
-        hit = self._plan_cache.get(key)
-        if hit is None:
-            op = self._evaluate_inlet(st.plane, shape0)
-            areas = AreaCurves(op.area_plane if op else self.inlet_plane_area, self.face_area, st.duct.area,
-                               self.settings.law, self.n_branches)
-            centreline, s_j, error, ring = None, self.settings.junction_fraction, "", None
-            if op is not None and self.scene.face_center is not None:
-                outlines = [op.outline] + [ol.build_outline(ol.edge_paths(ks.shape)[0]) for ks in st.sections[1:]]
-                keys = tuple(dm.KeyOutline(ks.s, o, np.array(ks.shape.vertices)) for ks, o in zip(st.sections, outlines))
-                try:
-                    pre = dm.Duct(self._spec(st, keys, op.area_plane), plan_only=True)
-                    areas, centreline, s_j = pre.areas, pre.centreline, pre.s_junction
-                    ring = pre.branch_end if self.n_branches == 2 else None
-                except ValueError as exc:
-                    error = str(exc)
-            hit = _Plan(centreline, areas, s_j, error, ring)
-            if len(self._plan_cache) > PLAN_CACHE_SIZE:
-                self._plan_cache.clear()
-            self._plan_cache[key] = hit
-        return hit
-
-    def _spec(self, st: InletState, keys, inlet_area: float) -> dm.DuctSpec:
-        s = self.settings
-        return dm.DuctSpec(
-            st.plane, keys, np.asarray(self.scene.face_center, dtype=float), np.asarray(s.face_axis),
-            self.scene.face_diameter, st.duct.centreline, st.duct.area, s.law, self.n_branches, s.n_stations_branch,
-            s.n_stations_trunk, s.n_points, st.duct.wall_thickness, st.duct.lip_extension, st.duct.lip_mode,
-            s.junction_fraction, inlet_area, s.splitter_length, s.overlap)
-
-    def _evaluate_inlet(self, plane, shape0):
-        if shape0 is None:
+    def _evaluate_inlet(self, k: int, state: InletState):
+        ins = state.inlets[k]
+        if not ins.placed or not ins.sections:
             return None
-        return sketch.evaluate(shape0, self._section_for(plane), plane, self.area)
+        return sketch.evaluate(ins.sections[0].shape, self._section_for(ins.plane), ins.plane,
+                               self.capture_target(k, state))
+
+    def _build_spec(self, st: InletState, ks_outlines: dict, op_areas: dict) -> dm.DuctSpec:
+        s = self.settings
+        specs = []
+        for k in self._placed(st):
+            ins = st.inlets[k]
+            keys = tuple(dm.KeyOutline(ks.s, o, np.array(ks.shape.vertices))
+                         for ks, o in zip(ins.sections, ks_outlines[k]))
+            specs.append(dm.InletSpec(ins.name, ins.plane, keys, ins.flow_fraction, ins.mirror, ins.start_handle,
+                                      ins.junction_in_handle, ins.area_branch, op_areas[k]))
+        return dm.DuctSpec(
+            tuple(specs), np.asarray(self.scene.face_center, dtype=float), np.asarray(s.face_axis),
+            self.scene.face_diameter, st.duct.centreline, st.duct.area, s.law, st.symmetry, s.n_stations_branch,
+            s.n_stations_trunk, s.n_points, st.duct.wall_thickness, st.duct.lip_extension, st.duct.lip_mode,
+            s.junction_fraction, s.splitter_length, s.overlap)
+
+    def _plan(self, state: InletState | None = None) -> _Plan:
+        """The centrelines, area curves and junction sections for ``state``. They depend on the planes, the key
+        section SHAPES (the junction section is derived from them; the sizes do not matter), the flow fractions and
+        the duct parameters."""
+        st = state or self.state
+        placed = self._placed(st)
+        face = self.scene.face_center
+        if not placed:
+            return _Plan(None, {}, {k: AreaCurves(1.0, 1.0, st.duct.area, self.settings.law, 1) for k in range(len(st.inlets))},
+                         "", self.settings.junction_fraction)
+        key = (st.symmetry, st.duct, tuple(
+            (st.inlets[k].name, st.inlets[k].plane, tuple(ks.shape for ks in st.inlets[k].sections),
+             tuple(ks.s for ks in st.inlets[k].sections), st.inlets[k].flow_fraction, st.inlets[k].mirror,
+             st.inlets[k].start_handle, st.inlets[k].junction_in_handle, st.inlets[k].area_branch) for k in placed),
+               self.settings, self.scene.face_diameter, None if face is None else tuple(np.asarray(face).tolist()))
+        hit = self._plan_cache.get(key)
+        if hit is not None:
+            return hit
+        ops = {k: self._evaluate_inlet(k, st) for k in placed}
+        areas_in = {k: ops[k].area_plane for k in placed}
+        duct, branch_of, error = None, {}, ""
+        if face is not None:
+            outlines = {k: [ops[k].outline] + [ol.build_outline(ol.edge_paths(ks.shape)[0])
+                                               for ks in st.inlets[k].sections[1:]] for k in placed}
+            try:
+                duct = dm.Duct(self._build_spec(st, outlines, areas_in), plan_only=True)
+                branch_of = {k: next(i for i, bg in enumerate(duct.branches) if bg.inlet == j and not bg.twin)
+                             for j, k in enumerate(placed)}
+            except ValueError as exc:
+                error = str(exc)
+        fallback = {}
+        if duct is None:
+            fr, _ = self._fractions(st)
+            total = sum(areas_in[k] * (2 if self.has_twin(k, st) else 1) for k in placed)
+            count = sum(2 if self.has_twin(k, st) else 1 for k in placed)
+            for k in placed:
+                pts = AreaPoints(st.duct.area.junction_area, st.inlets[k].area_branch, st.duct.area.trunk)
+                fallback[k] = AreaCurves(areas_in[k], self.face_area, pts, self.settings.law, count, fr[k], total)
+        hit = _Plan(duct, branch_of, fallback, error, self.settings.junction_fraction)
+        if len(self._plan_cache) > PLAN_CACHE_SIZE:
+            self._plan_cache.clear()
+        self._plan_cache[key] = hit
+        return hit
 
     def face_shape(self) -> SectionShape:
         """The engine face (s = 1): a circle of the face diameter, fixed."""
@@ -430,8 +648,9 @@ class InletModel:
 
     @property
     def junction_row(self) -> bool:
-        """The fixed junction section (a branch's half of the trunk start section) is listed for two branches."""
-        return self.placed and self.n_branches == 2 and self._plan().junction_ring is not None
+        """The fixed junction section (this branch's piece of the trunk start section) is listed when two or more
+        branches meet."""
+        return self.placed and self._plan().junction_ring(self.selected) is not None
 
     @property
     def active_is_junction(self) -> bool:
@@ -461,8 +680,8 @@ class InletModel:
         return self.state.sections[self.active].s
 
     def junction_shape(self) -> SectionShape | None:
-        """One branch's end section: its half of the trunk start section (derived, fixed)."""
-        ring = self._plan().junction_ring
+        """This branch's end section: its piece of the trunk start section (derived, fixed)."""
+        ring = self._plan().junction_ring(self.selected)
         return None if ring is None else SectionShape.polygon(ring)
 
     @property
@@ -492,6 +711,11 @@ class InletModel:
         """The skin curve the active section can snap to (only the inlet section has one)."""
         return self.section if self.active_is_inlet else None
 
+    @property
+    def symmetric_editing(self) -> bool:
+        """The selected inlet is centred on y = 0: its sections are kept mirror symmetric about u = 0."""
+        return self.placed and self.inlet.self_symmetric and not self.active_is_fixed
+
     def section_list(self) -> list[tuple[float, str, bool]]:
         """(s, label, editable) of every key section plus the fixed junction and engine face sections."""
         rows = []
@@ -514,40 +738,54 @@ class InletModel:
         return True
 
     def _section_for(self, plane: InletPlane) -> Section | None:
-        if self._section_cache is None or self._section_cache[0] != plane:
-            self._section_cache = (plane, compute_section(self.scene.fuselage, plane))
-        return self._section_cache[1]
+        if plane not in self._skin_cache:
+            if len(self._skin_cache) > 16:
+                self._skin_cache.clear()
+            self._skin_cache[plane] = compute_section(self.scene.fuselage, plane)
+        return self._skin_cache[plane]
 
     def _normalised(self, state: InletState) -> InletState:
-        """The inlet snapped exactly onto the current section (a default sketch if there is none yet), and every
-        other key section held at its area A(s)."""
-        if state.plane is None:
-            return state
-        section = self._section_for(state.plane)
-        secs = list(state.sections)
-        if not secs or secs[0].s != 0.0:
-            secs.insert(0, KeySection(0.0, sketch.default_sketch(section, state.plane, self.area)))
-        else:
-            secs[0] = KeySection(0.0, sketch.resnap(secs[0].shape, section))
-        base = replace(state, sections=tuple(secs))
+        """Every placed inlet snapped exactly onto its current section (a default sketch if it has none yet), and
+        every other key section held at its area A(s)."""
+        inlets = list(state.inlets)
+        for k, ins in enumerate(inlets):
+            if not ins.placed:
+                continue
+            section = self._section_for(ins.plane)
+            secs = list(ins.sections)
+            if not secs or secs[0].s != 0.0:
+                secs.insert(0, KeySection(0.0, sketch.default_sketch(section, ins.plane, self.capture_target(k, state))))
+            else:
+                secs[0] = KeySection(0.0, sketch.resnap(secs[0].shape, section))
+            inlets[k] = replace(ins, sections=tuple(secs))
+        base = replace(state, inlets=tuple(inlets))
         plan = self._plan(base)
-        for k in range(1, len(secs)):
-            target = float(plan.areas.area(secs[k].s, plan.s_junction)[0])
-            secs[k] = KeySection(secs[k].s, sketch.rescale_to_area(secs[k].shape, target))
-        return replace(state, sections=tuple(secs))
+        for k in self._placed(base):
+            secs = list(inlets[k].sections)
+            for j in range(1, len(secs)):
+                target = float(plan.areas(k).area(secs[j].s, plan.s_junction(k))[0])
+                secs[j] = KeySection(secs[j].s, sketch.rescale_to_area(secs[j].shape, target))
+            inlets[k] = replace(inlets[k], sections=tuple(secs))
+        return replace(state, inlets=tuple(inlets))
 
     def _recompute(self) -> None:
         st = self.state
-        if st.plane is None:
-            self.section = None
-            self.evaluations = []
+        plan = self._plan()
+        self._skins, self._evals = [], []
+        for k, ins in enumerate(st.inlets):
+            if not ins.placed or not ins.sections:
+                self._skins.append(None)
+                self._evals.append([])
+                continue
+            skin = self._section_for(ins.plane)
+            evs = [sketch.evaluate(ins.sections[0].shape, skin, ins.plane, self.capture_target(k, st))]
+            for ks in ins.sections[1:]:
+                evs.append(sketch.evaluate(ks.shape, None, None,
+                                           float(plan.areas(k).area(ks.s, plan.s_junction(k))[0])))
+            self._skins.append(skin)
+            self._evals.append(evs)
+        if not self.placed:
             self.active = 0
-            return
-        self.section = self._section_for(st.plane)
-        evals = [sketch.evaluate(st.sections[0].shape, self.section, st.plane, self.area)]
-        for ks in st.sections[1:]:
-            evals.append(sketch.evaluate(ks.shape, None, None, self.area_at(ks.s)))
-        self.evaluations = evals
 
     # ---- history ----------------------------------------------------------------------------------------
     def _commit(self, new: InletState, key: str | None = None) -> bool:
@@ -564,12 +802,14 @@ class InletModel:
         self._set_state(new)
         return True
 
-    def _set_state(self, new: InletState) -> None:
-        """Make ``new`` the state; the editor stays on its section (or on the engine face), clamped to what exists."""
+    def _set_state(self, new: InletState, keep_selection: bool = True) -> None:
+        """Make ``new`` the state; the selection stays on its inlet, and the editor on its section (or on a fixed
+        one), clamped to what exists."""
         was_fixed = self.active_is_fixed
         offset = self.active - self.n_sections  # 0: the junction row (or the face without one), 1: the face
-        self.state = new
-        self.active = len(new.sections) + offset if was_fixed else min(self.active, max(len(new.sections) - 1, 0))
+        selected = self.state.selected if keep_selection else new.selected
+        self.state = replace(new, selected=min(max(selected, 0), len(new.inlets) - 1))
+        self.active = len(self.state.sections) + offset if was_fixed else min(self.active, max(len(self.state.sections) - 1, 0))
         self._recompute()
         self.active = min(self.active, len(self.section_list()) - 1) if self.placed else 0
 
@@ -593,21 +833,135 @@ class InletModel:
         self._notify()
         return True
 
-    # ---- the plane --------------------------------------------------------------------------------------------
     def _changed(self, changed: bool, text: str = "") -> bool:
         if changed:
             self._say(text)
             self._notify()
         return changed
 
+    # ---- inlets: select, add, duplicate, remove, rename, mirror, flow, symmetry ------------------------------------------------------
+    def _unique_name(self, base: str) -> str:
+        names = {i.name for i in self.state.inlets}
+        if base not in names:
+            return base
+        k = 2
+        while f"{base} {k}" in names:
+            k += 1
+        return f"{base} {k}"
+
+    def select_inlet(self, index: int) -> bool:
+        """Edit another inlet. Not part of the undo history."""
+        if not 0 <= index < len(self.state.inlets):
+            return False
+        if index != self.selected:
+            self.state = replace(self.state, selected=index)
+            self.active = 0
+            self.alignment = None
+            self._notify()
+        return True
+
+    def _commit_state(self, new: InletState, key: str | None = None, select: int | None = None) -> bool:
+        changed = self._commit(self._normalised(new), key)
+        if select is not None:
+            self.state = replace(self.state, selected=select)
+            self.active = 0
+        return changed
+
+    def add_inlet(self, name: str | None = None, place: bool = True) -> int:
+        """Add an inlet (not placed yet) and select it; with ``place`` the explorer goes into place mode."""
+        name = self._unique_name(name or f"{DEFAULT_INLET_NAME} {len(self.state.inlets) + 1}")
+        new = Inlet(name, None, (), None, self.state.symmetry == "xz")
+        index = len(self.state.inlets)
+        self._commit_state(replace(self.state, inlets=self.state.inlets + (new,)), None, select=index)
+        if place and not self.locked:
+            self.mode = MODE_PLACING
+        self._say(f"Added inlet '{name}'" + (": click on the fuselage to place it" if place else ""))
+        self._notify()
+        return index
+
+    def duplicate_inlet(self, index: int | None = None) -> int | None:
+        """Copy an inlet (same plane and sections) under a new name and select the copy."""
+        index = self.selected if index is None else index
+        if not 0 <= index < len(self.state.inlets):
+            return None
+        src = self.state.inlets[index]
+        copy = replace(src, name=self._unique_name(f"{src.name} copy"))
+        new_index = index + 1
+        inlets = self.state.inlets[:new_index] + (copy,) + self.state.inlets[new_index:]
+        self._commit_state(replace(self.state, inlets=inlets), None, select=new_index)
+        self._say(f"Duplicated '{src.name}' as '{copy.name}'; move the copy")
+        self._notify()
+        return new_index
+
+    def remove_inlet(self, index: int | None = None) -> bool:
+        index = self.selected if index is None else index
+        if len(self.state.inlets) <= 1 or not 0 <= index < len(self.state.inlets):
+            self._say("The last inlet cannot be removed")
+            self._notify()
+            return False
+        name = self.state.inlets[index].name
+        inlets = self.state.inlets[:index] + self.state.inlets[index + 1:]
+        keep = self.selected - 1 if self.selected > index or self.selected == len(inlets) else self.selected
+        self._commit_state(replace(self.state, inlets=inlets), None, select=max(keep, 0))
+        self._say(f"Removed inlet '{name}'")
+        self._notify()
+        return True
+
+    def rename_inlet(self, index: int, name: str) -> bool:
+        name = str(name).strip()
+        if not name:
+            self._say("An inlet needs a name")
+            self._notify()
+            return False
+        if any(i.name == name for k, i in enumerate(self.state.inlets) if k != index):
+            self._say(f"There is already an inlet called '{name}'")
+            self._notify()
+            return False
+        return self._changed(self._commit_state(self.state.with_inlet(index, name=name), f"name{index}"))
+
+    def set_mirror(self, index: int, flag: bool) -> bool:
+        """Ask for (or drop) the mirrored twin of an inlet. Only meaningful with symmetry xz."""
+        if not 0 <= index < len(self.state.inlets):
+            return False
+        text = ""
+        ins = self.state.inlets[index]
+        if flag and ins.self_symmetric:
+            text = f"'{ins.name}' is centred on y = 0: it is its own mirror image and gets no twin"
+        elif flag and self.state.symmetry != "xz":
+            text = "The mirror flag only has an effect with symmetry xz"
+        changed = self._commit_state(self.state.with_inlet(index, mirror=bool(flag)))
+        self._say(text)
+        self._notify()
+        return changed
+
+    def set_flow_fraction(self, index: int, value: float | None) -> bool:
+        """The flow fraction of an inlet's branch (None = equal share); all fractions are normalised to sum to 1."""
+        if not 0 <= index < len(self.state.inlets):
+            return False
+        if value is not None and value <= 0.0:
+            self._say("A flow fraction must be positive")
+            self._notify()
+            return False
+        changed = self._changed(self._commit_state(
+            self.state.with_inlet(index, flow_fraction=None if value is None else float(value)), f"flow{index}"))
+        if changed and self.fractions_normalised:
+            self._say("The flow fractions were normalised to sum to 1")
+            self._notify()
+        return changed
+
+    def set_symmetry(self, symmetry: str) -> bool:
+        if symmetry not in SYMMETRIES:
+            raise ValueError(f"symmetry must be one of {', '.join(SYMMETRIES)}")
+        return self._changed(self._commit_state(replace(self.state, symmetry=symmetry)), f"Symmetry: {symmetry}")
+
+    # ---- the plane --------------------------------------------------------------------------------------------
     def _with_plane(self, plane: InletPlane, key: str | None) -> bool:
-        """Move / rotate the plane: the sketch keeps its (u, v), snapped vertices follow the new section and the
-        other key sections are re-held at their (changed) area A(s)."""
+        """Move / rotate the selected inlet's plane: the sketch keeps its (u, v), snapped vertices follow the new
+        section and the other key sections are re-held at their (changed) area A(s)."""
         plane.frame()  # validates the angles before anything changes
         if plane == self.state.plane:
             return False
-        base = replace(self.state, plane=plane)
-        return self._commit(self._normalised(base), key)
+        return self._commit(self._normalised(self.state.with_selected(plane=plane)), key)
 
     def set_param(self, key: str, value) -> bool:
         """Change the pitch or the sweep (degrees)."""
@@ -617,14 +971,18 @@ class InletModel:
             raise ValueError("place the inlet first")
         return self._changed(self._with_plane(replace(self.state.plane, **{key: float(value)}), key))
 
+    def _origin_y(self, y: float) -> float:
+        """A mirrored inlet is kept on the right (y >= 0): its twin is the left one."""
+        return abs(y) if self.state.symmetry == "xz" and self.inlet.mirror else y
+
     def set_origin(self, x: float, y: float, z: float) -> bool:
-        """Move the plane origin (the right inlet keeps y >= 0). Blocked while locked."""
+        """Move the plane origin. Blocked while locked."""
         if self.locked:
             self._say("Inlet is locked")
             self._notify()
             return False
         old = self.state.plane
-        plane = InletPlane((float(x), abs(float(y)), float(z)), old.pitch_deg if old else 0.0,
+        plane = InletPlane((float(x), self._origin_y(float(y)), float(z)), old.pitch_deg if old else 0.0,
                            old.sweep_deg if old else 0.0)
         return self._changed(self._with_plane(plane, "origin"))
 
@@ -632,11 +990,11 @@ class InletModel:
     def _replace_active(self, shape: SectionShape) -> InletState:
         secs = list(self.state.sections)
         secs[self.active] = KeySection(secs[self.active].s, shape)
-        return replace(self.state, sections=tuple(secs))
+        return self.state.with_selected(sections=tuple(secs))
 
     def _edit(self, fn, key: str | None = None, rescale: bool = True) -> bool:
-        """Apply ``fn(shape) -> shape`` to the active section as one undo step. A non-inlet section is brought
-        back to its area A(s) in the same step (``rescale`` False defers that, for the events of a drag)."""
+        """Apply ``fn(shape) -> shape`` to the active section as one undo step. Every other section is brought back
+        to its area A(s) in the same step (``rescale`` False defers that, for the events of a drag)."""
         if not self.placed or self.active_is_fixed:
             self._say("This section is fixed" if self.placed else "Place the inlet first")
             self._notify()
@@ -653,14 +1011,15 @@ class InletModel:
         return self._changed(self._commit(new, key))
 
     def finish_edit(self) -> bool:
-        """End of a drag: hold a non-inlet section at its area A(s) (merged into the drag's undo step)."""
+        """End of a drag: hold the sections at their area A(s) (merged into the drag's undo step)."""
         if not self.placed or self.active_is_fixed:
             return False
         return self._changed(self._commit(self._normalised(self.state), self._last_key))
 
     def drag_vertex(self, index: int, uv, snap_tolerance: float | None) -> bool:
         """Move vertex ``index`` of the active section to ``uv``. The inlet vertex snaps onto the skin curve
-        within ``snap_tolerance`` metres (None disables snapping) and unsnaps when dropped further away."""
+        within ``snap_tolerance`` metres (None disables snapping) and unsnaps when dropped further away. On a
+        self-symmetric inlet the mirror partner moves with it."""
         if not self.placed or self.active_is_fixed:
             return False
 
@@ -668,6 +1027,8 @@ class InletModel:
             point, flag = ((float(uv[0]), float(uv[1])), False)
             if self.active_is_inlet:
                 point, flag = sketch.snap_point(self.section, uv, snap_tolerance)
+            if self.symmetric_editing:
+                return ol.move_vertex_symmetric(shape, index, point, flag)
             moved = ol.move_vertex(shape, index, point)
             snapped = list(moved.snapped)
             snapped[index] = flag
@@ -677,8 +1038,8 @@ class InletModel:
 
     def drag_handle(self, edge: int, which: int, uv) -> bool:
         """Drag a Bézier handle of a free curved edge of the active section."""
-        return self._edit(lambda sh: ol.move_handle(sh, edge, which, uv), f"handle{edge}.{which}@{self.active}",
-                          rescale=False)
+        fn = ol.move_handle_symmetric if self.symmetric_editing else ol.move_handle
+        return self._edit(lambda sh: fn(sh, edge, which, uv), f"handle{edge}.{which}@{self.active}", rescale=False)
 
     def insert_vertex(self, edge: int, uv) -> int | None:
         """Insert a vertex on ``edge`` at the point of the edge nearest ``uv``. Returns its index, or None."""
@@ -688,20 +1049,24 @@ class InletModel:
             point = uv
             if self.active_is_inlet and shape.edge_is_snapped(edge):  # a vertex on the skin edge stays on the skin
                 point = tuple(sketch.snap_point(self.section, uv, float("inf"))[0])
-            new, at = ol.insert_vertex(shape, edge, point)
+            fn = ol.insert_vertex_symmetric if self.symmetric_editing else ol.insert_vertex
+            new, at = fn(shape, edge, point)
             made.append(at)
             return new
 
         return made[0] if self._edit(insert) and made else None
 
     def delete_vertex(self, index: int) -> bool:
-        return self._edit(lambda sh: ol.delete_vertex(sh, index))
+        fn = ol.delete_vertex_symmetric if self.symmetric_editing else ol.delete_vertex
+        return self._edit(lambda sh: fn(sh, index))
 
     def set_edge_type(self, edge: int, kind: str) -> bool:
-        return self._edit(lambda sh: ol.set_edge_type(sh, edge, kind))
+        fn = ol.set_edge_type_symmetric if self.symmetric_editing else ol.set_edge_type
+        return self._edit(lambda sh: fn(sh, edge, kind))
 
     def set_continuity(self, index: int, mode: str) -> bool:
-        return self._edit(lambda sh: ol.set_continuity(sh, index, mode))
+        fn = ol.set_continuity_symmetric if self.symmetric_editing else ol.set_continuity
+        return self._edit(lambda sh: fn(sh, index, mode))
 
     def fit_area(self) -> bool:
         """Active inlet section: scale only the free vertices so the projected area matches the capture area.
@@ -716,7 +1081,7 @@ class InletModel:
             self._notify()
             return True
         shape, ok, message = sketch.fit_area(self.state.sections[0].shape, self.section, self.state.plane, self.area)
-        self._commit(self._replace_active(shape))
+        self._commit(self._normalised(self._replace_active(shape)))
         self._say(message)
         self._notify()
         return ok
@@ -724,7 +1089,8 @@ class InletModel:
     # ---- key sections ------------------------------------------------------------------------------------------------
     def add_key_section(self, s: float) -> bool:
         """Add an intermediate key section at ``s`` (between 0 and 1, exclusive). It starts as a copy of the shape
-        of the section before it, centred and held at A(s), and becomes the active one."""
+        of the section before it, centred and held at A(s), and becomes the active one. Sections beyond the
+        junction shape the trunk: they are only taken from the first inlet."""
         if not self.placed:
             self._say("Place the inlet first")
             self._notify()
@@ -739,13 +1105,17 @@ class InletModel:
             self._say(f"There is already a section within {MIN_S_SEPARATION:g} of s = {s:g}")
             self._notify()
             return False
+        if self.selected != 0 and s >= self.junction_s - MIN_S_SEPARATION and self.junction_row:
+            self._say("Sections beyond the junction shape the trunk and are taken from the first inlet")
+            self._notify()
+            return False
         before = max((ks for ks in self.state.sections if ks.s < s), key=lambda ks: ks.s)
         shape = before.shape.with_(snapped=(False,) * before.shape.n)
         shape = ol.translate(shape, -ol.outline_centroid(before.shape, self.section if before.s == 0.0 else None))
         shape = sketch.rescale_to_area(shape, self.area_at(s))
         secs = sorted(list(self.state.sections) + [KeySection(s, shape)], key=lambda ks: ks.s)
         index = [ks.s for ks in secs].index(s)
-        self._commit(self._normalised(replace(self.state, sections=tuple(secs))))
+        self._commit(self._normalised(self.state.with_selected(sections=tuple(secs))))
         self.active = index
         self._say(f"Added a key section at s = {s:g}")
         self._notify()
@@ -758,28 +1128,32 @@ class InletModel:
             self._notify()
             return False
         secs = [ks for k, ks in enumerate(self.state.sections) if k != index]
-        self._commit(self._normalised(replace(self.state, sections=tuple(secs))))
+        self._commit(self._normalised(self.state.with_selected(sections=tuple(secs))))
         self.active = min(self.active, index - 1) if self.active >= index else self.active
         self._say("Removed the key section")
         self._notify()
         return True
 
     # ---- centreline, area law and wall: the duct parameters ---------------------------------------------------------------------
-    def _set_duct(self, duct: DuctParams, key: str | None, text: str = "") -> bool:
-        """Replace the duct parameters (one undo step; consecutive edits with the same ``key`` merge). The key
-        sections are held at the new area law in the same step."""
+    def _apply(self, new: InletState, key: str | None = None, text: str = "") -> bool:
+        """Commit a changed state (the sections are held at the new area law in the same step)."""
         if not self.placed:
             self._say("Place the inlet first")
             self._notify()
             return False
-        return self._changed(self._commit(self._normalised(replace(self.state, duct=duct)), key), text)
+        return self._changed(self._commit(self._normalised(new), key), text)
 
-    CENTRELINE_KEYS = ("junction", "junction_pitch_deg", "start_handle", "junction_in_handle", "junction_out_handle",
-                       "end_handle")
+    def _set_duct(self, duct: DuctParams, key: str | None, text: str = "") -> bool:
+        return self._apply(replace(self.state, duct=duct), key, text)
+
+    CENTRELINE_KEYS = ("junction", "junction_pitch_deg", "junction_y", "junction_yaw_deg", "start_handle",
+                       "junction_in_handle", "junction_out_handle", "end_handle")
+    INLET_HANDLE_KEYS = ("start_handle", "junction_in_handle")  # belong to the selected inlet; the rest is shared
 
     def set_centreline(self, key: str | None = "centreline", **changes) -> bool:
-        """Change centreline parameters (junction, junction_pitch_deg, start_handle, junction_in_handle,
-        junction_out_handle, end_handle); ``None`` returns a value to its default."""
+        """Change centreline parameters (junction, junction_pitch_deg, junction_y, junction_yaw_deg, start_handle,
+        junction_in_handle, junction_out_handle, end_handle); ``None`` returns a value to its default. The inlet
+        handles belong to the selected inlet, the rest is shared. With symmetry xz the junction is held on y = 0."""
         for name, value in changes.items():
             if name not in self.CENTRELINE_KEYS:
                 raise KeyError(name)
@@ -787,30 +1161,43 @@ class InletModel:
                 self._say("A handle length cannot be negative")
                 self._notify()
                 return False
-        cl = self.state.duct.centreline.with_(**changes)
-        return self._set_duct(replace(self.state.duct, centreline=cl), key)
+        own = {k: changes.pop(k) for k in self.INLET_HANDLE_KEYS if k in changes}
+        if self.state.symmetry == "xz":
+            changes.pop("junction_y", None)
+            changes.pop("junction_yaw_deg", None)
+        state = replace(self.state, duct=replace(self.state.duct, centreline=self.state.duct.centreline.with_(**changes)))
+        if own:
+            state = state.with_selected(**own)
+        return self._apply(state, key)
 
     def reset_centreline(self) -> bool:
         """Handles and tangent back to their defaults (1/3 of the chord, aimed at the face); the junction stays."""
         old = self.state.duct.centreline
-        cl = CentrelineParams(old.junction, handle_fraction=old.handle_fraction)
-        return self._set_duct(replace(self.state.duct, centreline=cl), None, "Centreline reset")
+        cl = CentrelineParams(old.junction, junction_y=old.junction_y, handle_fraction=old.handle_fraction)
+        state = replace(self.state, duct=replace(self.state.duct, centreline=cl)).with_selected(
+            start_handle=None, junction_in_handle=None)
+        return self._apply(state, None, "Centreline reset")
 
-    def drag_junction(self, x: float, z: float) -> bool:
+    def drag_junction(self, x: float, z: float, y: float | None = None) -> bool:
         if self.locked:
             self._say("Inlet is locked")
             self._notify()
             return False
-        return self.set_centreline("junction", junction=(float(x), float(z)))
+        changes = {"junction": (float(x), float(z))}
+        if y is not None and self.state.symmetry != "xz":
+            changes["junction_y"] = float(y)
+        return self.set_centreline("junction", **changes)
 
     def set_area_points(self, points: AreaPoints, key: str | None = "area") -> bool:
+        """The junction / trunk points are shared, the branch points belong to the selected inlet."""
         try:
-            AreaCurves(self.areas.a_in, self.face_area, points, self.settings.law, self.n_branches)
+            AreaCurves(self.areas.a_in, self.face_area, points, self.settings.law, 1)
         except ValueError as exc:
             self._say(str(exc))
             self._notify()
             return False
-        return self._set_duct(replace(self.state.duct, area=points), key)
+        state = replace(self.state, duct=replace(self.state.duct, area=AreaPoints(points.junction_area, None, points.trunk)))
+        return self._apply(state.with_selected(area_branch=points.branch), key)
 
     def _interior(self, curve: str) -> list:
         return list(self.areas.branch_interior if curve == "branch" else self.areas.trunk_interior)
@@ -847,7 +1234,8 @@ class InletModel:
         return self.set_area_points(self.areas.with_junction_area(max(float(area), floor)), "area:junction")
 
     def reset_area(self) -> bool:
-        return self.set_area_points(AreaPoints(), None)
+        state = replace(self.state, duct=replace(self.state.duct, area=AreaPoints())).with_selected(area_branch=None)
+        return self._apply(state, None)
 
     def set_wall_thickness(self, value: float) -> bool:
         if value <= 0.0:
@@ -866,19 +1254,19 @@ class InletModel:
     # ---- bodies and checks (heavy: built on demand and cached per state) -----------------------------------------------------------
     @property
     def can_build(self) -> bool:
-        return self.placed and self.scene.face_center is not None and self.valid
+        return bool(self._placed()) and self.scene.face_center is not None and self.valid
 
     def duct_spec(self) -> dm.DuctSpec | None:
         if not self.can_build:
             return None
-        keys = tuple(dm.KeyOutline(ks.s, ev.outline, np.array(ks.shape.vertices))
-                     for ks, ev in zip(self.state.sections, self.evaluations))
-        return self._spec(self.state, keys, self.evaluations[0].area_plane)
+        placed = self._placed()
+        outlines = {k: [ev.outline for ev in self._evals[k]] for k in placed}
+        return self._build_spec(self.state, outlines, {k: self._evals[k][0].area_plane for k in placed})
 
     @property
     def duct(self) -> dm.Duct | None:
         """The stations (cheap): built for the current state on first use."""
-        if self._built.get("state") is not self.state:
+        if self._built.get("state") != self.state:
             self._built = {"state": self.state}
         if "duct" not in self._built:
             spec = self.duct_spec()
@@ -892,7 +1280,12 @@ class InletModel:
     @property
     def duct_error(self) -> str:
         _ = self.duct
-        return self._built.get("error", "") or (self._plan().error if self.placed else "")
+        return self._built.get("error", "") or (self._plan().error if self._placed() else "")
+
+    def branch_index(self, k: int | None = None) -> int | None:
+        """Index in ``duct.branches`` of an inlet's primary branch (default: the selected inlet)."""
+        k = self.selected if k is None else k
+        return self._plan().branch_of.get(k)
 
     def _solid(self, key, make):
         if key not in self._solids:
@@ -908,7 +1301,7 @@ class InletModel:
 
     @property
     def checks_current(self) -> bool:
-        return self._built.get("state") is self.state and "checks" in self._built
+        return self._built.get("state") == self.state and "checks" in self._built
 
     def ensure_built(self) -> bool:
         """Build the bodies and run the checks for the current state (cached). False when there is no duct."""
@@ -988,13 +1381,13 @@ class InletModel:
         return self.cancel_place() if self.mode == MODE_PLACING else self.begin_place()
 
     def handle_click(self, point) -> bool:
-        """A click on the fuselage. Ignored unless in place mode; places the plane origin there (creating the
-        default sketch the first time) and leaves place mode."""
+        """A click on the fuselage. Ignored unless in place mode; places the selected inlet's plane origin there
+        (creating the default sketch the first time) and leaves place mode."""
         if self.mode != MODE_PLACING:
             return False
         p = np.asarray(point, dtype=float)
         old = self.state.plane
-        plane = InletPlane((float(p[0]), abs(float(p[1])), float(p[2])), old.pitch_deg if old else 0.0,
+        plane = InletPlane((float(p[0]), self._origin_y(float(p[1])), float(p[2])), old.pitch_deg if old else 0.0,
                            old.sweep_deg if old else 0.0)
         self._with_plane(plane, None)
         self.mode = MODE_VIEW
@@ -1010,53 +1403,61 @@ class InletModel:
         self._notify()
 
     # ---- save / revert -----------------------------------------------------------------------------------------------
-    def inlet_definition(self) -> dict | None:
-        """What Save writes to ``ducts.inlet`` (the plane); None until an inlet has been placed."""
-        st = self.state
-        if st.plane is None or not st.sections:
-            return None
-        return {
-            "origin": [float(c) for c in st.plane.origin],
-            "pitch_deg": float(st.plane.pitch_deg),
-            "sweep_deg": float(st.plane.sweep_deg),
-        }
-
-    def key_sections_definition(self) -> list[dict]:
-        """What Save writes to ``ducts.key_sections``: every key section, the inlet first."""
-        return [{"s": float(ks.s), **ol.shape_to_config(ks.shape)} for ks in self.state.sections]
+    def inlets_definition(self) -> list[dict]:
+        """What Save writes to ``ducts.inlets``: every placed inlet with its key sections (the inlet section first).
+        Flow fractions are written normalised when they were given."""
+        fractions, _ = self._fractions(self.state)
+        out = []
+        for k in self._placed():
+            ins = self.state.inlets[k]
+            out.append({
+                "name": ins.name,
+                "origin": [float(c) for c in ins.plane.origin],
+                "pitch_deg": float(ins.plane.pitch_deg),
+                "sweep_deg": float(ins.plane.sweep_deg),
+                "flow_fraction": None if ins.flow_fraction is None else float(fractions[k]),
+                "mirror": bool(ins.mirror),
+                "start_handle": ins.start_handle,
+                "junction_in_handle": ins.junction_in_handle,
+                "area_points": None if ins.area_branch is None else [[float(s), float(a)] for s, a in ins.area_branch],
+                "key_sections": [{"s": float(ks.s), **ol.shape_to_config(ks.shape)} for ks in ins.sections],
+            })
+        return out
 
     def ducts_definition(self) -> dict:
-        """What Save writes besides the plane and the key sections: junction, centreline handles, area points,
-        wall thickness and lip."""
+        """What Save writes into ``ducts``: symmetry, the inlets, junction, centreline handles, area points, wall
+        thickness and lip."""
         d, cl = self.state.duct, self.state.duct.centreline
         out = {
+            "symmetry": self.state.symmetry,
+            "inlets": self.inlets_definition(),
             "wall_thickness": float(d.wall_thickness),
             "lip_extension": float(d.lip_extension),
             "lip_mode": d.lip_mode,
             "centreline": {
-                "junction_pitch_deg": cl.junction_pitch_deg, "start_handle": cl.start_handle,
-                "junction_in_handle": cl.junction_in_handle, "junction_out_handle": cl.junction_out_handle,
-                "end_handle": cl.end_handle, "handle_fraction": float(cl.handle_fraction),
+                "junction_pitch_deg": cl.junction_pitch_deg, "junction_yaw_deg": cl.junction_yaw_deg,
+                "junction_out_handle": cl.junction_out_handle, "end_handle": cl.end_handle,
+                "handle_fraction": float(cl.handle_fraction),
             },
-            "area_points": areacurve.points_to_config(d.area),
+            "area_points": {"junction_area": None if d.area.junction_area is None else float(d.area.junction_area),
+                            "trunk": None if d.area.trunk is None else [[float(s), float(a)] for s, a in d.area.trunk]},
         }
         if cl.junction is not None:
-            out["junction"] = {"point": [float(cl.junction[0]), 0.0, float(cl.junction[1])]}
+            y = 0.0 if self.state.symmetry == "xz" or cl.junction_y is None else float(cl.junction_y)
+            out["junction"] = {"point": [float(cl.junction[0]), y, float(cl.junction[1])]}
         return out
 
     def save(self) -> bool:
-        definition = self.inlet_definition()
         if self.save_target is None:
             self._say(f"Not saved: the example config is read-only. Copy it to {PRIVATE_CONFIG.name}.")
-        elif definition is None:
+        elif not self._placed():
             self._say("Nothing to save: place an inlet first.")
         elif not self.valid:
-            first = next(e for ev in self.evaluations for e in ev.errors)
+            first = next(e for evs in self._evals for ev in evs for e in ev.errors)
             self._say(f"ERROR: not saved: {first}")
         else:
             try:
-                path = save_inlet_definition(definition, self.save_target, self.key_sections_definition(),
-                                             remove_inlet_keys=("vertices", "snapped", "lip_extension"),
+                path = save_inlet_definition(None, self.save_target, None, remove_ducts_keys=("inlet", "key_sections"),
                                              ducts_values=self.ducts_definition())
             except OSError as exc:
                 self._say(f"Save failed: {exc}")
@@ -1070,7 +1471,7 @@ class InletModel:
         return False
 
     def revert(self) -> bool:
-        """Go back to the inlet stored in the config file (undoable)."""
+        """Go back to the design stored in the config file (undoable)."""
         try:
             cfg, _ = load_config(self.config_path)
             with warnings.catch_warnings():
@@ -1084,21 +1485,42 @@ class InletModel:
             return False
         self.scene.sizing = sizing
         self.settings = settings
-        self.notice = legacy_notice(cfg)
         self.alignment = None
-        self._section_cache = None  # the capture area (hence the default sketch) may have changed
+        self._skin_cache.clear()  # the capture area (hence the default sketch) may have changed
         self._plan_cache.clear()
         self._built = {}
+        stored = replace(stored, selected=min(self.state.selected, len(stored.inlets) - 1))
         normalised = self._normalised(stored)
         self._commit(normalised)
         self._recompute()
-        self.saved_state = normalised if stored.sections or stored.plane is None else stored
+        created = any(i.placed and not i.sections for i in stored.inlets)
+        self.saved_state = stored if created else normalised
+        self.notice = self._notice_for(cfg)
         self.mode = MODE_VIEW
         self._say(f"Reverted to {self.config_path.name}.")
         self._notify()
         return True
 
     # ---- readouts -------------------------------------------------------------------------------------------------------
+    def inlet_readouts(self) -> list[Readout]:
+        """The inlets list: how many, which are mirrored, the flow fractions."""
+        st = self.state
+        fractions, changed = self._fractions(st)
+        twins = sum(1 for k in range(len(st.inlets)) if self.has_twin(k))
+        count = len(st.inlets)
+        out = [Readout("Inlets", f"{count} inlet(s), {len([i for i in st.inlets if i.placed]) + twins} branch(es), "
+                       f"symmetry {st.symmetry}")]
+        if count > 1 or twins:
+            for k, ins in enumerate(st.inlets):
+                f = fractions.get(k)
+                tag = ("self-symmetric" if ins.self_symmetric else "+ mirrored twin" if self.has_twin(k) else "")
+                mark = ">" if k == self.selected else " "
+                out.append(Readout(f"{mark} {ins.name}"[:20], "not placed" if not ins.placed else
+                                   f"flow {100 * f:.1f} %  {tag}".rstrip()))
+        if changed:
+            out.append(Readout("", "WARN the flow fractions do not sum to 1: normalised", "warn"))
+        return out
+
     def duct_readouts(self) -> list[Readout]:
         """The duct lines: cheap numbers always, the heavy checks once they have been computed for this state."""
         out: list[Readout] = []
@@ -1109,11 +1531,16 @@ class InletModel:
         duct = self.duct
         if duct is None:
             return out
-        cl, areas = duct.centreline, duct.areas
+        k = self.branch_index() or 0
+        bg = duct.branches[k]
+        cl, areas = bg.centreline, bg.areas
+        label = "Junction" if duct.n_branches > 1 else "Via point"
         out += [
-            Readout("Junction", f"x {cl.junction[0]:.4f}  z {cl.junction[2]:.4f} m  (s = {cl.s_junction:.3f})"),
+            Readout(label, f"x {cl.junction[0]:.4f}  y {cl.junction[1]:.4f}  z {cl.junction[2]:.4f} m  "
+                    f"(s = {cl.s_junction:.3f})"),
             Readout("Path length", f"branch {cl.length_branch:.4f} m + trunk {cl.length_trunk:.4f} m"),
-            Readout("Area junction", f"{areas.junction_area:.5f} m^2 = {self.n_branches} x {areas.junction_area / self.n_branches:.5f}"),
+            Readout("Area junction", f"{areas.junction_area:.5f} m^2, this branch {areas.share:.3f} of it = "
+                    f"{areas.junction_area * areas.share:.5f}"),
         ]
         checks = self._built["checks"] if self.checks_current else None
         if checks is None:
@@ -1141,6 +1568,7 @@ class InletModel:
         tail = [Readout("", w, "warn") for w in notes]
         if self.notice:
             tail.append(Readout("", self.notice, "warn"))
+        out += self.inlet_readouts()
         if self.opening is None:
             out.append(Readout("Inlet", "not placed - use Place inlet (P)"))
             return out + tail
@@ -1182,7 +1610,9 @@ class InletModel:
                                f"{100 * ev.delta:+.2f} %), {ks.shape.n} vertices",
                                "pass" if ev.valid and abs(ev.delta) <= sketch.AREA_TOLERANCE else "error"))
         out.append(Readout("Section s=1.000", f"engine face circle, {self.face_area:.5f} m^2 (fixed)"))
-        for ks, ev in zip(self.state.sections, self.evaluations):
-            out += [Readout("", f"ERROR: s = {ks.s:g}: {e}", "error") for e in ev.errors]
+        for k, evs in enumerate(self._evals):
+            name = self.state.inlets[k].name
+            for ks, ev in zip(self.state.inlets[k].sections, evs):
+                out += [Readout("", f"ERROR: {name}, s = {ks.s:g}: {e}", "error") for e in ev.errors]
         out += [Readout("", f"WARN {w}", "warn") for w in op.warnings]
         return out + self.duct_readouts() + tail

@@ -54,28 +54,26 @@ def test_everything_else_is_untouched(target):
     assert after["ducts"]["junction"] == before["ducts"]["junction"]
 
 
-def test_comments_outside_the_key_sections_are_preserved_line_for_line(target):
+def test_comments_outside_the_inlets_list_are_preserved_line_for_line(target):
     original = target.read_text(encoding="utf-8").splitlines()
-    save_inlet_definition(PLANE, target, KEY_SECTIONS)
+    inlets = [{"name": "a", **PLANE, "flow_fraction": None, "mirror": True, "key_sections": KEY_SECTIONS}]
+    save_inlet_definition(None, target, None, ducts_values={"inlets": inlets})
     written = target.read_text(encoding="utf-8").splitlines()
 
-    def outside(lines):  # everything except the plane values and the key_sections block
-        a = next(i for i, x in enumerate(lines) if x.startswith("  key_sections:"))
+    def outside(lines):  # everything except the inlets list
+        a = next(i for i, x in enumerate(lines) if x.startswith("  inlets:"))
         b = next(i for i, x in enumerate(lines) if x.startswith("  junction:"))
         return lines[:a], lines[b:]
 
-    (o_head, o_tail), (w_head, w_tail) = outside(original), outside(written)
     def plain(lines):  # the round trip writes a null as an empty value; nothing else may change
         return [" ".join(x.replace("null", "").split()) for x in lines]
 
-    assert plain(o_tail) == plain(w_tail)  # junction onwards, comments included
-    touched = ("origin:", "pitch_deg:", "sweep_deg:")
-    for old, new in zip(o_head, w_head):
-        if not any(old.strip().startswith(k) for k in touched):
-            assert new == old
-        else:
-            assert ("#" in new) == ("#" in old)  # trailing comments on edited lines survive, none are invented
-    assert len(o_head) == len(w_head)
+    (o_head, o_tail), (w_head, w_tail) = outside(original), outside(written)
+    assert plain(o_head) == plain(w_head) and plain(o_tail) == plain(w_tail)  # comments included
+    text = "\n".join(written)
+    assert "symmetry: xz" in text  # the key above the list is untouched
+    data = yaml.safe_load(text)["ducts"]["inlets"]
+    assert len(data) == 1 and data[0]["name"] == "a" and [s["s"] for s in data[0]["key_sections"]] == [0.0, 0.35]
 
 
 def test_the_old_vertices_and_snapped_are_removed_on_save(tmp_path):
@@ -196,7 +194,7 @@ def test_ducts_values_are_merged_into_the_ducts_block(target):
 def test_existing_comments_survive_the_ducts_values(target):
     save_inlet_definition(PLANE, target, KEY_SECTIONS, ducts_values=DUCTS)
     text = target.read_text(encoding="utf-8")
-    assert "# [x, 0, z] where the branches merge" in text
+    assert "# [x, y, z] where the branches merge" in text
     assert "# m, the positive body is the inner section offset outward" in text
     assert "# tangent direction at the junction in the XZ plane" in text
 

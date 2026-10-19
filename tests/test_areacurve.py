@@ -106,3 +106,14 @@ def test_config_round_trip():
         ac.points_from_config({"branch": [[0.4]]})
     with pytest.raises(ValueError, match="mapping"):
         ac.points_from_config([1])
+
+
+def test_a_branch_ends_with_its_flow_share_of_the_junction_area():
+    a = AreaCurves(A_IN, A_FACE, share=0.7, n_branches=3, a_in_total=0.4)
+    assert a.junction_area == pytest.approx(math.sqrt(0.4 * A_FACE))  # from the summed inlet area of all branches
+    assert a.branch_area(1.0) == pytest.approx(0.7 * a.junction_area) and a.trunk_area(0.0) == pytest.approx(a.junction_area)
+    shares = [0.5, 0.3, 0.2]
+    curves = [AreaCurves(A_IN, A_FACE, share=s, n_branches=3, a_in_total=0.4) for s in shares]
+    assert sum(c.branch_area(1.0) for c in curves) == pytest.approx(curves[0].trunk_area(0.0))  # the ends tile the trunk
+    with pytest.raises(ValueError, match="share"):
+        AreaCurves(A_IN, A_FACE, share=1.5)

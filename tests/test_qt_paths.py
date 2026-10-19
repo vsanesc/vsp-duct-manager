@@ -16,6 +16,7 @@ import pytest
 pytest.importorskip("PySide6")
 from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
+import cfgutil  # noqa: E402
 from ductmgr import qt_paths as qp  # noqa: E402
 from ductmgr.explore_model import InletModel  # noqa: E402
 from ductmgr.viz import ACCENT, load_scene  # noqa: E402
@@ -134,9 +135,9 @@ def test_the_inlet_handle_only_slides_along_the_inward_normal(model, clock):
     target = a2 + 0.7 * d2 + np.array([-d2[1], d2[0]]) * 0.2  # 0.7 along, 0.2 off the line
     clock.advance(10.0)
     drag(c, "start", target)
-    assert model.state.duct.centreline.start_handle == pytest.approx(float(np.dot(target - a2, d2) / np.dot(d2, d2)))
+    assert model.state.inlet.start_handle == pytest.approx(float(np.dot(target - a2, d2) / np.dot(d2, d2)))
     after = model.centreline
-    assert after.branch.ctrl[1] == pytest.approx(after.start + model.state.duct.centreline.start_handle * after.start_dir)
+    assert after.branch.ctrl[1] == pytest.approx(after.start + model.state.inlet.start_handle * after.start_dir)
     assert after.branch.tangents([0.0])[0] == pytest.approx(after.start_dir, abs=1e-12)  # the direction is fixed
 
 
@@ -161,7 +162,7 @@ def test_the_junction_handles_set_angle_and_length_in_the_side_view(model, clock
     clock.advance(10.0)
     drag(c, "junction_in", j - np.array([0.2, 0.0]))  # the in-handle lies behind the junction, collinear
     cl = model.state.duct.centreline
-    assert cl.junction_pitch_deg == pytest.approx(0.0, abs=1e-6) and cl.junction_in_handle == pytest.approx(0.2)
+    assert cl.junction_pitch_deg == pytest.approx(0.0, abs=1e-6) and model.state.inlet.junction_in_handle == pytest.approx(0.2)
     t = model.centreline
     assert t.branch.tangents([1.0])[0] == pytest.approx(t.trunk.tangents([0.0])[0], abs=1e-12)  # still G1
 
@@ -190,8 +191,8 @@ def test_double_clicking_a_handle_returns_it_to_its_default(model, clock):
     drag(c, "start", (2.5, 1.0))
     clock.advance(10.0)
     drag(c, "junction_out", (4.6, 0.5))
-    assert model.state.duct.centreline.start_handle is not None
-    assert c.double_click(c.to_screen(c.handles()["start"])) and model.state.duct.centreline.start_handle is None
+    assert model.state.inlet.start_handle is not None
+    assert c.double_click(c.to_screen(c.handles()["start"])) and model.state.inlet.start_handle is None
     assert c.double_click(c.to_screen(c.handles()["junction_out"]))
     cl = model.state.duct.centreline
     assert cl.junction_out_handle is None and cl.junction_pitch_deg is None
@@ -237,7 +238,7 @@ def test_the_views_paint_the_centrelines_the_opening_and_the_handles(model):
 
 def test_an_unplaced_model_paints_the_scene_without_ducts(qapp, scene, example_env):
     cfg = copy.deepcopy(example_env[0])
-    cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["key_sections"] = None
+    cfgutil.unplace(cfg)
     m = InletModel(scene, cfg, example_env[1], None)
     c = canvas_for(m, "side")
     assert c.handles() == {} and count_colour(pixels(c), qp.CENTRE_COLOR) == 0
@@ -270,7 +271,7 @@ def test_dragging_an_interior_point_edits_the_curve_through_the_model(model, clo
     c.release()
     new_s, new_area = model.areas.branch_interior[1]
     assert new_s == pytest.approx(0.55, abs=1e-6) and new_area == pytest.approx(area * 1.05, rel=1e-6)
-    assert model.state.duct.area.branch is not None and model.dirty
+    assert model.state.inlet.area_branch is not None and model.dirty
 
 
 def test_dragging_the_junction_end_of_either_curve_sets_the_junction_area(model, clock):
@@ -314,7 +315,7 @@ def test_the_area_plot_marks_a_shrinking_curve_in_red(model, clock):
 
 def test_the_area_plot_asks_to_place_the_inlet_first(qapp, scene, example_env):
     cfg = copy.deepcopy(example_env[0])
-    cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["key_sections"] = None
+    cfgutil.unplace(cfg)
     m = InletModel(scene, cfg, example_env[1], None)
     c = area_canvas(m)
     assert not c.press(QtCore.QPointF(100, 100)) and not c.double_click(QtCore.QPointF(100, 100))

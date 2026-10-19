@@ -116,3 +116,24 @@ def test_a_branch_end_offset_moves_the_end_but_keeps_the_junction_tangent():
     assert c.branch.ctrl[3] == pytest.approx(c.junction + off) and c.trunk.ctrl[0] == pytest.approx(c.junction)
     assert c.branch.tangents([1.0])[0] == pytest.approx(c.trunk.tangents([0.0])[0], abs=1e-12)  # still G1
     assert c.s_junction == pytest.approx(c.length_branch / c.length)
+
+
+def test_without_symmetry_the_junction_and_its_tangent_are_free_in_3d():
+    free = Centreline(START, START_DIR, FACE, AXIS,
+                      CentrelineParams(junction=(3.0, 0.4), junction_y=0.3, junction_yaw_deg=15.0, junction_pitch_deg=10.0),
+                      symmetric=False)
+    assert free.junction == pytest.approx([3.0, 0.3, 0.4])
+    t = free.junction_tangent
+    assert t == pytest.approx([math.cos(math.radians(15)) * math.cos(math.radians(10)), math.sin(math.radians(15)),
+                               math.cos(math.radians(15)) * math.sin(math.radians(10))])
+    assert free.branch.tangents([1.0])[0] == pytest.approx(free.trunk.tangents([0.0])[0], abs=1e-12)  # still G1
+    assert (free.resolved.junction_y, free.resolved.junction_yaw_deg) == pytest.approx((0.3, 15.0))
+    held = Centreline(START, START_DIR, FACE, AXIS,
+                      CentrelineParams(junction=(3.0, 0.4), junction_y=0.3, junction_yaw_deg=15.0), symmetric=True)
+    assert held.junction[1] == 0.0 and held.junction_tangent[1] == 0.0  # symmetry holds it on y = 0
+
+
+def test_the_free_defaults_aim_the_junction_tangent_at_the_face():
+    off = Centreline(START, START_DIR, np.array([6.0, 0.5, 0.0]), AXIS, CentrelineParams(junction=(3.0, 0.4)), symmetric=False)
+    d = np.array([6.0, 0.5, 0.0]) - off.junction
+    assert off.junction_tangent == pytest.approx(d / np.linalg.norm(d), abs=1e-12)

@@ -5,11 +5,11 @@
 
 Each curve is a function of its own local arc-length fraction ``s_local`` in [0, 1]:
 
-- branch: A(0) = the inlet section area (fixed), A(1) = junction area / n_branches;
+- branch: A(0) = the inlet section area (fixed), A(1) = this branch's share of the junction area;
 - trunk:  A(0) = the junction area, A(1) = the engine-face area (fixed).
 
-So the area is continuous in the sense the geometry needs: the trunk starts with exactly n_branches times the
-area a branch ends with. The junction area is a free value (default: the geometric mean of the combined inlet area
+So the area is continuous in the sense the geometry needs: the trunk starts with exactly the sum of the areas its
+branches end with (their shares add up to 1). The junction area is a free value (default: the geometric mean of the combined inlet area
 and the face area, so both stages diffuse by the same ratio); the interior control points default to the
 configured law (linear or cosine) and become explicit once edited.
 """
@@ -67,19 +67,25 @@ def validate_interior(points, where: str = "area points") -> None:
 
 class AreaCurves:
     def __init__(self, a_in: float, a_face: float, points: AreaPoints | None = None, law: str = DEFAULT_LAW,
-                 n_branches: int = 2):
+                 n_branches: int = 2, share: float | None = None, a_in_total: float | None = None):
+        """One branch's curve and the trunk's. ``share`` is the fraction of the trunk flow this branch carries
+        (default 1 / n_branches) and ``a_in_total`` the summed inlet area of all branches (default n_branches x
+        ``a_in``): the junction area defaults to sqrt(a_in_total x a_face)."""
         if law not in LAWS:
             raise ValueError(f"area law must be one of {', '.join(LAWS)} (got {law!r})")
         if a_in <= 0.0 or a_face <= 0.0:
             raise ValueError("the inlet and face areas must be positive")
         points = points or AreaPoints()
         self.a_in, self.a_face, self.law, self.n = float(a_in), float(a_face), law, int(n_branches)
+        self.share = 1.0 / self.n if share is None else float(share)
+        if not 0.0 < self.share <= 1.0:
+            raise ValueError("a branch's flow share must be in (0, 1]")
         self.points = points
         self.junction_area = (float(points.junction_area) if points.junction_area is not None
-                              else math.sqrt(self.n * self.a_in * self.a_face))
+                              else math.sqrt((self.n * self.a_in if a_in_total is None else a_in_total) * self.a_face))
         if self.junction_area <= 0.0:
             raise ValueError("the junction area must be positive")
-        a_branch_end = self.junction_area / self.n
+        a_branch_end = self.junction_area * self.share
         if points.branch is None:
             self.branch_interior = tuple((s, self.a_in + (a_branch_end - self.a_in) * weight(s, law))
                                          for s in DEFAULT_INTERIOR_S)

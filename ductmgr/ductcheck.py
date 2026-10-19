@@ -92,6 +92,11 @@ class BodySolids(dict):
         return self[key]
 
 
+def branch_names(bodies: dict) -> list[str]:
+    """The ``<name>`` of every ``neg_branch_<name>`` body (mirrored twins included)."""
+    return [n[len("neg_branch_"):] for n in bodies if n.startswith("neg_branch_")]
+
+
 def refine_rings(rings: np.ndarray, k: int = dm.REFINE_SUBDIVISIONS) -> tuple[np.ndarray, np.ndarray]:
     """Rings with ``k - 1`` linearly interpolated rings between each pair; also the index map (fractional ring
     positions in the original ring list)."""
@@ -117,7 +122,7 @@ def external_region(duct: dm.Duct, bodies: dict, fuselage: Solid, c: DuctChecks,
     are refined and tested again."""
     total_len = total_area = 0.0
     extent = 0.0
-    for name in ("pos_branch_R", "pos_trunk"):
+    for name in [f"pos_branch_{b}" for b in branch_names(bodies)] + ["pos_trunk"]:
         body = bodies[name]
         rings, dist = body.rings, body.dist
         n_r, n_p, _ = rings.shape
@@ -173,7 +178,8 @@ def wall_left(duct: dm.Duct, bodies: dict, fuselage: Solid, c: DuctChecks, s: Ch
     union_min = math.inf  # the wall of the union fuselage ∪ positive around the negative (negative = it leaves)
     solids = solids if solids is not None else BodySolids(bodies)
     external_wall = math.inf
-    for neg_name, pos_name in (("neg_branch_R", "pos_branch_R"), ("neg_trunk", "pos_trunk")):
+    pairs = [(f"neg_branch_{b}", f"pos_branch_{b}") for b in branch_names(bodies)] + [("neg_trunk", "pos_trunk")]
+    for neg_name, pos_name in pairs:
         neg, pos = bodies[neg_name], bodies[pos_name]
         solid_p = solids[pos_name]
         lateral_p = solids[(pos_name, True)]
@@ -234,7 +240,7 @@ def other_geoms(bodies: dict, parts: list[Solid], c: DuctChecks, solids: BodySol
     for solid in parts:
         lo, hi = np.array(solid.bounds[0::2]), np.array(solid.bounds[1::2])
         hit_bodies = []
-        for name in ("pos_branch_R", "pos_trunk", "neg_branch_R", "neg_trunk", "pos_branch_L", "neg_branch_L"):
+        for name in bodies:
             body = bodies[name]
             pts = body.mesh.points
             near = np.all((pts >= lo - 1e-9) & (pts <= hi + 1e-9), axis=1)
@@ -282,22 +288,16 @@ def line_of_sight(duct: dm.Duct, bodies: dict, c: DuctChecks) -> None:
     The union over the right and the mirrored left inlet is reported."""
     pts, mask = _face_grid(duct)
     flat, m = pts.reshape(-1, 3), mask.ravel()
-    st0 = duct.branch[0]
-    ring_uv = st0.ring
-    u0, v0, n0 = duct.spec.plane.frame()
     sides = []
-    for mirror in (False, True):
-        f = (lambda p: dm.mirrored(p)) if mirror else (lambda p: p)
-        centre = f(st0.centre)
-        n = f(n0)
-        U, V = f(st0.U), f(st0.V)
-        casters = RayCaster(bodies["neg_branch_L" if mirror else "neg_branch_R"].lateral, bodies["neg_trunk"].lateral)
-        sides.append((centre, n, U, V, casters))
+    for bg in duct.branches:  # every opening, mirrored twins included
+        st0 = bg.stations[0]
+        casters = RayCaster(bodies[f"neg_branch_{bg.name}"].lateral, bodies["neg_trunk"].lateral)
+        sides.append((st0.centre, -st0.T, st0.U, st0.V, st0.ring, casters))
     dirs = {"x": np.array([1.0, 0.0, 0.0]), "n": None}
     result = {}
     for key in ("x", "n"):
         vis_any = np.zeros(len(flat), dtype=bool)
-        for centre, n, U, V, caster in sides:
+        for centre, n, U, V, ring_uv, caster in sides:
             d = dirs["x"] if key == "x" else -n  # the direction the air travels
             denom = float(np.dot(n, d))
             if abs(denom) < 1e-9:
@@ -323,34 +323,46 @@ def line_of_sight(duct: dm.Duct, bodies: dict, c: DuctChecks) -> None:
 
 
 def numbers(duct: dm.Duct, c: DuctChecks, s: CheckSettings) -> None:
-    cl = duct.centreline
-    c.offset, _, c.offset_over_length = cl.offset_over_length()
-    c.add("Offset / length", f"{c.offset:.4f} m / {cl.length:.4f} m = {c.offset_over_length:.3f}")
-    c.max_curvature = cl.max_curvature()
-    if c.max_curvature < 1e-9:
-        c.add("Centreline curvature", "straight")
-    else:
-        c.add("Centreline curvature", f"max {c.max_curvature:.3f} 1/m (min radius {1.0 / c.max_curvature:.3f} m)")
-    angles = duct.cone_half_angles()
-    for part, a in angles.items():
-        if not a.size:
-            continue
-        worst = float(a.max())
-        c.half_angle_max = max(c.half_angle_max, worst)
-        over = np.flatnonzero(a > s.max_half_angle_deg)
-        level = "pass" if not len(over) else "warn"
-        c.add(f"Cone half-angle {part}", f"max {worst:.2f} deg (limit {s.max_half_angle_deg:g})", level)
-        if len(over):
-            where = f"{len(over)} segment(s) of the {part}"
-            c.half_angle_exceeded.append(part)
-            c.add("", f"WARN equivalent cone half-angle exceeds {s.max_half_angle_deg:g} deg in {where}", "warn")
-    areas: AreaCurves = duct.areas
-    for curve in ("branch", "trunk"):
-        dec = areas.decreasing(curve)
-        if dec:
-            c.area_decreasing.append(curve)
-            spans = ", ".join(f"{a:.2f}-{b:.2f}" for a, b in dec)
-            c.add("", f"WARN A(s) decreases in the {curve} (s = {spans})", "warn")
+    primaries = [i for i, bg in enumerate(duct.branches) if not bg.twin]
+    many = len(primaries) > 1
+    for i in primaries:
+        bg = duct.branches[i]
+        tag = f" {bg.name}" if many else ""
+        cl = bg.centreline
+        offset, _, ratio = cl.offset_over_length()
+        if i == primaries[0]:
+            c.offset, c.offset_over_length = offset, ratio
+        c.add(f"Offset / length{tag}", f"{offset:.4f} m / {cl.length:.4f} m = {ratio:.3f}")
+        curvature = cl.max_curvature()
+        c.max_curvature = max(c.max_curvature, curvature)
+        if curvature < 1e-9:
+            c.add(f"Centreline curvature{tag}", "straight")
+        else:
+            c.add(f"Centreline curvature{tag}", f"max {curvature:.3f} 1/m (min radius {1.0 / curvature:.3f} m)")
+        for part, a in duct.cone_half_angles(i).items():
+            if part == "trunk" and i != primaries[0]:
+                continue  # one trunk
+            if not a.size:
+                continue
+            worst = float(a.max())
+            c.half_angle_max = max(c.half_angle_max, worst)
+            over = np.flatnonzero(a > s.max_half_angle_deg)
+            label = f"{part}{tag}" if part == "branch" else part
+            c.add(f"Cone half-angle {label}", f"max {worst:.2f} deg (limit {s.max_half_angle_deg:g})",
+                  "pass" if not len(over) else "warn")
+            if len(over):
+                c.half_angle_exceeded.append(label)
+                c.add("", f"WARN equivalent cone half-angle exceeds {s.max_half_angle_deg:g} deg in {len(over)} "
+                      f"segment(s) of the {label}", "warn")
+        for curve in ("branch", "trunk"):
+            if curve == "trunk" and i != primaries[0]:
+                continue
+            dec = bg.areas.decreasing(curve)
+            if dec:
+                label = f"{curve}{tag}" if curve == "branch" else curve
+                c.area_decreasing.append(label)
+                spans = ", ".join(f"{x:.2f}-{y:.2f}" for x, y in dec)
+                c.add("", f"WARN A(s) decreases in the {label} (s = {spans})", "warn")
 
 
 def run_checks(duct: dm.Duct, fuselage: Solid | None, parts: list[Solid], settings: CheckSettings,

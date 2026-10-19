@@ -32,44 +32,52 @@ design_point:
 
 # ---- Phase 2: duct geometry ---------------------------------------------
 ducts:
-  n_inlets: 2                      # capture area per inlet = total / n_inlets
-  inlet:                           # right inlet; the left one is its mirror image about XZ
-    origin: [2.0, 0.5, 1.371]      # [x, y, z] origin O of the inlet plane (on / near the skin)
-    pitch_deg: 0.0                 # rotation about Y: opening tilted up (+) / down (-)
-    sweep_deg: 0.0                 # rotation about Z: opening swept in planform; plane normal
+  n_inlets: 2                      # Phase 1 sizing summary only (capture area per inlet = total / n_inlets); the geometry
+                                   # takes its inlets and flow fractions from ducts.inlets
+  symmetry: xz                     # xz: an inlet with mirror: true gets an automatic mirrored twin about the XZ plane and
+                                   # the junction / trunk are held on y = 0; none: every inlet is independent, free layout
+  inlets:                          # 1..N inlets; each has its own plane, key sections, flow share and mirror flag
+    - name: right                  # unique; used in the body names (DUCT_BRANCH_<name>_POS / NEG)
+      origin: [2.0, 0.5, 1.371]    # [x, y, z] origin O of the inlet plane (on / near the skin)
+      pitch_deg: 0.0               # rotation about Y: opening tilted up (+) / down (-)
+      sweep_deg: 0.0               # rotation about Z: opening swept in planform; plane normal
                                    # n = Rz(sweep) Ry(pitch) (-X), so 0 / 0 is the plane x = const facing forward
-  key_sections:                    # sections along each branch (right inlet; the left one is its mirror image)
-    - s: 0.0                       # normalised arc length: 0 = the inlet section, in the inlet plane
-      vertices:                    # [u, v] in metres relative to O (u right, v up seen from the front; counter-clockwise)
-        - [-0.09242, -0.07479]
-        - [0.14268, 0.04234]
-        - [0.13367, 0.31868]
-        - [-0.00203, 0.40010]
-        - [-0.13772, 0.31868]
-      snapped: [true, true, false, false, false]   # on the fuselage section curve; an edge between two snapped
-                                                   # vertices follows the curve and is not editable
-      edges: [straight, straight, straight, straight, straight]  # edge i joins vertex i to i+1: straight or curved
-      handles: [null, null, null, null, null]  # curved edges: [[du, dv], [du, dv]] tangent offsets from its two vertices
-      continuity: [corner, corner, corner, corner, corner]       # per vertex: corner, smooth (G1) or symmetric
-    # more sections: add entries with 0 < s < 1; each keeps its own shape but is sized by the area law A(s).
-    # The engine face (s = 1) is a fixed circle and is not listed.
+      flow_fraction: null          # share of the total flow per physical branch; null = equal split (must sum to 1)
+      mirror: true                 # with symmetry xz: also build the mirror image (not for an inlet centred on y = 0)
+      start_handle: null           # m, handle at the inlet section centroid, along the inward plane normal
+      junction_in_handle: null     # m, this branch's side of the junction
+      area_points: null            # this branch's area law A(s): interior [s, area] points; null = from area_law
+      key_sections:                # sections along the branch
+        - s: 0.0                   # normalised arc length: 0 = the inlet section, in the inlet plane
+          vertices:                # [u, v] in metres relative to O (u right, v up seen from the front; counter-clockwise)
+            - [-0.09242, -0.07479]
+            - [0.14268, 0.04234]
+            - [0.13367, 0.31868]
+            - [-0.00203, 0.40010]
+            - [-0.13772, 0.31868]
+          snapped: [true, true, false, false, false]   # on the fuselage section curve; an edge between two snapped
+                                                       # vertices follows the curve and is not editable
+          edges: [straight, straight, straight, straight, straight]  # edge i joins vertex i to i+1: straight or curved
+          handles: [null, null, null, null, null]  # curved edges: [[du, dv], [du, dv]] tangent offsets from its two vertices
+          continuity: [corner, corner, corner, corner, corner]       # per vertex: corner, smooth (G1) or symmetric
+        # more sections: add entries with 0 < s < 1; each keeps its own shape but is sized by the area law A(s).
+        # The engine face (s = 1) is a fixed circle and is not listed.
   junction:
-    point: [4.0, 0.0, 0.2]         # [x, 0, z] where the branches merge (drag it in the SIDE / TOP tabs)
+    point: [4.0, 0.0, 0.2]         # [x, y, z] where the branches merge (drag it in the SIDE / TOP tabs); y is 0 with
+                                   # symmetry xz. With one branch: an intermediate point (G1) instead of a junction
     splitter_length: 0.0           # m, the branch negatives stay apart (a wall of wall_thickness on y = 0) this far
                                    # into the trunk; 0 = they merge at the junction plane
     overlap: 0.02                  # m, each branch negative reaches this far past the junction plane and the trunk
                                    # negative starts this far before it (inside the duct, for clean booleans)
   centreline:                      # cubic Bezier centrelines; null = default (handle_fraction x chord length)
     junction_pitch_deg: null       # tangent direction at the junction in the XZ plane (0 = +X, + up)
-    start_handle: null             # m, handle at the inlet section centroid, along the inward plane normal
-    junction_in_handle: null       # m, branch side of the junction
+    junction_yaw_deg: null         # tangent yaw towards +Y at the junction (only with symmetry none; else 0)
     junction_out_handle: null      # m, trunk side of the junction (collinear with the in-handle: G1)
     end_handle: null               # m, handle at the engine face, along the engine axis
     handle_fraction: 0.3333        # default handle length / chord length
   area_points:                     # area law A(s), PCHIP through these; null = derived from area_law below
-    junction_area: null            # m^2 at the junction (trunk start); each branch ends with half of it
-    branch: null                   # interior control points [[s, area], ...], s = local arc length 0..1
-    trunk: null
+    junction_area: null            # m^2 at the junction (trunk start); each branch ends with its flow share of it
+    trunk: null                    # interior control points [[s, area], ...], s = local arc length 0..1
   wall_thickness: 0.004            # m, the positive body is the inner section offset outward by this
   lip_extension: 0.05              # m, the negative starts this far upstream of the opening plane
   lip_mode: blunt                  # lip shape of the positive at the opening ("blunt" for now)

@@ -53,9 +53,12 @@ def _round_values(value):
     return value
 
 
-def save_inlet_definition(inlet: dict, target: Path | None = None, key_sections: list | None = None,
-                          remove_inlet_keys=(), ducts_values: dict | None = None) -> Path:
-    """Write ``inlet`` into ``ducts.inlet`` of the private config, keeping comments and every other key.
+def save_inlet_definition(inlet: dict | None, target: Path | None = None, key_sections: list | None = None,
+                          remove_inlet_keys=(), ducts_values: dict | None = None, remove_ducts_keys=()) -> Path:
+    """Write ``inlet`` into ``ducts.inlet`` of the private config (skipped when None), keeping comments and every
+    other key. ``remove_ducts_keys`` names superseded keys to delete from ``ducts`` (the old ``inlet`` and
+    ``key_sections``). In ``ducts_values`` the key ``inlets`` is a list of mappings (one per inlet, with its own
+    ``key_sections``) that replaces ``ducts.inlets`` wholesale.
 
     ``ducts_values`` is a (nested) mapping merged into ``ducts`` (junction point, centreline, area points, wall
     thickness, lip); ``None`` values are written as null.
@@ -115,7 +118,9 @@ def save_inlet_definition(inlet: dict, target: Path | None = None, key_sections:
     def assign_tree(slot, mapping):
         """Set nested mapping values in place (keeping the comments of keys that already exist); lists are flow."""
         for key, value in mapping.items():
-            if isinstance(value, dict):
+            if key == "inlets" and isinstance(value, list):
+                slot[key] = CommentedSeq([entry_map(e) for e in value])
+            elif isinstance(value, dict):
                 assign_tree(mapping_of(slot, key), value)
             elif isinstance(value, list):
                 assign_list(slot, key, value)
@@ -142,20 +147,38 @@ def save_inlet_definition(inlet: dict, target: Path | None = None, key_sections:
                 out[key] = value
         return out
 
+    def entry_map(entry):
+        """One inlet: its key sections as section maps, other lists in flow style."""
+        out = CommentedMap()
+        for key, value in entry.items():
+            if key == "key_sections":
+                out[key] = CommentedSeq([section_map(e) for e in value])
+            elif key == "area_points" and value is not None:
+                out[key] = CommentedSeq([flow_seq(p) for p in value])
+            elif isinstance(value, list):
+                out[key] = flow_seq(value)
+            else:
+                out[key] = value
+        return out
+
     ducts = mapping(doc, "ducts")
-    slot = mapping(ducts, "inlet")
-    for key in remove_inlet_keys:
-        if key in slot:
-            del slot[key]
-    for key, value in _round_values(inlet).items():
-        if isinstance(value, dict):
-            sub = mapping(slot, key)
-            for k, v in value.items():
-                sub[k] = v
-        elif isinstance(value, list):
-            assign_list(slot, key, value)
-        else:
-            slot[key] = value
+    for key in remove_ducts_keys:
+        if key in ducts:
+            del ducts[key]
+    if inlet is not None:
+        slot = mapping(ducts, "inlet")
+        for key in remove_inlet_keys:
+            if key in slot:
+                del slot[key]
+        for key, value in _round_values(inlet).items():
+            if isinstance(value, dict):
+                sub = mapping(slot, key)
+                for k, v in value.items():
+                    sub[k] = v
+            elif isinstance(value, list):
+                assign_list(slot, key, value)
+            else:
+                slot[key] = value
     if key_sections is not None:
         ducts["key_sections"] = CommentedSeq([section_map(e) for e in _round_values(key_sections)])
     if ducts_values:

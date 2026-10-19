@@ -18,6 +18,7 @@ import copy  # noqa: E402
 import numpy as np  # noqa: E402
 from PySide6 import QtCore, QtWidgets  # noqa: E402
 
+import cfgutil  # noqa: E402
 from ductmgr.explore_model import InletModel  # noqa: E402
 from ductmgr.qt_explorer import CLICK_TOLERANCE_PX, ExploreWindow  # noqa: E402
 from ductmgr.viz import SceneView, load_scene  # noqa: E402
@@ -27,8 +28,7 @@ from ductmgr.viz import SceneView, load_scene  # noqa: E402
 def gui(example_env):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
-    inlet = cfg["ducts"]["inlet"]
-    inlet["origin"] = cfg["ducts"]["key_sections"] = None  # start without an inlet
+    cfgutil.unplace(cfg)  # start without an inlet
     scene = load_scene(cfg, path)
     model = InletModel(scene, cfg, path, None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -163,7 +163,8 @@ def test_the_3d_view_follows_the_2d_centreline_editor_and_builds_the_bodies_afte
     win.act_place.trigger()
     click(win, display_of(win.plotter, [3.0, 0.4, top_of(model, 3.0, 0.4)]))
     acts = win.plotter.renderer.actors
-    for name in ("cl_right", "cl_left", "cl_trunk"):
+    base = model.inlet.name
+    for name in (f"cl_{base}", f"cl_{base}_mirror", "cl_trunk"):
         assert name in acts  # drawn at once, before the bodies
     before = np.asarray(acts["cl_trunk"].GetMapper().GetInput().points).copy()
     c = win.canvas_side
@@ -181,5 +182,5 @@ def test_the_3d_view_follows_the_2d_centreline_editor_and_builds_the_bodies_afte
             break
         QtCore.QThread.msleep(30)
     assert model.checks_current
-    for name in ("duct_neg_trunk", "duct_pos_trunk", "duct_neg_branch_R", "duct_pos_branch_L"):
+    for name in ("duct_neg_trunk", "duct_pos_trunk", f"duct_neg_branch_{base}", f"duct_pos_branch_{base}_mirror"):
         assert name in win.plotter.renderer.actors

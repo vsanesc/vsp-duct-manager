@@ -34,20 +34,20 @@ def mixed_shape():
     return ol.set_continuity(s, 2, "smooth")
 
 
-def spec_for(shape, origin=(1.0, 0.0, 0.0), face=FACE, diameter=0.5, n_branches=1, extra_keys=(), **kw):
+def spec_for(shape, origin=(1.0, 0.0, 0.0), face=FACE, diameter=0.5, mirror=False, extra_keys=(), **kw):
     keys = (key_for(shape),) + tuple(extra_keys)
-    return dm.DuctSpec(InletPlane(origin), keys, np.asarray(face, dtype=float), AXIS, diameter, n_branches=n_branches,
-                       **kw)
+    return dm.single_spec(InletPlane(origin), keys, np.asarray(face, dtype=float), AXIS, diameter, mirror=mirror,
+                          **kw)
 
 
 def pentagon_to_circle(**kw):
-    return dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.3, 0.2), n_branches=2, **kw))
+    return dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.3, 0.2), mirror=True, **kw))
 
 
 # ---- sections at exactly A(s) -------------------------------------------------------------------------------------
 @pytest.mark.parametrize("shape", [SectionShape.polygon(PENTAGON), mixed_shape(), ol.circle_shape(0.2)])
 def test_the_inner_section_has_exactly_the_area_law_area_at_every_station(shape):
-    d = dm.Duct(spec_for(shape, origin=(1.0, 0.3, 0.2), n_branches=2))
+    d = dm.Duct(spec_for(shape, origin=(1.0, 0.3, 0.2), mirror=True))
     for st in d.stations():
         want = float(d.areas.branch_area(st.dist / d.centreline.length_branch) if st.part == "branch"
                      else d.areas.trunk_area((st.dist - d.centreline.length_branch) / d.centreline.length_trunk))
@@ -69,8 +69,7 @@ def test_the_stations_run_from_the_inlet_centroid_to_the_face_centre():
 def test_the_first_station_is_the_sketched_opening_in_the_inlet_plane():
     shape = SectionShape.polygon(PENTAGON)
     plane = InletPlane((1.0, 0.3, 0.2), 8.0, 12.0)
-    d = dm.Duct(spec_for(shape, origin=plane.origin, n_branches=2).__class__(
-        plane, (key_for(shape),), FACE, AXIS, 0.5, n_branches=2))
+    d = dm.Duct(dm.single_spec(plane, (key_for(shape),), FACE, AXIS, 0.5, mirror=True))
     pts = d.inner_ring(d.branch[0])
     n = plane.normal
     assert np.abs((pts - plane.origin) @ n).max() < 1e-12  # in the plane
@@ -88,7 +87,7 @@ def test_the_last_station_is_the_circle_of_the_face_diameter_area():
 
 def test_a_key_section_in_the_middle_is_honoured():
     mid = ol.circle_shape(0.15)
-    d = dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.3, 0.2), n_branches=2,
+    d = dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.3, 0.2), mirror=True,
                          extra_keys=(key_for(mid, 0.3),)))
     st = min(d.branch[:-1], key=lambda s: abs(s.s - 0.3))
     ring = st.ring
@@ -115,7 +114,7 @@ def test_the_branch_and_trunk_frames_agree_at_the_junction_and_the_inlet_frame_i
     a, b = d.branch[-1], d.trunk[0]
     assert a.T == pytest.approx(b.T, abs=1e-9)  # G1
     assert a.U == pytest.approx(b.U, abs=1e-9) and a.V == pytest.approx(b.V, abs=1e-9)  # no twist at the join
-    u, v, n = d.spec.plane.frame()
+    u, v, n = d.branches[0].plane.frame()
     s0 = d.branch[0]
     assert s0.U == pytest.approx(u, abs=1e-9) and s0.V == pytest.approx(v, abs=1e-9) and s0.T == pytest.approx(-n)
 
@@ -123,7 +122,7 @@ def test_the_branch_and_trunk_frames_agree_at_the_junction_and_the_inlet_frame_i
 def test_the_branch_roll_is_removed_by_the_twist_correction_for_a_banked_inlet():
     shape = SectionShape.polygon(PENTAGON)
     plane = InletPlane((1.0, 0.8, 0.9), 25.0, 30.0)
-    d = dm.Duct(dm.DuctSpec(plane, (key_for(shape),), FACE, AXIS, 0.5, n_branches=2))
+    d = dm.Duct(dm.single_spec(plane, (key_for(shape),), FACE, AXIS, 0.5, mirror=True))
     a, b = d.branch[-1], d.trunk[0]
     assert a.V == pytest.approx(b.V, abs=1e-9)
     # the frame changes gradually along the branch (the twist is spread over its length)
@@ -139,8 +138,8 @@ def test_parallel_transport_keeps_a_frame_on_a_planar_curve_planar():
 
 # ---- area and G1 continuity at the junction ---------------------------------------------------------------------------------
 def test_the_trunk_starts_with_n_times_the_area_the_branch_ends_with():
-    for n in (1, 2, 3):
-        d = dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.3, 0.2), n_branches=n))
+    for mirror, n in ((False, 1), (True, 2)):
+        d = dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.3, 0.2), mirror=mirror))
         assert d.trunk[0].area == pytest.approx(n * d.branch[-1].area, rel=1e-6)  # the halves tile the section
         assert d.trunk[-1].area == pytest.approx(0.25 * math.pi * 0.25, rel=1e-9)
         assert d.centreline.branch.tangents([1.0])[0] == pytest.approx(d.centreline.trunk.tangents([0.0])[0], abs=1e-12)
@@ -148,7 +147,7 @@ def test_the_trunk_starts_with_n_times_the_area_the_branch_ends_with():
 
 def test_explicit_area_points_are_used():
     pts = AreaPoints(0.2, ((0.5, 0.12),), ((0.5, 0.21),))
-    d = dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.3, 0.2), n_branches=2, area_points=pts))
+    d = dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.3, 0.2), mirror=True, area_points=pts))
     mid_b = min(d.branch, key=lambda s: abs(s.dist / d.centreline.length_branch - 0.5))
     assert mid_b.area == pytest.approx(float(d.areas.branch_area(mid_b.dist / d.centreline.length_branch)))
     assert d.trunk[0].area == pytest.approx(0.2) and d.branch[-1].area == pytest.approx(0.1)
@@ -162,7 +161,7 @@ def polyline_distance(points, ring):
 @pytest.mark.parametrize("shape", [SectionShape.polygon(PENTAGON), mixed_shape(), ol.circle_shape(0.2)])
 def test_the_positive_is_the_inner_section_offset_by_the_wall_thickness_everywhere(shape):
     t = 0.01
-    d = dm.Duct(spec_for(shape, origin=(1.0, 0.3, 0.2), n_branches=2, wall_thickness=t))
+    d = dm.Duct(spec_for(shape, origin=(1.0, 0.3, 0.2), mirror=True, wall_thickness=t))
     for st in d.stations():
         inner, outer = st.ring, dm.offset_ring(st.ring, t)
         # no outer vertex is closer to the inner section than t ...
@@ -199,7 +198,7 @@ def test_an_offset_that_is_too_thick_for_the_curvature_is_detected():
 def test_the_bodies_are_closed_outward_oriented_solids():
     d = pentagon_to_circle()
     b = d.bodies()
-    assert set(b) == {f"{k}_{p}" for k in ("neg", "pos") for p in ("branch_R", "branch_L", "trunk")}
+    assert set(b) == {f"{k}_{p}" for k in ("neg", "pos") for p in ("branch_R", "branch_R_mirror", "trunk")}
     for name, body in b.items():
         assert body.mesh.n_open_edges == 0, name
         assert body.mesh.volume > 0.0, name  # positive volume = outward orientation
@@ -210,7 +209,7 @@ def test_the_negative_starts_exactly_lip_extension_upstream_and_shares_no_face_w
     lip = 0.07
     d = pentagon_to_circle(lip_extension=lip)
     b = d.bodies()
-    plane = d.spec.plane
+    plane = d.branches[0].plane
     n = plane.normal
     neg = b["neg_branch_R"]
     height = lambda pts: (np.asarray(pts) - plane.origin) @ n  # distance from the opening plane along +n (upstream)
@@ -251,7 +250,7 @@ def test_the_left_bodies_are_the_exact_mirror_image_of_the_right_ones():
     d = pentagon_to_circle(centreline=CentrelineParams(junction=(3.0, 0.9)))
     b = d.bodies()
     for kind in ("neg", "pos"):
-        r, l = b[f"{kind}_branch_R"], b[f"{kind}_branch_L"]
+        r, l = b[f"{kind}_branch_R"], b[f"{kind}_branch_R_mirror"]
         mirror = r.mesh.points * np.array([1.0, -1.0, 1.0])
         key = lambda p: p[np.lexsort(np.round(p, 10).T[::-1])]
         assert key(l.mesh.points) == pytest.approx(key(mirror), abs=1e-12)
@@ -359,13 +358,13 @@ def test_the_total_flow_area_is_continuous_across_the_junction_and_g1():
 def test_the_mirror_of_the_junction_is_exact():
     d = pentagon_to_circle()
     b = d.bodies()
-    r, l = b["neg_branch_R"], b["neg_branch_L"]
+    r, l = b["neg_branch_R"], b["neg_branch_R_mirror"]
     assert l.rings == pytest.approx(dm.mirrored(r.rings)[:, ::-1], abs=1e-15)
     assert l.dist == pytest.approx(r.dist)
 
 
 def test_a_single_inlet_has_no_split():
-    d = dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.0, 0.2), n_branches=1))
+    d = dm.Duct(spec_for(SectionShape.polygon(PENTAGON), origin=(1.0, 0.0, 0.2), mirror=False))
     assert d.branch_end_offset == pytest.approx(np.zeros(3)) and d.branch[-1].centre == pytest.approx(d.trunk[0].centre)
     assert d.branch[-1].area == pytest.approx(d.trunk[0].area, rel=1e-9)
 
@@ -406,7 +405,7 @@ def test_the_splitter_keeps_the_branch_negatives_apart_by_exactly_the_wall_thick
     d = pentagon_to_circle(wall_thickness=t, splitter_length=L, overlap=0.02)
     b = d.bodies()
     lb = d.centreline.length_branch
-    r, l = b["neg_branch_R"], b["neg_branch_L"]
+    r, l = b["neg_branch_R"], b["neg_branch_R_mirror"]
     into = r.dist > lb - 1e-12  # the junction ring and the half-sections inside the trunk
     assert into.sum() >= 3 and r.dist[-1] == pytest.approx(lb + L + 0.02)
     for ring_r, ring_l in zip(r.rings[into], l.rings[into]):

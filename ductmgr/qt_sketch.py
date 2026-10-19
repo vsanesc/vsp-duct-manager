@@ -413,7 +413,7 @@ class SketchCanvas(QtWidgets.QWidget):
         if op is None or shape is None:
             return
         plane = m.state.plane
-        if m.active_is_inlet:  # the left inlet (mirror image), projected into this plane and greyed
+        if m.active_is_inlet and m.has_twin(m.selected):  # the mirrored twin, projected into this plane and greyed
             ghost = plane.to_uv(plane.to_3d(op.outline) * np.array([1.0, -1.0, 1.0]))
             p.setPen(self._pen(GHOST_COLOR, 1.0, QtCore.Qt.PenStyle.DashLine))
             self._polyline(p, ghost, close=True)
@@ -524,6 +524,15 @@ class SketchDock(QtWidgets.QWidget):
         self.canvas.add_selection_listener(self.refresh)
         self.refresh()
 
+    def _set_title(self, text: str) -> None:
+        """The section title, led by the inlet's name when there are several, and noting a symmetric editor."""
+        m = self.model
+        if len(m.state.inlets) > 1:
+            text = f"{m.inlet.name}  |  {text}"
+        if m.symmetric_editing:
+            text += "  [mirror symmetric about u = 0: edit one side]"
+        self.title.setText(text)
+
     # ---- buttons -> model ------------------------------------------------------------------------------------------
     def _set_edge(self, kind: str) -> None:
         if self.canvas.selected_edge is not None:
@@ -553,14 +562,14 @@ class SketchDock(QtWidgets.QWidget):
             self.info.setText("")
             return
         if m.active_is_junction:
-            self.title.setText(f"Section s = {m.active_s:.3f}  -  junction: the branch end, exactly its half of the "
+            self._set_title(f"Section s = {m.active_s:.3f}  -  junction: the branch end, exactly its half of the "
                                "trunk start section (derived, fixed)")
         elif m.active_is_face:
-            self.title.setText("Section s = 1.000  -  engine face (fixed circle)")
+            self._set_title("Section s = 1.000  -  engine face (fixed circle)")
         elif m.active_is_inlet:
-            self.title.setText("Section s = 0.000  -  inlet (in the inlet plane, snaps to the skin)")
+            self._set_title("Section s = 0.000  -  inlet (in the inlet plane, snaps to the skin)")
         else:
-            self.title.setText(f"Section s = {m.active_s:.3f}  -  key section "
+            self._set_title(f"Section s = {m.active_s:.3f}  -  key section "
                                f"(shape is free, size is held at A(s) = {op.target_area:.5f} m²)")
         green, amber, red = "#4CAF50", "#E0A030", "#F85149"
         colour = green if abs(op.delta) <= 0.005 else amber

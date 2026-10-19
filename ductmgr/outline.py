@@ -483,3 +483,94 @@ def shape_from_config(data: dict, where: str = "section") -> SectionShape:
         else:
             handles.append(None)
     return SectionShape(tuple(_v(p) for p in raw), tuple(snapped), tuple(edges), tuple(handles), tuple(cont))
+
+
+# ---- mirror symmetry about u = 0 (a self-symmetric inlet keeps its sections symmetric) -----------------------------------
+SYMMETRY_TOL = 1e-6  # of the section size: vertices this close to each other's mirror image are partners
+
+
+def vertex_partners(shape: SectionShape, tol: float = SYMMETRY_TOL) -> list[int | None]:
+    """For every vertex the index of its mirror image about u = 0 (itself for a vertex on the axis), or None."""
+    pts = np.array(shape.vertices)
+    scale = max(float(np.ptp(pts, axis=0).max()), 1e-12)
+    out: list[int | None] = []
+    for i, (u, v) in enumerate(pts):
+        d = np.linalg.norm(pts - np.array([-u, v]), axis=1)
+        j = int(np.argmin(d))
+        out.append(j if d[j] <= tol * scale else None)
+    return out
+
+
+def is_mirror_symmetric(shape: SectionShape, tol: float = SYMMETRY_TOL) -> bool:
+    return all(p is not None for p in vertex_partners(shape, tol))
+
+
+def edge_partner(shape: SectionShape, partners: list[int | None], e: int) -> int | None:
+    """The edge that is the mirror image of edge ``e`` (it runs from the partner of e's end to the partner of its
+    start, so a mirror-symmetric edge is its own partner)."""
+    n = shape.n
+    a, b = partners[e], partners[(e + 1) % n]
+    if a is None or b is None or (b + 1) % n != a:
+        return None
+    return b
+
+
+def move_vertex_symmetric(shape: SectionShape, i: int, uv, flag: bool | None = None) -> SectionShape:
+    """Move vertex ``i`` of a symmetric shape and its mirror partner with it (a vertex on the axis stays on it)."""
+    partners = vertex_partners(shape)
+    j = partners[i]
+    u, v = float(uv[0]), float(uv[1])
+    if j is None:
+        out = move_vertex(shape, i, (u, v))
+    elif j == i:
+        out = move_vertex(shape, i, (0.0, v))
+    else:
+        out = move_vertex(move_vertex(shape, i, (u, v)), j, (-u, v))
+    if flag is not None:
+        snapped = list(out.snapped)
+        for k in {i, j} - {None}:
+            snapped[k] = bool(flag)
+        out = out.with_(snapped=tuple(snapped))
+    return out
+
+
+def move_handle_symmetric(shape: SectionShape, edge: int, which: int, uv) -> SectionShape:
+    """Drag a Bézier handle of a symmetric shape and the mirrored handle of its partner edge."""
+    ep = edge_partner(shape, vertex_partners(shape), edge)
+    out = move_handle(shape, edge, which, uv)
+    if ep is not None:
+        out = move_handle(out, ep, 1 - which, (-float(uv[0]), float(uv[1])))
+    return out
+
+
+def insert_vertex_symmetric(shape: SectionShape, edge: int, point) -> tuple[SectionShape, int]:
+    """Insert a vertex and its mirror image on the partner edge (on the axis when the edge is its own partner)."""
+    ep = edge_partner(shape, vertex_partners(shape), edge)
+    if ep is None:
+        return insert_vertex(shape, edge, point)
+    if ep == edge:
+        return insert_vertex(shape, edge, (0.0, float(point[1])))
+    out, at = insert_vertex(shape, edge, point)
+    pu, pv = out.vertices[at]
+    out, _ = insert_vertex(out, ep + 1 if ep > edge else ep, (-pu, pv))
+    return out, at
+
+
+def delete_vertex_symmetric(shape: SectionShape, i: int) -> SectionShape:
+    j = vertex_partners(shape)[i]
+    if j is None or j == i:
+        return delete_vertex(shape, i)
+    out = delete_vertex(shape, max(i, j))
+    return delete_vertex(out, min(i, j))
+
+
+def set_edge_type_symmetric(shape: SectionShape, edge: int, kind: str) -> SectionShape:
+    ep = edge_partner(shape, vertex_partners(shape), edge)
+    out = set_edge_type(shape, edge, kind)
+    return out if ep is None or ep == edge else set_edge_type(out, ep, kind)
+
+
+def set_continuity_symmetric(shape: SectionShape, i: int, mode: str) -> SectionShape:
+    j = vertex_partners(shape)[i]
+    out = set_continuity(shape, i, mode)
+    return out if j is None or j == i else set_continuity(out, j, mode)

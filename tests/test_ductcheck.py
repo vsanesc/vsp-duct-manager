@@ -27,14 +27,14 @@ def circle_key(r):
 
 def straight(z=0.0, r=0.25, wall=0.01, **kw):
     """A single-inlet duct of constant radius ``r`` flying straight at height z (inlet and face coincide in size)."""
-    spec = dm.DuctSpec(InletPlane((1.0, 0.0, z)), (circle_key(r),), np.array([6.0, 0.0, z]), AXIS, 2 * r,
-                       n_branches=1, wall_thickness=wall, **kw)
+    spec = dm.single_spec(InletPlane((1.0, 0.0, z)), (circle_key(r),), np.array([6.0, 0.0, z]), AXIS, 2 * r,
+                       mirror=False, wall_thickness=wall, **kw)
     return dm.Duct(spec)
 
 
 def s_duct(offset=1.0, r=0.25):
-    spec = dm.DuctSpec(InletPlane((1.0, 0.0, offset)), (circle_key(r),), np.array([6.0, 0.0, 0.0]), AXIS, 2 * r,
-                       n_branches=1)
+    spec = dm.single_spec(InletPlane((1.0, 0.0, offset)), (circle_key(r),), np.array([6.0, 0.0, 0.0]), AXIS, 2 * r,
+                       mirror=False)
     return dm.Duct(spec)
 
 
@@ -80,8 +80,8 @@ def test_a_positive_poking_out_along_the_whole_duct_is_an_unplanned_bump():
 
 
 def test_the_external_region_near_the_opening_is_intended_when_the_duct_dives():
-    spec = dm.DuctSpec(InletPlane((1.0, 0.0, 0.9)), (circle_key(0.1),), np.array([6.0, 0.0, 0.0]), AXIS, 0.2,
-                       n_branches=1, wall_thickness=0.02)
+    spec = dm.single_spec(InletPlane((1.0, 0.0, 0.9)), (circle_key(0.1),), np.array([6.0, 0.0, 0.0]), AXIS, 0.2,
+                       mirror=False, wall_thickness=0.02)
     d = dm.Duct(spec)
     c_short, _ = run(d, lip_length=0.15)
     assert c_short.external_unplanned and c_short.external_extent > 0.15
@@ -120,8 +120,8 @@ def test_the_clearance_applies_only_to_the_internal_part():
     assert any("between the negative and the skin" in v for _, v, _ in skimming.findings)
     # ... but the thin external lip alone is not
     prism = Solid(test_bodies.chined_prism(), "prism")
-    spec = dm.DuctSpec(InletPlane((1.0, 0.0, 0.41 - 0.1 * math.cos(math.radians(45))), 45.0), (circle_key(0.1),),
-                       np.array([3.0, 0.0, -0.3]), AXIS, 0.2, n_branches=1, wall_thickness=0.004)
+    spec = dm.single_spec(InletPlane((1.0, 0.0, 0.41 - 0.1 * math.cos(math.radians(45))), 45.0), (circle_key(0.1),),
+                       np.array([3.0, 0.0, -0.3]), AXIS, 0.2, mirror=False, wall_thickness=0.004)
     ok, _ = run(dm.Duct(spec), fuselage=prism, min_clearance=0.02)
     assert ok.external_area > 0.0  # the positive does leave the skin at the lip, with a wall of 4 mm < 20 mm ...
     assert ok.min_wall >= 0.02 and ok.wall_ok  # ... and that raises no clearance warning
@@ -139,11 +139,11 @@ def test_a_wall_too_thick_for_a_concave_section_is_an_error():
     star = ol.SectionShape.polygon([(0, 0.2), (-0.02, 0.03), (-0.2, 0), (-0.02, -0.03), (0, -0.2), (0.02, -0.03),
                                     (0.2, 0), (0.02, 0.03)])
     key = dm.KeyOutline(0.0, ol.build_outline(ol.edge_paths(star)[0]), np.array(star.vertices))
-    d = dm.Duct(dm.DuctSpec(InletPlane((1.0, 0.0, 0.0)), (key,), np.array([6.0, 0.0, 0.0]), AXIS, 0.5, n_branches=1,
+    d = dm.Duct(dm.single_spec(InletPlane((1.0, 0.0, 0.0)), (key,), np.array([6.0, 0.0, 0.0]), AXIS, 0.5, mirror=False,
                             wall_thickness=0.08))
     c, _ = run(d)
     assert any(lvl == "error" and "too large" in v for _, v, lvl in c.findings)
-    ok = dm.Duct(dm.DuctSpec(InletPlane((1.0, 0.0, 0.0)), (key,), np.array([6.0, 0.0, 0.0]), AXIS, 0.5, n_branches=1,
+    ok = dm.Duct(dm.single_spec(InletPlane((1.0, 0.0, 0.0)), (key,), np.array([6.0, 0.0, 0.0]), AXIS, 0.5, mirror=False,
                              wall_thickness=0.004))
     assert not any(lvl == "error" for _, _, lvl in run(ok)[0].findings)
 
@@ -204,8 +204,8 @@ def test_offset_over_length_curvature_and_cone_angles_are_reported():
 
 
 def test_the_cone_half_angle_limit_warns():
-    d = dm.Duct(dm.DuctSpec(InletPlane((1.0, 0.0, 0.0)), (circle_key(0.1),), np.array([2.0, 0.0, 0.0]), AXIS, 0.6,
-                            n_branches=1))
+    d = dm.Duct(dm.single_spec(InletPlane((1.0, 0.0, 0.0)), (circle_key(0.1),), np.array([2.0, 0.0, 0.0]), AXIS, 0.6,
+                            mirror=False))
     c, _ = run(d, max_half_angle_deg=2.0)
     assert c.half_angle_exceeded and any("half-angle exceeds" in v for _, v, _ in c.findings)
     ok, _ = run(d, max_half_angle_deg=60.0)
@@ -215,8 +215,8 @@ def test_the_cone_half_angle_limit_warns():
 def test_a_shrinking_area_law_is_flagged():
     from ductmgr.areacurve import AreaPoints
 
-    spec = dm.DuctSpec(InletPlane((1.0, 0.0, 0.0)), (circle_key(0.2),), np.array([6.0, 0.0, 0.0]), AXIS, 0.5,
-                       n_branches=1, area_points=AreaPoints(None, ((0.4, 0.2), (0.7, 0.05)), None))
+    spec = dm.single_spec(InletPlane((1.0, 0.0, 0.0)), (circle_key(0.2),), np.array([6.0, 0.0, 0.0]), AXIS, 0.5,
+                       mirror=False, area_points=AreaPoints(None, ((0.4, 0.2), (0.7, 0.05)), None))
     c, _ = run(dm.Duct(spec))
     assert "branch" in c.area_decreasing and any("A(s) decreases" in v for _, v, _ in c.findings)
 
