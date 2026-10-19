@@ -1239,7 +1239,7 @@ def test_the_readouts_list_the_duct_numbers_and_the_checks(cyl_model):
     assert "External region" not in rows  # the heavy checks are not computed behind the user's back
     m.ensure_built()
     rows = {r.label: r for r in m.readouts() if r.label}
-    for label in ("External region", "Wall left (min)", "Other Geoms", "Line of sight"):
+    for label in ("External region", "Wall left (internal)", "Other Geoms", "Line of sight"):
         assert label in rows
     m.live_checks = True
     m.set_wall_thickness(0.02)

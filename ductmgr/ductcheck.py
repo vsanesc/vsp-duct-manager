@@ -20,6 +20,7 @@ from ductmgr.solids import RayCaster, Solid
 DEFAULT_MIN_CLEARANCE = 0.02  # m, when checks.min_clearance is not configured
 DEFAULT_MAX_HALF_ANGLE_DEG = 6.0  # when checks.max_diffuser_half_angle_deg is not configured
 DEFAULT_LIP_LENGTH = 0.15  # m, when checks.lip_length is not configured
+COVERED_TOL = 1e-6  # m: a skin point deeper than this inside the positive is not on the outer boundary
 OUTSIDE_TOL = 1e-6  # m: a vertex further outside than this is outside the skin
 INSIDE_TOL = 1e-6  # m: a vertex deeper than this is inside another Geom
 LOS_GRID = 15  # face sample points per side (those inside the disc are used)
@@ -58,6 +59,7 @@ class DuctChecks:
     external_unplanned: bool = False
     min_wall: float | None = None
     wall_ok: bool | None = None
+    external_wall: float | None = None  # wall thickness measured where the positive is outside the skin
     intersections: list[str] = field(default_factory=list)
     los_x: float | None = None  # fraction of the face seen along +X through the opening
     los_n: float | None = None  # ... along the inlet normal
@@ -163,9 +165,14 @@ def external_region(duct: dm.Duct, bodies: dict, fuselage: Solid, c: DuctChecks,
 
 def wall_left(duct: dm.Duct, bodies: dict, fuselage: Solid, c: DuctChecks, s: CheckSettings,
               solids: BodySolids | None = None) -> None:
-    """The negative must lie fully inside (fuselage ∪ positive); report the wall left around it."""
-    worst = math.inf
+    """The negative must lie inside (fuselage ∪ positive), and ``checks.min_clearance`` applies to the INTERNAL
+    part only: the distance from the negative (the inner wall) to the skin where the positive is inside the skin.
+    Where the positive is outside the skin (the external region) the wall is ``wall_thickness`` by definition; it
+    is reported for information and never compared with the clearance."""
+    internal_min = math.inf
+    union_min = math.inf  # the wall of the union fuselage ∪ positive around the negative (negative = it leaves)
     solids = solids if solids is not None else BodySolids(bodies)
+    external_wall = math.inf
     for neg_name, pos_name in (("neg_branch_R", "pos_branch_R"), ("neg_trunk", "pos_trunk")):
         neg, pos = bodies[neg_name], bodies[pos_name]
         solid_p = solids[pos_name]
@@ -176,35 +183,52 @@ def wall_left(duct: dm.Duct, bodies: dict, fuselage: Solid, c: DuctChecks, s: Ch
         d_f = fuselage.signed(pts)
         d_p = solid_p.signed(pts)
         wall_f = -d_f
-        wall_p = np.where(d_p < 0.0, lateral_p.distance(pts), d_p * -1.0)
-        wall = np.maximum(wall_f, wall_p).reshape(r, n)
+        lat = lateral_p.distance(pts)
+        wall_p = np.where(d_p < 0.0, lat, -d_p)
+        union = np.maximum(wall_f, wall_p).reshape(r, n)
+        # A negative vertex is EXTERNAL when the nearest boundary of (fuselage ∪ positive) is the part of the
+        # positive outside the skin (the wall there is wall_thickness), INTERNAL when it is the skin itself.
+        flags = c.external_cells.get(pos_name)
+        if flags is not None and flags.any():
+            ext_surface = Solid(pos.mesh.extract_cells(np.flatnonzero(flags)).extract_surface(algorithm="dataset_surface"))
+            d_ext = ext_surface.distance(pts)
+        else:
+            d_ext = np.full(len(pts), np.inf)
+        # the skin only bounds the wall where it is not buried inside the positive
+        skin_pts = fuselage.closest_points(pts)
+        covered = solid_p.signed(skin_pts) < -COVERED_TOL
+        ext_vertex = ((d_f > 0.0) | covered | (d_ext <= wall_f)).reshape(r, n)
         # rings in the opening plane (the positive's start cap) and at the face (its end cap) are on a cap of the
-        # positive: only the wall around them counts, which the lateral distance already gives
-        first = 2 if neg_name == "neg_branch_R" else 1  # skip the upstream lip ring and the opening plane ring
+        # positive and are not part of the wall
+        lead = r - pos.rings.shape[0]  # negative rings upstream of the positive's first ring (the lip ring)
+        first = lead + 1 if neg_name == "neg_branch_R" else 1
         keep = np.ones(r, dtype=bool)
         keep[:first] = False
-        if neg_name == "neg_trunk":
-            keep[0] = False
         keep[-1] = False
-        keep_wall = wall[keep]
-        if keep_wall.size:
-            worst = min(worst, float(keep_wall.min()))
+        internal = keep[:, None] & ~ext_vertex
+        external = keep[:, None] & ext_vertex
+        if internal.any():
+            internal_min = min(internal_min, float((wall_f.reshape(r, n))[internal].min()))
+        if keep.any():
+            union_min = min(union_min, float(union[keep].min()))
+        if external.any():
+            external_wall = min(external_wall, float(d_ext.reshape(r, n)[external].min()))
         scalar = np.full(neg.mesh.n_points, np.inf)
-        full = np.where(keep[:, None], wall, np.nan)
-        scalar[: r * n] = np.nan_to_num(full, nan=np.inf).ravel()
-        scalar[r * n:] = np.inf
+        scalar[: r * n] = np.where(internal, wall_f.reshape(r, n), np.inf).ravel()
         c.wall_points[neg_name] = scalar
-    c.min_wall = None if math.isinf(worst) else worst
-    if c.min_wall is None:
-        return
-    c.wall_ok = c.min_wall >= s.min_clearance
-    if c.min_wall < 0.0:
-        c.add("Wall left (min)", f"{c.min_wall:.4f} m: the negative leaves (fuselage ∪ positive)", "error")
-    else:
-        c.add("Wall left (min)", f"{c.min_wall:.4f} m (limit {s.min_clearance:g} m)", "pass" if c.wall_ok else "warn")
-    if not c.wall_ok:
-        c.add("", f"WARN wall left around the negative {c.min_wall:.4f} m < checks.min_clearance "
-              f"({s.min_clearance:g} m)", "warn")
+    c.external_wall = None if math.isinf(external_wall) else external_wall
+    c.min_wall = None if math.isinf(internal_min) else internal_min
+    if not math.isinf(union_min) and union_min < 0.0:
+        c.add("Wall left (min)", f"{union_min:.4f} m: the negative leaves (fuselage ∪ positive)", "error")
+    if c.min_wall is not None:
+        c.wall_ok = c.min_wall >= s.min_clearance
+        c.add("Wall left (internal)", f"{c.min_wall:.4f} m to the skin (limit {s.min_clearance:g} m)",
+              "pass" if c.wall_ok else "warn")
+        if not c.wall_ok:
+            c.add("", f"WARN wall left between the negative and the skin {c.min_wall:.4f} m < checks.min_clearance "
+                  f"({s.min_clearance:g} m)", "warn")
+    if c.external_wall is not None:
+        c.add("Wall (external)", f"{c.external_wall:.4f} m = wall_thickness (not compared with min_clearance)")
 
 
 def other_geoms(bodies: dict, parts: list[Solid], c: DuctChecks, solids: BodySolids | None = None) -> None:

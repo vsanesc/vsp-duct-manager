@@ -66,7 +66,7 @@ ducts:
     junction_area: null            # m^2 at the junction (trunk start); each branch ends with half of it
     branch: null                   # interior control points [[s, area], ...], s = local arc length 0..1
     trunk: null
-  wall_thickness: 0.025            # m, the positive body is the inner section offset outward by this
+  wall_thickness: 0.004            # m, the positive body is the inner section offset outward by this
   lip_extension: 0.05              # m, the negative starts this far upstream of the opening plane
   lip_mode: blunt                  # lip shape of the positive at the opening ("blunt" for now)
   engine_face:

@@ -105,12 +105,34 @@ def test_the_wall_left_around_a_buried_duct_is_the_distance_to_the_skin():
     assert c.min_wall == pytest.approx(0.75, abs=0.01) and c.wall_ok
 
 
-def test_where_the_positive_is_outside_the_skin_the_wall_is_its_thickness():
-    thin, _ = run(straight(z=0.9, r=0.1, wall=0.01), min_clearance=0.02)
-    assert thin.min_wall == pytest.approx(0.01, abs=2e-3) and thin.wall_ok is False
-    assert any("min_clearance" in v for _, v, _ in thin.findings)
-    thick, _ = run(straight(z=0.9, r=0.1, wall=0.03), min_clearance=0.02)
-    assert thick.min_wall >= 0.02 and thick.wall_ok
+def test_the_external_wall_is_the_thickness_and_is_reported_separately():
+    c, _ = run(straight(z=0.9, r=0.1, wall=0.01), min_clearance=0.02)
+    assert c.external_wall == pytest.approx(0.01, abs=2e-3)
+    assert any(lbl == "Wall (external)" and "not compared" in v for lbl, v, _ in c.findings)
+    # a warning, if any, is about the internal wall (bore to skin), never about the external thickness
+    assert not any("min_clearance" in v and "skin" not in v for lbl, v, _ in c.findings if lbl != "Wall (external)")
+
+
+def test_the_clearance_applies_only_to_the_internal_part():
+    # a bore skimming the skin has a thin internal wall: that is a real warning ...
+    skimming, _ = run(straight(z=0.9, r=0.1, wall=0.004), min_clearance=0.02)
+    assert skimming.min_wall is not None and skimming.min_wall < 0.02 and skimming.wall_ok is False
+    assert any("between the negative and the skin" in v for _, v, _ in skimming.findings)
+    # ... but the thin external lip alone is not
+    prism = Solid(test_bodies.chined_prism(), "prism")
+    spec = dm.DuctSpec(InletPlane((1.0, 0.0, 0.41 - 0.1 * math.cos(math.radians(45))), 45.0), (circle_key(0.1),),
+                       np.array([3.0, 0.0, -0.3]), AXIS, 0.2, n_branches=1, wall_thickness=0.004)
+    ok, _ = run(dm.Duct(spec), fuselage=prism, min_clearance=0.02)
+    assert ok.external_area > 0.0  # the positive does leave the skin at the lip, with a wall of 4 mm < 20 mm ...
+    assert ok.min_wall >= 0.02 and ok.wall_ok  # ... and that raises no clearance warning
+    assert not any(lvl == "warn" and "clearance" in v for _, v, lvl in ok.findings)
+
+
+def test_the_example_config_has_independent_thickness_and_clearance():
+    from ductmgr.config import EXAMPLE_CONFIG, load_config
+
+    cfg = load_config(EXAMPLE_CONFIG)[0]
+    assert cfg["ducts"]["wall_thickness"] < cfg["checks"]["min_clearance"]
 
 
 def test_a_wall_too_thick_for_a_concave_section_is_an_error():

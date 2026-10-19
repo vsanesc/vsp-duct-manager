@@ -51,6 +51,12 @@ class Solid:
         out = pv.wrap(flt.GetOutput())
         return np.array(out.point_data["Implicit scalars"], dtype=float)
 
+    def closest_points(self, points) -> np.ndarray:
+        """The nearest point of the surface to each of ``points``."""
+        pts = np.atleast_2d(np.asarray(points, dtype=float))
+        _, closest = self.mesh.find_closest_cell(pts, return_closest_point=True)
+        return np.asarray(closest)
+
     def distance(self, points) -> np.ndarray:
         return np.abs(self.signed(points))
 

@@ -198,8 +198,10 @@ and the same undo history as the section editor, and the 3D view follows at once
   **(fuselage ∪ positives) − negatives**. The part of the positive outside the fuselage skin, the *external region*,
   is a result: it is drawn in orange and reported with its length and wetted area.
 - **Live checks** (readouts; the bodies turn red where they apply). The positive may leave the skin only within
-  `checks.lip_length` of the opening, otherwise WARN (an unplanned bump); the wall left around the negative inside
-  (fuselage ∪ positive) must be at least `checks.min_clearance`; neither body may intersect another Geom (the engine
+  `checks.lip_length` of the opening, otherwise WARN (an unplanned bump); `checks.min_clearance` applies only to the
+  internal part, the distance from the negative (the inner wall) to the skin where the positive is inside it; in the
+  external region the wall is `wall_thickness` by definition, reported separately and never compared with the
+  clearance; neither body may intersect another Geom (the engine
   is not one of them); the line of sight reports the % of the engine face seen straight through an opening along
   +X and along the inlet normal (0 % = hidden); offset / length, the maximum centreline curvature and the cone
   half-angle per part; A(s) must not decrease. The cheap numbers update with every edit; the bodies and the mesh
