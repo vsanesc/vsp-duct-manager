@@ -18,13 +18,18 @@ from pathlib import Path
 
 import numpy as np
 
-from ductmgr import area_law, sketch, vspio
+from ductmgr import area_law, areacurve, ductcheck, sketch, vspio
+from ductmgr import duct as dm
+from ductmgr import interp
 from ductmgr import outline as ol
+from ductmgr.areacurve import AreaCurves, AreaPoints
+from ductmgr.centreline import Centreline, CentrelineParams
 from ductmgr.config import PRIVATE_CONFIG, load_config, save_inlet_definition
 from ductmgr.engine import EngineSizingWarning, size_from_config
-from ductmgr.geometry import InletPlane, inlet_readout, sweep_for_edge_angle
+from ductmgr.geometry import InletPlane, inlet_readout, polygon_centroid, sweep_for_edge_angle
 from ductmgr.outline import SectionShape
 from ductmgr.section import Section, compute_section
+from ductmgr.solids import Solid
 
 MIN_ALIGN_PROJECTION = 0.2  # |n.X| below this blocks an edge alignment
 MIN_S_SEPARATION = 0.01  # key sections closer than this in s are refused
@@ -44,12 +49,29 @@ class KeySection:
     shape: SectionShape
 
 
+DEFAULT_WALL_THICKNESS = 0.005  # m, when ducts.wall_thickness is not configured
+DEFAULT_LIP_EXTENSION = 0.05  # m, when ducts.lip_extension (or the old ducts.inlet.lip_extension) is not configured
+HEAVY_KEYS = ("wall_thickness", "lip_extension")
+
+
+@dataclass(frozen=True)
+class DuctParams:
+    """The editable duct inputs besides the plane and the key sections (all part of the undo history)."""
+
+    centreline: CentrelineParams = CentrelineParams()
+    area: AreaPoints = AreaPoints()
+    wall_thickness: float = DEFAULT_WALL_THICKNESS
+    lip_extension: float = DEFAULT_LIP_EXTENSION
+    lip_mode: str = dm.DEFAULT_LIP_MODE
+
+
 @dataclass(frozen=True)
 class InletState:
     """Everything the undo history tracks."""
 
     plane: InletPlane | None  # None until an inlet has been placed
     sections: tuple[KeySection, ...]  # sorted by s; sections[0] is the inlet (s = 0) once placed
+    duct: DuctParams = DuctParams()
 
 
 @dataclass(frozen=True)
@@ -61,11 +83,15 @@ class Readout:
 
 @dataclass(frozen=True)
 class DuctsSettings:
-    """The ``ducts:`` values the area law needs."""
+    """The ``ducts:`` / ``checks:`` values that are not edited in the explorer."""
 
     law: str = area_law.DEFAULT_LAW
-    junction_point: tuple[float, float, float] | None = None
     junction_fraction: float = area_law.DEFAULT_JUNCTION_FRACTION
+    face_axis: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    n_stations_branch: int = 12
+    n_stations_trunk: int = 12
+    n_points: int = interp.DEFAULT_SAMPLES
+    checks: ductcheck.CheckSettings = ductcheck.CheckSettings()
 
 
 # ---- config <-> state -----------------------------------------------------------------------------------------
@@ -88,16 +114,71 @@ def legacy_notice(cfg: dict) -> str:
 
 def duct_settings(cfg: dict) -> DuctsSettings:
     ducts = cfg.get("ducts") or {}
-    point = (ducts.get("junction") or {}).get("point")
     law = ducts.get("area_law") or area_law.DEFAULT_LAW
     if law not in area_law.LAWS:
         raise ValueError(f"ducts.area_law must be one of {', '.join(area_law.LAWS)} (got {law!r})")
     fraction = ducts.get("junction_fraction")
+    axis = (ducts.get("engine_face") or {}).get("normal")
+    if axis is not None and not (isinstance(axis, (list, tuple)) and len(axis) == 3 and any(axis)):
+        raise ValueError("ducts.engine_face.normal must be a non-zero [x, y, z]")
+
+    def count(key, default, minimum):
+        v = ducts.get(key)
+        v = default if v is None else int(v)
+        if v < minimum:
+            raise ValueError(f"ducts.{key} must be at least {minimum}")
+        return v
+
     return DuctsSettings(
         law,
-        tuple(float(c) for c in point) if point is not None else None,
         area_law.DEFAULT_JUNCTION_FRACTION if fraction is None else float(fraction),
+        tuple(float(c) for c in axis) if axis is not None else (1.0, 0.0, 0.0),
+        count("n_stations_branch", 12, 2),
+        count("n_stations_trunk", 12, 2),
+        count("n_section_points", interp.DEFAULT_SAMPLES, 8),
+        ductcheck.CheckSettings.from_config(cfg),
     )
+
+
+def duct_params_from_config(cfg: dict) -> DuctParams:
+    ducts = cfg.get("ducts") or {}
+    c = ducts.get("centreline") or {}
+    if not isinstance(c, dict):
+        raise ValueError("ducts.centreline must be a mapping")
+
+    def opt(key):
+        v = c.get(key)
+        return None if v is None else float(v)
+
+    point = (ducts.get("junction") or {}).get("point")
+    junction = None
+    if point is not None:
+        if not (isinstance(point, (list, tuple)) and len(point) == 3):
+            raise ValueError("ducts.junction.point must be [x, y, z]")
+        junction = (float(point[0]), float(point[2]))  # the junction lies on y = 0
+    fraction = c.get("handle_fraction")
+    centreline = CentrelineParams(
+        junction, opt("junction_pitch_deg"), opt("start_handle"), opt("junction_in_handle"),
+        opt("junction_out_handle"), opt("end_handle"),
+        CentrelineParams().handle_fraction if fraction is None else float(fraction),
+    )
+    wall = ducts.get("wall_thickness")
+    lip = ducts.get("lip_extension")
+    if lip is None:
+        lip = (ducts.get("inlet") or {}).get("lip_extension")  # the old location
+    params = DuctParams(
+        centreline, areacurve.points_from_config(ducts.get("area_points")),
+        DEFAULT_WALL_THICKNESS if wall is None else float(wall),
+        DEFAULT_LIP_EXTENSION if lip is None else float(lip),
+        ducts.get("lip_mode") or dm.DEFAULT_LIP_MODE,
+    )
+    if params.wall_thickness <= 0.0:
+        raise ValueError("ducts.wall_thickness must be positive")
+    if params.lip_extension < 0.0:
+        raise ValueError("ducts.lip_extension must not be negative")
+    if params.lip_mode not in dm.LIP_MODES:
+        raise ValueError(f"ducts.lip_mode must be one of {', '.join(dm.LIP_MODES)} (got {params.lip_mode!r})")
+    return params
 
 
 def parse_key_sections(raw) -> tuple[KeySection, ...]:
@@ -124,8 +205,9 @@ def state_from_config(cfg: dict) -> InletState:
     ducts = cfg.get("ducts") or {}
     inlet = ducts.get("inlet") or {}
     origin = inlet.get("origin")
+    params = duct_params_from_config(cfg)
     if origin is None:
-        return InletState(None, ())
+        return InletState(None, (), params)
     if not (isinstance(origin, (list, tuple)) and len(origin) == 3):
         raise ValueError("ducts.inlet.origin must be [x, y, z]")
     plane = InletPlane(
@@ -134,12 +216,23 @@ def state_from_config(cfg: dict) -> InletState:
     plane.frame()  # validates the angles
     raw = ducts.get("key_sections")
     if raw is not None:
-        return InletState(plane, parse_key_sections(raw))
+        return InletState(plane, parse_key_sections(raw), params)
     if inlet.get("vertices") is not None:  # the old 5-vertex format: a straight-edged inlet section
         flags = inlet.get("snapped")
         data = {"vertices": inlet["vertices"], "snapped": flags}
-        return InletState(plane, (KeySection(0.0, ol.shape_from_config(data, "ducts.inlet")),))
-    return InletState(plane, ())
+        return InletState(plane, (KeySection(0.0, ol.shape_from_config(data, "ducts.inlet")),), params)
+    return InletState(plane, (), params)
+
+
+class _Plan:
+    """Centreline (None when the engine face is unknown), area curves and the junction's arc-length fraction."""
+
+    def __init__(self, centreline, areas, s_junction):
+        self.centreline, self.areas, self.s_junction = centreline, areas, s_junction
+
+
+PLAN_CACHE_SIZE = 16
+MIN_AREA_FRACTION = 0.01  # a dragged area control point never goes below this fraction of the face area
 
 
 class InletModel:
@@ -155,7 +248,11 @@ class InletModel:
         self._last_key: str | None = None
         self._last_time = -1e9
         self._section_cache: tuple[InletPlane, Section | None] | None = None
+        self._plan_cache: dict = {}
+        self._built: dict = {}  # state-keyed cache of the Duct, its bodies and checks
+        self._solids: dict = {}
         self.mode = MODE_VIEW
+        self.live_checks = False  # the window turns this on to show a pending note for the heavy checks
         self.locked = False
         self.message = ""
         self.notice = legacy_notice(cfg)
@@ -250,15 +347,53 @@ class InletModel:
 
     @property
     def junction_s(self) -> float:
-        plane = self.state.plane
-        origin = plane.origin if plane else (0.0, 0.0, 0.0)
-        return area_law.junction_s(origin, self.scene.face_center, self.settings.junction_point,
-                                   self.settings.junction_fraction)
+        """Where the branches merge along the path (arc-length fraction); from the centreline when it can be built."""
+        plan = self._plan()
+        return plan.s_junction
 
     def area_at(self, s: float) -> float:
         """A(s), the in-plane area every key section is held to."""
-        return area_law.section_area(s, self.inlet_plane_area, self.face_area, self.junction_s, self.settings.law,
-                                     self.n_branches)
+        return float(self._plan().areas.area(s, self.junction_s)[0])
+
+    @property
+    def areas(self) -> AreaCurves:
+        return self._plan().areas
+
+    @property
+    def centreline(self) -> Centreline | None:
+        return self._plan().centreline
+
+    def _plan(self, state: InletState | None = None):
+        """The centreline and the area curves for ``state``. They depend only on the plane, the inlet sketch and
+        the duct parameters, so editing another key section does not recompute them."""
+        st = state or self.state
+        if st.plane is None:
+            return _Plan(None, AreaCurves(1.0, 1.0, st.duct.area, self.settings.law, self.n_branches), 0.5)
+        shape0 = st.sections[0].shape if st.sections else None
+        key = (st.plane, shape0, st.duct.centreline, st.duct.area, self.settings, self.scene.face_diameter,
+               None if self.scene.face_center is None else tuple(np.asarray(self.scene.face_center).tolist()))
+        hit = self._plan_cache.get(key)
+        if hit is None:
+            op = self._evaluate_inlet(st.plane, shape0)
+            areas = AreaCurves(op.area_plane if op else self.inlet_plane_area, self.face_area, st.duct.area,
+                               self.settings.law, self.n_branches)
+            centreline, s_j = None, self.settings.junction_fraction
+            if op is not None and self.scene.face_center is not None:
+                ring0 = interp.resample(op.outline, np.array(shape0.vertices), self.settings.n_points)
+                start = st.plane.to_3d([polygon_centroid(ring0)])[0]
+                centreline = Centreline(start, -st.plane.normal, self.scene.face_center, self.settings.face_axis,
+                                        st.duct.centreline, self.settings.junction_fraction)
+                s_j = centreline.s_junction
+            hit = _Plan(centreline, areas, s_j)
+            if len(self._plan_cache) > PLAN_CACHE_SIZE:
+                self._plan_cache.clear()
+            self._plan_cache[key] = hit
+        return hit
+
+    def _evaluate_inlet(self, plane, shape0):
+        if shape0 is None:
+            return None
+        return sketch.evaluate(shape0, self._section_for(plane), plane, self.area)
 
     def face_shape(self) -> SectionShape:
         """The engine face (s = 1): a circle of the face diameter, fixed."""
@@ -337,13 +472,12 @@ class InletModel:
             secs.insert(0, KeySection(0.0, sketch.default_sketch(section, state.plane, self.area)))
         else:
             secs[0] = KeySection(0.0, sketch.resnap(secs[0].shape, section))
-        a_in = self.area / max(state.plane.projection_factor, 1e-6)
-        s_j = area_law.junction_s(state.plane.origin, self.scene.face_center, self.settings.junction_point,
-                                  self.settings.junction_fraction)
+        base = replace(state, sections=tuple(secs))
+        plan = self._plan(base)
         for k in range(1, len(secs)):
-            target = area_law.section_area(secs[k].s, a_in, self.face_area, s_j, self.settings.law, self.n_branches)
+            target = float(plan.areas.area(secs[k].s, plan.s_junction)[0])
             secs[k] = KeySection(secs[k].s, sketch.rescale_to_area(secs[k].shape, target))
-        return InletState(state.plane, tuple(secs))
+        return replace(state, sections=tuple(secs))
 
     def _recompute(self) -> None:
         st = self.state
@@ -572,6 +706,177 @@ class InletModel:
         self._notify()
         return True
 
+    # ---- centreline, area law and wall: the duct parameters ---------------------------------------------------------------------
+    def _set_duct(self, duct: DuctParams, key: str | None, text: str = "") -> bool:
+        """Replace the duct parameters (one undo step; consecutive edits with the same ``key`` merge). The key
+        sections are held at the new area law in the same step."""
+        if not self.placed:
+            self._say("Place the inlet first")
+            self._notify()
+            return False
+        return self._changed(self._commit(self._normalised(replace(self.state, duct=duct)), key), text)
+
+    CENTRELINE_KEYS = ("junction", "junction_pitch_deg", "start_handle", "junction_in_handle", "junction_out_handle",
+                       "end_handle")
+
+    def set_centreline(self, key: str | None = "centreline", **changes) -> bool:
+        """Change centreline parameters (junction, junction_pitch_deg, start_handle, junction_in_handle,
+        junction_out_handle, end_handle); ``None`` returns a value to its default."""
+        for name, value in changes.items():
+            if name not in self.CENTRELINE_KEYS:
+                raise KeyError(name)
+            if name.endswith("_handle") and value is not None and value < 0.0:
+                self._say("A handle length cannot be negative")
+                self._notify()
+                return False
+        cl = self.state.duct.centreline.with_(**changes)
+        return self._set_duct(replace(self.state.duct, centreline=cl), key)
+
+    def reset_centreline(self) -> bool:
+        """Handles and tangent back to their defaults (1/3 of the chord, aimed at the face); the junction stays."""
+        old = self.state.duct.centreline
+        cl = CentrelineParams(old.junction, handle_fraction=old.handle_fraction)
+        return self._set_duct(replace(self.state.duct, centreline=cl), None, "Centreline reset")
+
+    def drag_junction(self, x: float, z: float) -> bool:
+        if self.locked:
+            self._say("Inlet is locked")
+            self._notify()
+            return False
+        return self.set_centreline("junction", junction=(float(x), float(z)))
+
+    def set_area_points(self, points: AreaPoints, key: str | None = "area") -> bool:
+        try:
+            AreaCurves(self.areas.a_in, self.face_area, points, self.settings.law, self.n_branches)
+        except ValueError as exc:
+            self._say(str(exc))
+            self._notify()
+            return False
+        return self._set_duct(replace(self.state.duct, area=points), key)
+
+    def _interior(self, curve: str) -> list:
+        return list(self.areas.branch_interior if curve == "branch" else self.areas.trunk_interior)
+
+    def area_move_point(self, curve: str, index: int, s: float, area: float) -> bool:
+        """Drag interior control point ``index`` of ``curve`` ("branch" or "trunk"), kept between its neighbours."""
+        interior = self._interior(curve)
+        gap = areacurve.MIN_S_GAP
+        lo = interior[index - 1][0] + gap if index > 0 else gap
+        hi = interior[index + 1][0] - gap if index + 1 < len(interior) else 1.0 - gap
+        interior[index] = (min(max(float(s), lo), hi), max(float(area), MIN_AREA_FRACTION * self.face_area))
+        return self.set_area_points(self.areas.with_interior(curve, interior), f"area:{curve}:{index}")
+
+    def area_add_point(self, curve: str, s: float, area: float | None = None) -> bool:
+        interior = self._interior(curve)
+        fn = self.areas.branch_area if curve == "branch" else self.areas.trunk_area
+        gap = areacurve.MIN_S_GAP
+        if not gap <= s <= 1.0 - gap or any(abs(s - p[0]) < gap for p in interior):
+            self._say("Not added: too close to another control point or to an end")
+            self._notify()
+            return False
+        interior.append((float(s), float(fn(s)) if area is None else float(area)))
+        return self.set_area_points(self.areas.with_interior(curve, interior), None)
+
+    def area_remove_point(self, curve: str, index: int) -> bool:
+        interior = self._interior(curve)
+        if not 0 <= index < len(interior):
+            return False
+        del interior[index]
+        return self.set_area_points(self.areas.with_interior(curve, interior), None)
+
+    def area_set_junction(self, area: float) -> bool:
+        floor = MIN_AREA_FRACTION * self.face_area
+        return self.set_area_points(self.areas.with_junction_area(max(float(area), floor)), "area:junction")
+
+    def reset_area(self) -> bool:
+        return self.set_area_points(AreaPoints(), None)
+
+    def set_wall_thickness(self, value: float) -> bool:
+        if value <= 0.0:
+            self._say("The wall thickness must be positive")
+            self._notify()
+            return False
+        return self._set_duct(replace(self.state.duct, wall_thickness=float(value)), "wall_thickness")
+
+    def set_lip_extension(self, value: float) -> bool:
+        if value < 0.0:
+            self._say("The lip extension cannot be negative")
+            self._notify()
+            return False
+        return self._set_duct(replace(self.state.duct, lip_extension=float(value)), "lip_extension")
+
+    # ---- bodies and checks (heavy: built on demand and cached per state) -----------------------------------------------------------
+    @property
+    def can_build(self) -> bool:
+        return self.placed and self.scene.face_center is not None and self.valid
+
+    def duct_spec(self) -> dm.DuctSpec | None:
+        if not self.can_build:
+            return None
+        st = self.state
+        keys = tuple(dm.KeyOutline(ks.s, ev.outline, np.array(ks.shape.vertices))
+                     for ks, ev in zip(st.sections, self.evaluations))
+        return dm.DuctSpec(
+            st.plane, keys, np.asarray(self.scene.face_center, dtype=float), np.asarray(self.settings.face_axis),
+            self.scene.face_diameter, st.duct.centreline, st.duct.area, self.settings.law, self.n_branches,
+            self.settings.n_stations_branch, self.settings.n_stations_trunk, self.settings.n_points,
+            st.duct.wall_thickness, st.duct.lip_extension, st.duct.lip_mode, self.settings.junction_fraction,
+            self.evaluations[0].area_plane)
+
+    @property
+    def duct(self) -> dm.Duct | None:
+        """The stations (cheap): built for the current state on first use."""
+        if self._built.get("state") is not self.state:
+            self._built = {"state": self.state}
+        if "duct" not in self._built:
+            spec = self.duct_spec()
+            try:
+                self._built["duct"] = dm.Duct(spec) if spec is not None else None
+                self._built["error"] = ""
+            except ValueError as exc:
+                self._built["duct"], self._built["error"] = None, str(exc)
+        return self._built["duct"]
+
+    @property
+    def duct_error(self) -> str:
+        _ = self.duct
+        return self._built.get("error", "")
+
+    def _solid(self, key, make):
+        if key not in self._solids:
+            self._solids[key] = make()
+        return self._solids[key]
+
+    def fuselage_solid(self) -> Solid:
+        return self._solid("fuselage", lambda: Solid(self.scene.fuselage, "fuselage"))
+
+    def other_solids(self) -> list[Solid]:
+        parts = getattr(self.scene, "context_parts", None) or []
+        return [self._solid(("part", k), lambda m=m, n=n: Solid(m, n)) for k, (n, m) in enumerate(parts)]
+
+    @property
+    def checks_current(self) -> bool:
+        return self._built.get("state") is self.state and "checks" in self._built
+
+    def ensure_built(self) -> bool:
+        """Build the bodies and run the checks for the current state (cached). False when there is no duct."""
+        duct = self.duct
+        if duct is None:
+            return False
+        if "checks" not in self._built:
+            checks, bodies = ductcheck.run_checks(duct, self.fuselage_solid(), self.other_solids(),
+                                                  self.settings.checks)
+            self._built["checks"], self._built["bodies"] = checks, bodies
+        return True
+
+    @property
+    def bodies(self) -> dict | None:
+        return self._built["bodies"] if self.ensure_built() else None
+
+    @property
+    def checks(self) -> "ductcheck.DuctChecks | None":
+        return self._built["checks"] if self.ensure_built() else None
+
     # ---- aligning the plane to an edge ---------------------------------------------------------------------------------
     def wing_edge(self, wing_index: int, edge: str) -> vspio.EdgeSweep:
         """The planform edge sweep of a wing in the section that spans the inlet's y."""
@@ -668,6 +973,25 @@ class InletModel:
         """What Save writes to ``ducts.key_sections``: every key section, the inlet first."""
         return [{"s": float(ks.s), **ol.shape_to_config(ks.shape)} for ks in self.state.sections]
 
+    def ducts_definition(self) -> dict:
+        """What Save writes besides the plane and the key sections: junction, centreline handles, area points,
+        wall thickness and lip."""
+        d, cl = self.state.duct, self.state.duct.centreline
+        out = {
+            "wall_thickness": float(d.wall_thickness),
+            "lip_extension": float(d.lip_extension),
+            "lip_mode": d.lip_mode,
+            "centreline": {
+                "junction_pitch_deg": cl.junction_pitch_deg, "start_handle": cl.start_handle,
+                "junction_in_handle": cl.junction_in_handle, "junction_out_handle": cl.junction_out_handle,
+                "end_handle": cl.end_handle, "handle_fraction": float(cl.handle_fraction),
+            },
+            "area_points": areacurve.points_to_config(d.area),
+        }
+        if cl.junction is not None:
+            out["junction"] = {"point": [float(cl.junction[0]), 0.0, float(cl.junction[1])]}
+        return out
+
     def save(self) -> bool:
         definition = self.inlet_definition()
         if self.save_target is None:
@@ -680,7 +1004,8 @@ class InletModel:
         else:
             try:
                 path = save_inlet_definition(definition, self.save_target, self.key_sections_definition(),
-                                             remove_inlet_keys=("vertices", "snapped"))
+                                             remove_inlet_keys=("vertices", "snapped", "lip_extension"),
+                                             ducts_values=self.ducts_definition())
             except OSError as exc:
                 self._say(f"Save failed: {exc}")
             else:
@@ -710,6 +1035,8 @@ class InletModel:
         self.notice = legacy_notice(cfg)
         self.alignment = None
         self._section_cache = None  # the capture area (hence the default sketch) may have changed
+        self._plan_cache.clear()
+        self._built = {}
         normalised = self._normalised(stored)
         self._commit(normalised)
         self._recompute()
@@ -720,6 +1047,34 @@ class InletModel:
         return True
 
     # ---- readouts -------------------------------------------------------------------------------------------------------
+    def duct_readouts(self) -> list[Readout]:
+        """The duct lines: cheap numbers always, the heavy checks once they have been computed for this state."""
+        out: list[Readout] = []
+        if self.scene.face_center is None:
+            return out
+        if self.duct_error:
+            return [Readout("Duct", f"ERROR {self.duct_error}", "error")]
+        duct = self.duct
+        if duct is None:
+            return out
+        cl, areas = duct.centreline, duct.areas
+        out += [
+            Readout("Junction", f"x {cl.junction[0]:.4f}  z {cl.junction[2]:.4f} m  (s = {cl.s_junction:.3f})"),
+            Readout("Path length", f"branch {cl.length_branch:.4f} m + trunk {cl.length_trunk:.4f} m"),
+            Readout("Area junction", f"{areas.junction_area:.5f} m^2 = {self.n_branches} x {areas.junction_area / self.n_branches:.5f}"),
+        ]
+        checks = self._built["checks"] if self.checks_current else None
+        if checks is None:
+            cheap = ductcheck.DuctChecks()
+            ductcheck.numbers(duct, cheap, self.settings.checks)
+            findings = cheap.findings
+        else:
+            findings = checks.findings
+        out += [Readout(label, value, level) for label, value, level in findings]
+        if checks is None and self.live_checks:
+            out.append(Readout("Body checks", "updating...", "info"))
+        return out
+
     def readouts(self) -> list[Readout]:
         """Lines for the read-only panel; ``level`` drives the colour (PASS green, WARN amber, ERROR red)."""
         out: list[Readout] = []
@@ -778,4 +1133,4 @@ class InletModel:
         for ks, ev in zip(self.state.sections, self.evaluations):
             out += [Readout("", f"ERROR: s = {ks.s:g}: {e}", "error") for e in ev.errors]
         out += [Readout("", f"WARN {w}", "warn") for w in op.warnings]
-        return out + tail
+        return out + self.duct_readouts() + tail

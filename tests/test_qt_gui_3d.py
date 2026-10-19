@@ -16,7 +16,7 @@ if not os.environ.get("DUCTMGR_GUI_TESTS"):
 import copy  # noqa: E402
 
 import numpy as np  # noqa: E402
-from PySide6 import QtWidgets  # noqa: E402
+from PySide6 import QtCore, QtWidgets  # noqa: E402
 
 from ductmgr.explore_model import InletModel  # noqa: E402
 from ductmgr.qt_explorer import CLICK_TOLERANCE_PX, ExploreWindow  # noqa: E402
@@ -156,3 +156,30 @@ def test_the_embedded_view_renders_the_dark_scene(gui):
     image = win.plotter.screenshot(return_img=True)
     assert image.shape[2] == 3 and (image != image[0, 0]).any()
     assert tuple(image[0, 0]) == (0x15, 0x18, 0x1C)
+
+
+def test_the_3d_view_follows_the_2d_centreline_editor_and_builds_the_bodies_after_a_pause(gui):
+    app, win, model = gui
+    win.act_place.trigger()
+    click(win, display_of(win.plotter, [3.0, 0.4, top_of(model, 3.0, 0.4)]))
+    acts = win.plotter.renderer.actors
+    for name in ("cl_right", "cl_left", "cl_trunk"):
+        assert name in acts  # drawn at once, before the bodies
+    before = np.asarray(acts["cl_trunk"].GetMapper().GetInput().points).copy()
+    c = win.canvas_side
+    c.resize(700, 300)
+    c.fit_view()
+    c.press(c.to_screen(c.handles()["junction"]))
+    c.move(c.to_screen((3.9, 0.9)))
+    c.release()
+    after = np.asarray(win.plotter.renderer.actors["cl_trunk"].GetMapper().GetInput().points)
+    assert np.abs(after - before).max() > 0.05  # the 3D centreline moved with the 2D drag
+    assert not any(n.startswith("duct_") for n in win.plotter.renderer.actors)
+    for _ in range(40):  # let the pause timer fire
+        app.processEvents()
+        if model.checks_current:
+            break
+        QtCore.QThread.msleep(30)
+    assert model.checks_current
+    for name in ("duct_neg_trunk", "duct_pos_trunk", "duct_neg_branch_R", "duct_pos_branch_L"):
+        assert name in win.plotter.renderer.actors

@@ -644,3 +644,78 @@ def test_undo_restores_the_list_after_an_add(make_window, monkeypatch):
     w.btn_add_section.click()
     w.act_undo.trigger()
     assert len(list_rows(w)) == 2 and w.model.active == 0
+
+
+# ---- Phase 3b: the duct tabs, wall / lip, heavy refresh ----------------------------------------------------------
+def test_the_duct_tabs_and_the_wall_group_exist(make_window):
+    w = make_window()
+    w.show()
+    assert [w.tabs.tabText(i) for i in range(3)] == ["Side (x-z)", "Top (x-y)", "Area law A(s)"]
+    assert w.canvas_side.view == "side" and w.canvas_top.view == "top"
+    assert w.act_paths.isChecked() and not w.paths_dock.isHidden()
+    w.act_paths.trigger()
+    assert w.paths_dock.isHidden()
+    cfg = w.model.state.duct
+    assert w.spin_wall.value() == pytest.approx(cfg.wall_thickness) and w.spin_lip.value() == pytest.approx(cfg.lip_extension)
+    assert w.lbl_lip_mode.text() == "blunt"
+
+
+def test_the_wall_and_lip_boxes_edit_the_model_and_undo(make_window):
+    w = make_window()
+    w.spin_wall.setValue(0.0123)
+    w.spin_lip.setValue(0.078)
+    assert w.model.state.duct.wall_thickness == pytest.approx(0.0123) and w.model.state.duct.lip_extension == pytest.approx(0.078)
+    assert w.model.dirty and w.windowTitle().endswith("*")
+    w.act_undo.trigger()
+    w.act_undo.trigger()
+    assert w.spin_wall.value() != pytest.approx(0.0123) or w.spin_lip.value() != pytest.approx(0.078)
+
+
+def test_the_reset_buttons(make_window):
+    w = make_window()
+    w.model.set_centreline("t", start_handle=0.9)
+    w.model.area_move_point("branch", 0, 0.25, 0.1)
+    w.btn_reset_cl.click()
+    w.btn_reset_area.click()
+    assert w.model.state.duct.centreline.start_handle is None and w.model.state.duct.area.branch is None
+
+
+def test_2d_edits_and_the_model_stay_in_step(make_window):
+    w = make_window()
+    c = w.canvas_side
+    c.resize(700, 300)
+    c.fit_view()
+    start = c.to_screen(c.handles()["junction"])
+    c.press(start)
+    c.move(c.to_screen((3.7, 0.4)))
+    c.release()
+    assert w.model.state.duct.centreline.junction == pytest.approx((3.7, 0.4))
+    assert w.windowTitle().endswith("*")
+    assert any(r.label == "Junction" and "3.7000" in r.value for r in w.model.readouts())
+
+
+def test_the_heavy_checks_are_deferred_then_refreshed(make_window):
+    w = make_window()
+    w.model.set_wall_thickness(0.02)
+    assert w._heavy_timer.isActive() and not w.model.checks_current  # not computed during the edit
+    assert "updating" in w.readout_view.toPlainText()
+    w.refresh_heavy()
+    assert w.model.checks_current
+    text = w.readout_view.toPlainText()
+    assert "External region" in text and "Line of sight" in text and "updating" not in text
+
+
+def test_a_failing_check_does_not_take_the_window_down(make_window, monkeypatch):
+    w = make_window()
+
+    def boom():
+        raise RuntimeError("mesh trouble")
+
+    monkeypatch.setattr(w.model, "ensure_built", boom)
+    w.refresh_heavy()
+    assert "mesh trouble" in w.message_label.text()
+
+
+def test_no_duct_widgets_are_active_before_the_inlet_is_placed(make_window, example_env):
+    w = make_window(cfg=unplaced(example_env))
+    assert not w.spin_wall.isEnabled() and not w.btn_reset_cl.isEnabled() and not w._heavy_timer.isActive()

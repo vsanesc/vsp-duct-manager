@@ -17,6 +17,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from ductmgr import vspio
 from ductmgr.explore_model import MIN_ALIGN_PROJECTION, MODE_PLACING, InletModel, Readout
 from ductmgr.geometry import InletPlane, sweep_for_edge_angle
+from ductmgr.qt_paths import AreaCanvas, PathCanvas
 from ductmgr.qt_sketch import SketchDock
 from ductmgr.viz import ACCENT, BACKGROUND, Scene, SceneView
 
@@ -36,6 +37,10 @@ PITCH_RANGE_DEG = (-85.0, 85.0)
 SWEEP_RANGE_DEG = (-90.0, 90.0)
 CLICK_TOLERANCE_PX = 4  # a press-release further apart than this is a camera drag, not a click
 SECTION_LIST_HEIGHT = 110
+PATHS_HEIGHT = 300  # the 2D duct tabs dock at the bottom
+HEAVY_DELAY_MS = 150  # bodies and checks are rebuilt this long after the last change (the rest updates at once)
+WALL_RANGE_M = (0.0005, 0.2)
+LIP_RANGE_M = (0.0, 0.5)
 NEW_SECTION_S = 0.5  # the s suggested for a new key section
 MANUAL_ANGLE_DEFAULT_DEG = 30.0  # the edge picker's starting manual angle
 COLORS = {"info": "#C9D1D9", "pass": "#4CAF50", "warn": "#E0A030", "error": "#F85149"}  # readout text colours
@@ -265,6 +270,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self._build_actions()
         self._build_panel()
         self._build_sketch_dock()
+        self._build_paths_dock()
         self._build_toolbar()
         self._build_status_bar()
         self.model.add_listener(self.sync)
@@ -337,6 +343,10 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.act_sketch.setText("Sketch")
         self.act_sketch.setToolTip("Show / hide the section sketcher")
         bar.addAction(self.act_sketch)
+        self.act_paths = self.paths_dock.toggleViewAction()
+        self.act_paths.setText("Duct tabs")
+        self.act_paths.setToolTip("Show / hide the side / top / area law editors")
+        bar.addAction(self.act_paths)
 
     def _spin(self, lo, hi, step, decimals=3, suffix="") -> FocusSpinBox:
         box = FocusSpinBox()
@@ -404,6 +414,28 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.grp_position.form.addRow(self.btn_align)
         col.addWidget(self.grp_position)
 
+        # Duct walls
+        self.grp_duct = CollapsibleGroup("Duct walls")
+        self.spin_wall = self._spin(*WALL_RANGE_M, 0.001, decimals=4, suffix=" m")
+        self.spin_wall.setToolTip("Thickness of the positive body around the inner section (ducts.wall_thickness)")
+        self.spin_lip = self._spin(*LIP_RANGE_M, 0.005, decimals=3, suffix=" m")
+        self.spin_lip.setToolTip("How far the negative starts upstream of the opening plane (ducts.lip_extension)")
+        self.spin_wall.valueChanged.connect(lambda v: self._on_duct("wall", v))
+        self.spin_lip.valueChanged.connect(lambda v: self._on_duct("lip", v))
+        self.lbl_lip_mode = QtWidgets.QLabel()
+        self.btn_reset_cl = QtWidgets.QPushButton("Reset centreline")
+        self.btn_reset_area = QtWidgets.QPushButton("Reset area law")
+        self.btn_reset_cl.clicked.connect(lambda *_: self.model.reset_centreline())
+        self.btn_reset_area.clicked.connect(lambda *_: self.model.reset_area())
+        self.grp_duct.form.addRow("Wall thickness", self.spin_wall)
+        self.grp_duct.form.addRow("Lip extension", self.spin_lip)
+        self.grp_duct.form.addRow("Lip mode", self.lbl_lip_mode)
+        resets = QtWidgets.QHBoxLayout()
+        resets.addWidget(self.btn_reset_cl)
+        resets.addWidget(self.btn_reset_area)
+        self.grp_duct.form.addRow(resets)
+        col.addWidget(self.grp_duct)
+
         # Key sections along the branch
         self.grp_sections = CollapsibleGroup("Key sections")
         self.section_list = QtWidgets.QListWidget()
@@ -467,6 +499,28 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.sketch_dock.setMinimumWidth(SKETCH_WIDTH)
         self.resizeDocks([self.sketch_dock], [SKETCH_WIDTH], QtCore.Qt.Orientation.Horizontal)
 
+    def _build_paths_dock(self) -> None:
+        self.tabs = QtWidgets.QTabWidget()
+        self.canvas_side = PathCanvas(self.model, "side")
+        self.canvas_top = PathCanvas(self.model, "top")
+        self.canvas_area = AreaCanvas(self.model)
+        self.tabs.addTab(self.canvas_side, "Side (x-z)")
+        self.tabs.addTab(self.canvas_top, "Top (x-y)")
+        self.tabs.addTab(self.canvas_area, "Area law A(s)")
+        self.paths_dock = QtWidgets.QDockWidget("Duct", self)
+        self.paths_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                                    | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable
+                                    | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.paths_dock.setWidget(self.tabs)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.paths_dock)
+        self.paths_dock.setMinimumHeight(PATHS_HEIGHT)
+        self.resizeDocks([self.paths_dock], [PATHS_HEIGHT], QtCore.Qt.Orientation.Vertical)
+        self._heavy_timer = QtCore.QTimer(self)
+        self._heavy_timer.setSingleShot(True)
+        self._heavy_timer.setInterval(HEAVY_DELAY_MS)
+        self._heavy_timer.timeout.connect(self.refresh_heavy)
+        self.model.live_checks = True
+
     def _build_status_bar(self) -> None:
         self.mode_label = QtWidgets.QLabel()
         self.message_label = QtWidgets.QLabel()
@@ -481,6 +535,14 @@ class ExploreWindow(QtWidgets.QMainWindow):
     def _on_position(self) -> None:
         if not self._syncing:
             self.model.set_origin(*(self.spin_pos[a].value() for a in "xyz"))
+
+    def _on_duct(self, which: str, value: float) -> None:
+        if self._syncing:
+            return
+        if which == "wall":
+            self.model.set_wall_thickness(value)
+        else:
+            self.model.set_lip_extension(value)
 
     def _on_lock(self, locked: bool) -> None:
         if not self._syncing:
@@ -583,6 +645,11 @@ class ExploreWindow(QtWidgets.QMainWindow):
             for box in (self.spin_pitch, self.spin_sweep):
                 box.setEnabled(placed)
             self.btn_align.setEnabled(placed)
+            self._set_value(self.spin_wall, m.state.duct.wall_thickness)
+            self._set_value(self.spin_lip, m.state.duct.lip_extension)
+            self.lbl_lip_mode.setText(m.state.duct.lip_mode)
+            for box in (self.spin_wall, self.spin_lip, self.btn_reset_cl, self.btn_reset_area):
+                box.setEnabled(placed)
             self.section_list.clear()
             for s, label, _ in m.section_list():
                 self.section_list.addItem(f"s = {s:.3f}   {label}")
@@ -606,10 +673,34 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.mode_label.setText(m.mode_text)
         self.message_label.setText(m.message)
         self.setWindowTitle(self.window_title())
+        for canvas in (self.canvas_side, self.canvas_top, self.canvas_area):
+            canvas.update()
+        if m.placed and m.can_build:
+            self._heavy_timer.start()
         if self.plotter is not None:
             self.view.update_inlet(m)
+            self.view.update_ducts(m)
             self.plotter.setCursor(QtCore.Qt.CursorShape.CrossCursor if m.mode == MODE_PLACING
                                    else QtCore.Qt.CursorShape.ArrowCursor)
+            self.plotter.render()
+
+    def refresh_heavy(self) -> None:
+        """Build the bodies and run the checks for the current state, then redraw (called after a short pause
+        in the edits, so dragging stays responsive)."""
+        try:
+            built = self.model.ensure_built()
+        except Exception as exc:  # a failing check must not take the window down
+            self.message_label.setText(f"Duct checks failed: {type(exc).__name__}: {exc}"[:200])
+            return
+        if not built:
+            return
+        self._syncing = True
+        try:
+            self.readout_view.setHtml(readouts_html(self.model.readouts()))
+        finally:
+            self._syncing = False
+        if self.plotter is not None:
+            self.view.update_ducts(self.model)
             self.plotter.render()
 
     def window_title(self) -> str:

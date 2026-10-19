@@ -164,6 +164,52 @@ section to an OpenVSP **Edit Curve** cross-section (type `CEDIT`) for the export
 degenerate Beziers with handles at 1/3 and 2/3, curved edges as Beziers, corners kept, G1 flags only where the
 handles are collinear, so every point stays editable in the OpenVSP GUI.
 
+**The duct (Phase 3b).** Below the 3D view a **Duct** dock has three tabs; every edit goes through the same model
+and the same undo history as the section editor, and the 3D view follows at once.
+
+- **Topology.** Two branches (the right inlet and its mirror image) join in a Y junction on `y = 0`, and one trunk
+  runs to the engine face (centre from the engine Geom, axis `ducts.engine_face.normal`, default +X).
+- **Centrelines** (SIDE x-z and TOP x-y tabs). A cubic Bezier per branch, from the inlet section centroid
+  (starting along the inward plane normal) to the junction, and one for the trunk, from the junction to the face
+  centre (ending along the engine axis). The junction tangent lies in the XZ plane, so the branches and the trunk
+  are G1 at the junction and everything is symmetric about `y = 0`; the two junction handles are collinear with
+  independent lengths. The tabs show the fuselage silhouette, the engine, the other components, the opening and the
+  centrelines with CAD-style handles. Drag the junction (side: x and z; top: x only) and the handles: the inlet
+  handle slides along the inlet normal and the face handle along the engine axis (length only), the junction
+  handles set angle and length in the side view and length in the top view. Double-click a handle for its default
+  (`ducts.centreline.handle_fraction` x the chord length). Wheel zooms, middle-drag pans.
+- **Area law** (third tab). `A(s)` for the branch and the trunk as monotone (PCHIP) curves with draggable control
+  points. The branch runs from the inlet area to half the junction area, the trunk from the junction area to the
+  face area, so the trunk starts with `n_inlets` times the area a branch ends with. The junction area (drag the
+  right end of the branch curve or the left end of the trunk curve) defaults to the geometric mean of the combined
+  inlet area and the face area; the interior points default to `ducts.area_law` (`linear` or `cosine`).
+  Double-click a curve to add a point, right-click a point to remove it. The curve is red where it decreases or
+  where the equivalent cone half-angle exceeds `checks.max_diffuser_half_angle_deg`. Key sections are held at
+  `A(s)` of these curves, `s` being the arc-length fraction of the whole path.
+- **Bodies.** Stations lie along the centrelines (`ducts.n_stations_branch` / `n_stations_trunk`); the section at a
+  station is the blend of the neighbouring key sections (arc-length correspondence, no twist), scaled to exactly
+  `A(s)`, with frames from parallel transport (the branch's accumulated roll is spread so it meets the trunk's
+  symmetric frame at the junction). Two bodies per branch and for the trunk come from the same stations:
+  the **negative** is the inner sections, starting `ducts.lip_extension` *upstream* of the opening plane (a prism
+  along the inlet normal) so it never shares a face with the positive, and ending at the engine face; the
+  **positive** is the inner section offset outward by `ducts.wall_thickness` (exactly that perpendicular to every
+  edge, curved ones and corners included), starting exactly at the opening plane (`ducts.lip_mode: blunt`, a blunt
+  lip of that thickness) and running to the face. The model intended in OpenVSP is
+  **(fuselage ∪ positives) − negatives**. The part of the positive outside the fuselage skin, the *external region*,
+  is a result: it is drawn in orange and reported with its length and wetted area.
+- **Live checks** (readouts; the bodies turn red where they apply). The positive may leave the skin only within
+  `checks.lip_length` of the opening, otherwise WARN (an unplanned bump); the wall left around the negative inside
+  (fuselage ∪ positive) must be at least `checks.min_clearance`; neither body may intersect another Geom (the engine
+  is not one of them); the line of sight reports the % of the engine face seen straight through an opening along
+  +X and along the inlet normal (0 % = hidden); offset / length, the maximum centreline curvature and the cone
+  half-angle per part; A(s) must not decrease. The cheap numbers update with every edit; the bodies and the mesh
+  checks are rebuilt a moment after the last one.
+
+The config keeps the junction in `ducts.junction.point`, the handle lengths and tangent in `ducts.centreline`
+(`null` = default), the area law in `ducts.area_points` (`junction_area`, interior `branch` / `trunk` points,
+`null` = derived from `ducts.area_law`), and `ducts.wall_thickness`, `ducts.lip_extension` (formerly
+`ducts.inlet.lip_extension`, still read) and `ducts.lip_mode`; Save writes them all, keeping comments.
+
 The 3D view draws both openings on their planes, the section curve and the plane's `u`/`v`/`n` arrows at `O`.
 
 Other controls:

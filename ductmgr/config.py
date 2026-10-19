@@ -54,8 +54,11 @@ def _round_values(value):
 
 
 def save_inlet_definition(inlet: dict, target: Path | None = None, key_sections: list | None = None,
-                          remove_inlet_keys=()) -> Path:
+                          remove_inlet_keys=(), ducts_values: dict | None = None) -> Path:
     """Write ``inlet`` into ``ducts.inlet`` of the private config, keeping comments and every other key.
+
+    ``ducts_values`` is a (nested) mapping merged into ``ducts`` (junction point, centreline, area points, wall
+    thickness, lip); ``None`` values are written as null.
 
     ``key_sections`` (a list of mappings: ``s``, ``vertices``, ``snapped``, ``edges``, ``handles``, ``continuity``)
     replaces ``ducts.key_sections`` wholesale when given. ``remove_inlet_keys`` names superseded keys to delete
@@ -109,6 +112,21 @@ def save_inlet_definition(inlet: dict, target: Path | None = None, key_sections:
         else:
             slot[key] = flow_seq(value)
 
+    def assign_tree(slot, mapping):
+        """Set nested mapping values in place (keeping the comments of keys that already exist); lists are flow."""
+        for key, value in mapping.items():
+            if isinstance(value, dict):
+                assign_tree(mapping_of(slot, key), value)
+            elif isinstance(value, list):
+                assign_list(slot, key, value)
+            else:
+                slot[key] = value
+
+    def mapping_of(parent, key):
+        if not isinstance(parent.get(key), CommentedMap):
+            parent[key] = CommentedMap()
+        return parent[key]
+
     def section_map(entry):
         """One key section: lists in flow style, one [u, v] vertex / handle pair per line."""
         out = CommentedMap()
@@ -140,6 +158,8 @@ def save_inlet_definition(inlet: dict, target: Path | None = None, key_sections:
             slot[key] = value
     if key_sections is not None:
         ducts["key_sections"] = CommentedSeq([section_map(e) for e in _round_values(key_sections)])
+    if ducts_values:
+        assign_tree(ducts, _round_values(ducts_values))
 
     tmp = target.with_name(target.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline=newline) as f:

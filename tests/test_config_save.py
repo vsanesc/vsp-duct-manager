@@ -50,7 +50,7 @@ def test_everything_else_is_untouched(target):
     after = yaml.safe_load(target.read_text(encoding="utf-8"))
     for section in ("model", "engine", "design_point", "checks"):
         assert after[section] == before[section]
-    assert after["ducts"]["inlet"]["lip_extension"] == before["ducts"]["inlet"]["lip_extension"]
+    assert after["ducts"]["lip_extension"] == before["ducts"]["lip_extension"]
     assert after["ducts"]["junction"] == before["ducts"]["junction"]
 
 
@@ -65,7 +65,10 @@ def test_comments_outside_the_key_sections_are_preserved_line_for_line(target):
         return lines[:a], lines[b:]
 
     (o_head, o_tail), (w_head, w_tail) = outside(original), outside(written)
-    assert o_tail == w_tail  # junction onwards, comments included, byte-identical
+    def plain(lines):  # the round trip writes a null as an empty value; nothing else may change
+        return [" ".join(x.replace("null", "").split()) for x in lines]
+
+    assert plain(o_tail) == plain(w_tail)  # junction onwards, comments included
     touched = ("origin:", "pitch_deg:", "sweep_deg:")
     for old, new in zip(o_head, w_head):
         if not any(old.strip().startswith(k) for k in touched):
@@ -168,3 +171,52 @@ def test_crlf_line_endings_are_preserved(tmp_path):
     save_inlet_definition(PLANE, path, KEY_SECTIONS)
     raw = path.read_bytes()
     assert b"\r\n" in raw and raw.count(b"\n") == raw.count(b"\r\n")
+
+
+# ---- Phase 3b: junction, centreline handles, area points, wall ---------------------------------------------------
+DUCTS = {
+    "wall_thickness": 0.012, "lip_extension": 0.07, "lip_mode": "blunt",
+    "junction": {"point": [3.5, 0.0, 0.25]},
+    "centreline": {"junction_pitch_deg": 14.0, "start_handle": 0.6, "junction_in_handle": None,
+                   "junction_out_handle": None, "end_handle": None, "handle_fraction": 0.3333},
+    "area_points": {"junction_area": 0.2, "branch": [[0.3, 0.11], [0.7, 0.13]], "trunk": None},
+}
+
+
+def test_ducts_values_are_merged_into_the_ducts_block(target):
+    save_inlet_definition(PLANE, target, KEY_SECTIONS, ducts_values=DUCTS)
+    d = load_config(target)[0]["ducts"]
+    assert d["wall_thickness"] == 0.012 and d["lip_extension"] == 0.07 and d["lip_mode"] == "blunt"
+    assert d["junction"]["point"] == [3.5, 0.0, 0.25]
+    assert d["centreline"]["start_handle"] == 0.6 and d["centreline"]["junction_in_handle"] is None
+    assert d["area_points"]["branch"] == [[0.3, 0.11], [0.7, 0.13]] and d["area_points"]["trunk"] is None
+    assert d["area_points"]["junction_area"] == 0.2
+
+
+def test_existing_comments_survive_the_ducts_values(target):
+    save_inlet_definition(PLANE, target, KEY_SECTIONS, ducts_values=DUCTS)
+    text = target.read_text(encoding="utf-8")
+    assert "# [x, 0, z] where the branches merge" in text
+    assert "# m, the positive body is the inner section offset outward" in text
+    assert "# tangent direction at the junction in the XZ plane" in text
+
+
+def test_ducts_values_are_stable_and_a_missing_block_is_created(target, tmp_path):
+    save_inlet_definition(PLANE, target, KEY_SECTIONS, ducts_values=DUCTS)
+    once = target.read_bytes()
+    save_inlet_definition(PLANE, target, KEY_SECTIONS, ducts_values=DUCTS)
+    assert target.read_bytes() == once
+    bare = tmp_path / "bare.yaml"
+    bare.write_text("ducts:\n  n_inlets: 2\n", encoding="utf-8")
+    save_inlet_definition(PLANE, bare, ducts_values=DUCTS)
+    d = yaml.safe_load(bare.read_text(encoding="utf-8"))["ducts"]
+    assert d["centreline"]["junction_pitch_deg"] == 14.0 and d["area_points"]["branch"][0] == [0.3, 0.11]
+    assert d["n_inlets"] == 2
+
+
+def test_the_old_inlet_lip_extension_can_be_removed_on_save(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text("ducts:\n  inlet:\n    lip_extension: 0.05\n    origin: [1.0, 0.5, 1.0]\n", encoding="utf-8")
+    save_inlet_definition(PLANE, path, remove_inlet_keys=("lip_extension",), ducts_values={"lip_extension": 0.07})
+    d = yaml.safe_load(path.read_text(encoding="utf-8"))["ducts"]
+    assert "lip_extension" not in d["inlet"] and d["lip_extension"] == 0.07

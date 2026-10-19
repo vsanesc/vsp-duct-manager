@@ -252,3 +252,64 @@ def test_the_scene_renders_on_the_dark_background(plotter, scene, example_env):
     bg = tuple(int(BACKGROUND[i:i + 2], 16) for i in (1, 3, 5))
     assert tuple(image[2, 2]) == bg  # an untouched corner is the theme background
     assert (image != np.array(bg)).any()  # and something was drawn
+
+
+# ---- Phase 3b: centrelines and duct bodies --------------------------------------------------------------------------------
+def test_the_centrelines_are_drawn_without_building_the_bodies(plotter, scene, example_env):
+    view = SceneView(plotter, scene)
+    model = model_for(scene, example_env)
+    view.update_ducts(model)
+    acts = plotter.renderer.actors
+    for name in ("cl_right", "cl_left", "cl_trunk"):
+        assert name in acts
+    assert not any(n.startswith("duct_") for n in acts) and not model.checks_current  # the heavy part waits
+    right = np.asarray(acts["cl_right"].GetMapper().GetInput().points)
+    left = np.asarray(acts["cl_left"].GetMapper().GetInput().points)
+    assert left == pytest.approx(right * np.array([1.0, -1.0, 1.0]), abs=1e-5)  # the exact mirror image
+    assert right[0] == pytest.approx(model.centreline.start, abs=1e-5)
+
+
+def test_the_six_bodies_are_drawn_once_they_are_built(plotter, scene, example_env):
+    view = SceneView(plotter, scene)
+    model = model_for(scene, example_env)
+    model.ensure_built()
+    view.update_ducts(model)
+    acts = plotter.renderer.actors
+    from ductmgr.viz import BODY_NAMES
+
+    for name in BODY_NAMES:
+        assert f"duct_{name}" in acts
+    neg = acts["duct_neg_trunk"].GetProperty().GetOpacity()
+    assert neg < 0.5 and acts["duct_pos_trunk"].GetProperty().GetOpacity() > neg
+
+
+def test_the_external_part_of_the_positive_gets_its_own_colour(plotter, scene, example_env):
+    view = SceneView(plotter, scene)
+    model = model_for(scene, example_env)
+    model.ensure_built()
+    assert model.checks.external_cells["pos_branch_R"].any()  # the example duct leaves the skin near the opening
+    view.update_ducts(model)
+    mapper = plotter.renderer.actors["duct_pos_branch_R"].GetMapper()
+    assert mapper.GetScalarVisibility() and mapper.GetScalarModeAsString() == "UseCellData"
+    assert mapper.GetArrayName() == "external"
+    assert mapper.GetScalarRange() == (0.0, 1.0)
+
+
+def test_a_body_intersecting_another_geom_is_drawn_red(plotter, scene, example_env):
+    view = SceneView(plotter, scene)
+    model = model_for(scene, example_env)
+    model.ensure_built()
+    model.checks.intersecting.add("pos_trunk")
+    view.update_ducts(model)
+    red = tuple(int(ERROR_COLOR[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    assert plotter.renderer.actors["duct_pos_trunk"].GetProperty().GetColor() == pytest.approx(red, abs=1e-3)
+
+
+def test_no_duct_is_drawn_for_an_unplaced_model_and_actors_are_removed(plotter, scene, example_env):
+    view = SceneView(plotter, scene)
+    model = model_for(scene, example_env)
+    model.ensure_built()
+    view.update_ducts(model)
+    assert "cl_right" in plotter.renderer.actors
+    view.update_ducts(model_for(scene, example_env, placed=False))
+    assert not any(n.startswith(("cl_", "duct_")) for n in plotter.renderer.actors)

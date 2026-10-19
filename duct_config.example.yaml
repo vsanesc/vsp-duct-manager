@@ -38,7 +38,6 @@ ducts:
     pitch_deg: 0.0                 # rotation about Y: opening tilted up (+) / down (-)
     sweep_deg: 0.0                 # rotation about Z: opening swept in planform; plane normal
                                    # n = Rz(sweep) Ry(pitch) (-X), so 0 / 0 is the plane x = const facing forward
-    lip_extension: 0.05            # m, how far the negative starts outside the skin
   key_sections:                    # sections along each branch (right inlet; the left one is its mirror image)
     - s: 0.0                       # normalised arc length: 0 = the inlet section, in the inlet plane
       vertices:                    # [u, v] in metres relative to O (u right, v up seen from the front; counter-clockwise)
@@ -55,7 +54,21 @@ ducts:
     # more sections: add entries with 0 < s < 1; each keeps its own shape but is sized by the area law A(s).
     # The engine face (s = 1) is a fixed circle and is not listed.
   junction:
-    point: [4.0, 0.0, 0.2]         # [x, 0, z] where the branches merge
+    point: [4.0, 0.0, 0.2]         # [x, 0, z] where the branches merge (drag it in the SIDE / TOP tabs)
+  centreline:                      # cubic Bezier centrelines; null = default (handle_fraction x chord length)
+    junction_pitch_deg: null       # tangent direction at the junction in the XZ plane (0 = +X, + up)
+    start_handle: null             # m, handle at the inlet section centroid, along the inward plane normal
+    junction_in_handle: null       # m, branch side of the junction
+    junction_out_handle: null      # m, trunk side of the junction (collinear with the in-handle: G1)
+    end_handle: null               # m, handle at the engine face, along the engine axis
+    handle_fraction: 0.3333        # default handle length / chord length
+  area_points:                     # area law A(s), PCHIP through these; null = derived from area_law below
+    junction_area: null            # m^2 at the junction (trunk start); each branch ends with half of it
+    branch: null                   # interior control points [[s, area], ...], s = local arc length 0..1
+    trunk: null
+  wall_thickness: 0.025            # m, the positive body is the inner section offset outward by this
+  lip_extension: 0.05              # m, the negative starts this far upstream of the opening plane
+  lip_mode: blunt                  # lip shape of the positive at the opening ("blunt" for now)
   engine_face:
     centre: [5.0, 0.0, 0.0]        # [x, 0, z]
     normal: [1.0, 0.0, 0.0]        # default +X
@@ -68,3 +81,4 @@ ducts:
 checks:
   min_clearance: 0.02              # m, minimum wall clearance to the fuselage skin
   max_diffuser_half_angle_deg: 6.0
+  lip_length: 0.15                 # m, the positive may leave the skin only this far aft of the opening

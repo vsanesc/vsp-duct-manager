@@ -37,6 +37,12 @@ FRAME_ARROW_FRACTION = 0.035  # arrow length, as a fraction of the largest fusel
 GUIDE_COLOR = "#9aa4ad"
 DISC_RESOLUTION = (4, 64)  # radial, circumferential
 ENVELOPE_COLOR, ENVELOPE_OPACITY, ENVELOPE_SEGMENTS = "#e5534b", 0.4, 96
+NEGATIVE_COLOR, NEGATIVE_OPACITY = "#58a6ff", 0.35  # the negative bodies (the bore that is cut away)
+POSITIVE_COLOR, POSITIVE_OPACITY = "#c8b9a0", 0.55  # the positive bodies (the walls added to the fuselage)
+EXTERNAL_COLOR = "#f0883e"  # the part of the positive outside the fuselage skin
+VIOLATION_COLOR = "#e5534b"  # wall left below the minimum clearance / body intersecting another Geom
+CENTRELINE_COLOR, CENTRELINE_WIDTH = "#3fb950", 3
+BODY_NAMES = tuple(f"{k}_{p}" for k in ("neg", "pos") for p in ("branch_R", "branch_L", "trunk"))
 PICK_TOLERANCE = 0.0005  # vtkCellPicker tolerance (fraction of the render window diagonal)
 
 VIEWS = {"side": "xz", "top": "xy", "front": "yz", "iso": "iso"}
@@ -56,6 +62,7 @@ class Scene:
     engine_check: vspio.FaceEnvelopeCheck | None = None
     warnings: list[str] = field(default_factory=list)
     wings: list[vspio.WingPlanform] = field(default_factory=list)  # planform edges, from the VSP parameters
+    context_parts: list[tuple[str, pv.PolyData]] = field(default_factory=list)  # (Geom name, mesh) of each other Geom
 
 
 def load_scene(cfg: dict, config_path: Path) -> Scene:
@@ -105,7 +112,9 @@ def load_scene(cfg: dict, config_path: Path) -> Scene:
         )
 
     skip = {fus_geom.id} | ({engine_geom.id} if engine_geom else set())
-    context = vspio.export_mesh([g for g in geoms if g.id not in skip])
+    others = [g for g in geoms if g.id not in skip]
+    context_parts = [(g.name, vspio.export_mesh([g])) for g in others]  # one mesh per Geom, for the intersection checks
+    context = pv.merge([m for _, m in context_parts]) if context_parts else pv.PolyData()
     engine_mesh = vspio.export_mesh([engine_geom]) if engine_geom else pv.PolyData()
 
     return Scene(
@@ -121,6 +130,7 @@ def load_scene(cfg: dict, config_path: Path) -> Scene:
         engine_check=engine_check,
         warnings=msgs,
         wings=vspio.read_wings(geoms),
+        context_parts=context_parts,
     )
 
 
@@ -235,6 +245,59 @@ class SceneView:
                        pickable=False, render=False)
         else:
             p.remove_actor("to_face", render=False)
+
+    # ---- ducts ---------------------------------------------------------------------------------------------
+    DUCT_ACTORS = ("cl_right", "cl_left", "cl_trunk") + tuple(f"duct_{n}" for n in BODY_NAMES)
+
+    def update_ducts(self, model) -> None:
+        """Draw the centrelines (cheap) and, once the model has built them for its current state, the negative
+        and positive bodies: the positive's external part in its own colour, wall below the clearance and bodies
+        intersecting other Geoms in red."""
+        p = self.plotter
+        duct = model.duct if model.placed else None
+        if duct is None:
+            for name in self.DUCT_ACTORS:
+                p.remove_actor(name, render=False)
+            return
+        cl = duct.centreline
+        for name, curve, mirror in (("cl_right", cl.branch, False), ("cl_left", cl.branch, True),
+                                    ("cl_trunk", cl.trunk, False)):
+            pts = curve.points(np.linspace(0.0, 1.0, 60))
+            if mirror:
+                pts = pts * np.array([1.0, -1.0, 1.0])
+            p.add_mesh(pv.lines_from_points(pts), color=CENTRELINE_COLOR, line_width=CENTRELINE_WIDTH, name=name,
+                       pickable=False, render=False)
+        if not model.checks_current:
+            return
+        checks, bodies = model.checks, model.bodies
+        for name, body in bodies.items():
+            mesh = body.mesh.copy()
+            colour_kwargs = {}
+            if body.kind == "positive":
+                flags = checks.external_cells.get(name)
+                if name in checks.intersecting:
+                    colour_kwargs = {"color": VIOLATION_COLOR}
+                elif flags is not None and flags.any():
+                    mesh.cell_data["external"] = flags.astype(float)
+                    colour_kwargs = {"scalars": "external", "cmap": [POSITIVE_COLOR, EXTERNAL_COLOR],
+                                     "clim": [0.0, 1.0], "show_scalar_bar": False}
+                else:
+                    colour_kwargs = {"color": POSITIVE_COLOR}
+                opacity = POSITIVE_OPACITY
+            else:
+                wall = checks.wall_points.get("neg_branch_R" if name == "neg_branch_L" else name)
+                limit = model.settings.checks.min_clearance
+                if name in checks.intersecting:
+                    colour_kwargs = {"color": VIOLATION_COLOR}
+                elif wall is not None and np.isfinite(wall).any() and (wall < limit).any():
+                    bad = np.where(wall < limit, 1.0, 0.0)
+                    mesh.point_data["violation"] = bad
+                    colour_kwargs = {"scalars": "violation", "cmap": [NEGATIVE_COLOR, VIOLATION_COLOR],
+                                     "clim": [0.0, 1.0], "show_scalar_bar": False}
+                else:
+                    colour_kwargs = {"color": NEGATIVE_COLOR}
+                opacity = NEGATIVE_OPACITY
+            p.add_mesh(mesh, opacity=opacity, name=f"duct_{name}", pickable=False, render=False, **colour_kwargs)
 
     # ---- view controls --------------------------------------------------------------------------------------
     def has(self, name: str) -> bool:

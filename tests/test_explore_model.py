@@ -906,8 +906,6 @@ def test_adding_a_key_section_copies_the_previous_shape_at_the_area_law_size(cyl
 
 
 def test_key_section_areas_follow_the_area_law_before_and_after_the_junction(cyl_model, clock):
-    from ductmgr import area_law
-
     m = cyl_model
     sj = m.junction_s
     for s in (sj * 0.5, (1 + sj) / 2):
@@ -915,9 +913,8 @@ def test_key_section_areas_follow_the_area_law_before_and_after_the_junction(cyl
         m.add_key_section(round(s, 4))
     s_branch, s_trunk = (ks.s for ks in m.state.sections[1:])
     assert s_branch < sj < s_trunk
-    a_in = m.inlet_plane_area
     for ks, ev in zip(m.state.sections[1:], m.evaluations[1:]):
-        expect = area_law.section_area(ks.s, a_in, m.face_area, sj, m.settings.law, 2)
+        expect = float(m.areas.area(ks.s, sj)[0])  # branch curve before the junction, trunk curve after it
         assert ev.area_plane == pytest.approx(expect, rel=1e-9)
 
 
@@ -1033,3 +1030,265 @@ def test_moving_the_plane_rescales_the_other_sections_to_the_new_area_law(cyl_mo
     m.set_param("sweep_deg", 40.0)  # the in-plane inlet area grows by 1 / cos(40)
     assert m.evaluations[1].area_plane == pytest.approx(m.area_at(0.3), rel=1e-9)
     assert m.inlet_plane_area == pytest.approx(0.12 / math.cos(math.radians(40.0)))
+
+
+# ---- Phase 3b: centrelines, area law, bodies, checks ---------------------------------------------------------------------------------
+from ductmgr import areacurve  # noqa: E402
+from ductmgr.areacurve import AreaPoints  # noqa: E402
+from ductmgr.centreline import CentrelineParams  # noqa: E402
+
+
+def test_the_duct_parameters_are_loaded_from_the_config(scene, example_env):
+    cfg, path, _ = example_env
+    m = make(scene, path)
+    d = m.state.duct
+    assert d.centreline.junction == (cfg["ducts"]["junction"]["point"][0], cfg["ducts"]["junction"]["point"][2])
+    assert d.centreline.junction_pitch_deg is None and d.centreline.start_handle is None
+    assert d.area == AreaPoints()
+    assert d.wall_thickness == cfg["ducts"]["wall_thickness"] and d.lip_extension == cfg["ducts"]["lip_extension"]
+    assert d.lip_mode == "blunt"
+    assert m.settings.checks.lip_length == cfg["checks"]["lip_length"]
+    assert not m.dirty
+
+
+def test_lip_extension_is_still_read_from_its_old_place_and_defaults_apply(scene, example_env):
+    cfg, path, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    ducts = cfg["ducts"]
+    ducts.pop("lip_extension")
+    ducts["inlet"]["lip_extension"] = 0.123
+    ducts["wall_thickness"] = None
+    d = state_from_config(cfg).duct
+    assert d.lip_extension == 0.123 and d.wall_thickness == em.DEFAULT_WALL_THICKNESS
+    ducts["inlet"].pop("lip_extension")
+    assert state_from_config(cfg).duct.lip_extension == em.DEFAULT_LIP_EXTENSION
+
+
+@pytest.mark.parametrize("patch, message", [
+    ({"wall_thickness": -0.001}, "wall_thickness"),
+    ({"lip_extension": -0.1}, "lip_extension"),
+    ({"lip_mode": "rounded"}, "lip_mode"),
+    ({"junction": {"point": [1.0, 2.0]}}, "junction.point"),
+    ({"centreline": [1]}, "centreline"),
+    ({"area_points": {"branch": [[1.5, 0.1]]}}, "between 0 and 1"),
+    ({"area_law": "parabolic"}, "area_law"),
+    ({"n_stations_branch": 1}, "n_stations_branch"),
+])
+def test_malformed_duct_settings_are_rejected_clearly(example_env, patch, message):
+    cfg, _, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    cfg["ducts"].update(patch)
+    with pytest.raises(ValueError, match=message):
+        state_from_config(cfg)
+        em.duct_settings(cfg)
+
+
+def test_the_centreline_is_built_from_the_inlet_centroid_the_junction_and_the_face(scene, example_env):
+    _, path, _ = example_env
+    m = make(scene, path)
+    cl = m.centreline
+    assert cl is not None
+    assert cl.start == pytest.approx(m.opening_centroid, abs=2e-3)  # the centroid of the sketched opening
+    assert cl.face_centre == pytest.approx(scene.face_center)
+    assert cl.junction[0] == m.state.duct.centreline.junction[0] and cl.junction[1] == 0.0
+    assert m.junction_s == pytest.approx(cl.s_junction)
+    assert cl.branch.tangents([0.0])[0] == pytest.approx(-m.state.plane.normal, abs=1e-12)
+
+
+def test_dragging_the_junction_is_one_undo_step_and_keeps_g1(scene, example_env, clock):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    start = m.state
+    for k in range(5):
+        clock.advance(0.01)
+        assert m.drag_junction(3.5 + 0.01 * k, 0.1 + 0.01 * k)
+    assert m.state.duct.centreline.junction == pytest.approx((3.54, 0.14))
+    cl = m.centreline
+    assert cl.branch.tangents([1.0])[0] == pytest.approx(cl.trunk.tangents([0.0])[0], abs=1e-12)
+    clock.advance(10.0)
+    assert m.undo() and m.state == start and not m.can_undo
+
+
+def test_handle_edits_and_their_defaults(scene, example_env, clock):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    default = m.centreline.resolved
+    clock.advance(10.0)
+    assert m.set_centreline("h", start_handle=0.9, junction_pitch_deg=20.0, junction_out_handle=0.3)
+    r = m.centreline.resolved
+    assert r.start_handle == 0.9 and r.junction_pitch_deg == 20.0 and r.junction_out_handle == 0.3
+    assert r.end_handle == pytest.approx(default.end_handle)  # untouched ones stay default
+    t = m.centreline.junction_tangent
+    assert math.degrees(math.atan2(t[2], t[0])) == pytest.approx(20.0)
+    clock.advance(10.0)
+    assert not m.set_centreline("h", end_handle=-1.0) and "negative" in m.message
+    with pytest.raises(KeyError):
+        m.set_centreline("h", bogus=1.0)
+    clock.advance(10.0)
+    assert m.reset_centreline() and m.state.duct.centreline.start_handle is None
+    assert m.centreline.resolved.start_handle == pytest.approx(default.start_handle)
+
+
+def test_the_lock_blocks_junction_drags(scene, example_env):
+    _, path, _ = example_env
+    m = make(scene, path)
+    m.set_locked(True)
+    before = m.state
+    assert not m.drag_junction(3.0, 0.5) and m.state == before
+
+
+def test_key_sections_follow_the_centreline_and_the_area_law(cyl_model, clock):
+    m = cyl_model
+    clock.advance(10.0)
+    m.add_key_section(0.3)
+    clock.advance(10.0)
+    assert m.drag_junction(3.0, 0.3) or m.set_centreline("c", junction=(3.0, 0.3))
+    assert m.evaluations[1].area_plane == pytest.approx(m.area_at(0.3), rel=1e-9)
+    clock.advance(10.0)
+    assert m.area_set_junction(0.4)
+    assert m.areas.junction_area == 0.4 and m.evaluations[1].area_plane == pytest.approx(m.area_at(0.3), rel=1e-9)
+    assert m.undo() and m.areas.junction_area != 0.4
+
+
+def test_area_points_can_be_moved_added_and_removed(cyl_model, clock):
+    m = cyl_model
+    default = m.areas.branch_interior
+    clock.advance(10.0)
+    assert m.area_move_point("branch", 1, 0.55, 0.115) and m.state.duct.area.branch is not None
+    assert m.areas.branch_interior[1] == (0.55, 0.115) and m.areas.trunk_interior == m.areas.trunk_interior
+    clock.advance(10.0)
+    m.area_move_point("branch", 1, 5.0, 0.115)  # dragged far right: kept between its neighbours
+    assert m.areas.branch_interior[1][0] < m.areas.branch_interior[2][0]
+    clock.advance(10.0)
+    assert m.area_add_point("trunk", 0.6) and len(m.areas.trunk_interior) == len(default) + 1
+    assert not m.area_add_point("trunk", 0.6)  # too close to the point just added
+    n = len(m.areas.trunk_interior)
+    assert m.area_remove_point("trunk", 0) and len(m.areas.trunk_interior) == n - 1
+    assert not m.area_remove_point("trunk", 99)
+    assert m.reset_area() and m.state.duct.area == AreaPoints()
+
+
+def test_dragging_an_area_point_is_one_undo_step(cyl_model, clock):
+    m = cyl_model
+    start = m.state
+    for k in range(6):
+        clock.advance(0.01)
+        m.area_move_point("branch", 0, 0.25, 0.11 + 0.001 * k)
+    clock.advance(10.0)
+    assert m.undo() and m.state == start
+
+
+def test_invalid_area_points_are_refused_with_a_message(cyl_model):
+    m = cyl_model
+    before = m.state
+    assert not m.set_area_points(AreaPoints(None, ((1.5, 0.1),), None)) and m.state == before and m.message
+
+
+def test_wall_thickness_and_lip_extension(cyl_model, clock):
+    m = cyl_model
+    assert m.set_wall_thickness(0.012) and m.state.duct.wall_thickness == 0.012
+    assert m.set_lip_extension(0.08) and m.state.duct.lip_extension == 0.08
+    assert not m.set_wall_thickness(0.0) and not m.set_lip_extension(-0.1)
+    assert m.duct.spec.wall_thickness == 0.012 and m.duct.spec.lip_extension == 0.08
+
+
+def test_the_duct_spec_uses_the_sketched_sections_and_the_scene(cyl_model):
+    m = cyl_model
+    m.add_key_section(0.5)
+    spec = m.duct_spec()
+    assert [k.s for k in spec.keys] == [0.0, 0.5] and spec.n_branches == 2
+    assert spec.face_centre == pytest.approx([6.0, 0.0, 0.0]) and spec.face_diameter == 0.5
+    assert spec.inlet_area == pytest.approx(m.opening.area_plane)
+    assert m.duct.areas.a_in == pytest.approx(m.opening.area_plane)
+
+
+def test_bodies_and_checks_are_built_on_demand_and_cached_per_state(cyl_model, clock):
+    m = cyl_model
+    assert not m.checks_current
+    assert m.ensure_built() and m.checks_current and set(m.bodies) == set(dm_names())
+    first = m.checks
+    assert m.checks is first  # cached
+    clock.advance(10.0)
+    m.set_wall_thickness(0.02)
+    assert not m.checks_current  # a new state invalidates it
+    assert m.checks is not first and m.checks_current
+
+
+def dm_names():
+    return [f"{k}_{p}" for k in ("neg", "pos") for p in ("branch_R", "branch_L", "trunk")]
+
+
+def test_there_is_no_duct_without_an_engine_face(example_env):
+    cfg, path, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    cfg["engine"]["geom_name"] = None
+    cfg["ducts"]["engine_face"]["centre"] = None
+    s = load_scene(cfg, path)
+    m = InletModel(s, cfg, path, None)
+    assert m.duct is None and m.centreline is None and not m.ensure_built() and not m.can_build
+    assert m.junction_s == m.settings.junction_fraction  # the old proxy
+    assert all("Junction" != r.label for r in m.readouts())
+
+
+def test_the_readouts_list_the_duct_numbers_and_the_checks(cyl_model):
+    m = cyl_model
+    rows = {r.label: r for r in m.readouts() if r.label}
+    for label in ("Junction", "Path length", "Area junction", "Offset / length", "Centreline curvature",
+                  "Cone half-angle branch", "Cone half-angle trunk"):
+        assert label in rows
+    assert "External region" not in rows  # the heavy checks are not computed behind the user's back
+    m.ensure_built()
+    rows = {r.label: r for r in m.readouts() if r.label}
+    for label in ("External region", "Wall left (min)", "Other Geoms", "Line of sight"):
+        assert label in rows
+    m.live_checks = True
+    m.set_wall_thickness(0.02)
+    assert any(r.label == "Body checks" and "updating" in r.value for r in m.readouts())
+
+
+def test_duct_parameters_survive_a_save_and_a_reload(scene, writable, clock):
+    before = yaml.safe_load(writable.read_text(encoding="utf-8"))
+    m = make(scene, writable, writable, clock=clock)
+    for step in (lambda: m.drag_junction(3.4, 0.35), lambda: m.set_centreline("h", start_handle=0.7, junction_pitch_deg=12.0),
+                 lambda: m.area_move_point("branch", 1, 0.5, 0.1), lambda: m.area_set_junction(0.19),
+                 lambda: m.set_wall_thickness(0.03), lambda: m.set_lip_extension(0.06)):
+        clock.advance(10.0)
+        assert step()
+    assert m.save()
+    ducts = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]
+    assert ducts["junction"]["point"] == [3.4, 0.0, 0.35]
+    assert ducts["centreline"]["start_handle"] == 0.7 and ducts["centreline"]["junction_pitch_deg"] == 12.0
+    assert ducts["centreline"]["end_handle"] is None  # defaults stay null
+    assert ducts["area_points"]["junction_area"] == 0.19 and ducts["area_points"]["branch"][1] == [0.5, 0.1]
+    assert ducts["wall_thickness"] == 0.03 and ducts["lip_extension"] == 0.06 and ducts["lip_mode"] == "blunt"
+    after = yaml.safe_load(writable.read_text(encoding="utf-8"))
+    for section in ("model", "engine", "design_point", "checks"):
+        assert after[section] == before[section]
+    again = make(scene, writable, writable)
+    assert not again.dirty and again.state.duct.centreline == m.state.duct.centreline
+    assert again.state.duct.wall_thickness == 0.03 and again.state.duct.lip_extension == 0.06
+    for got, want in zip(again.areas.branch_interior + again.areas.trunk_interior,
+                         m.areas.branch_interior + m.areas.trunk_interior):
+        assert got == pytest.approx(want, abs=1e-6)
+
+
+def test_saving_moves_a_legacy_lip_extension_out_of_the_inlet_block(scene, example_env, writable):
+    text = yaml.safe_load(writable.read_text(encoding="utf-8"))
+    text["ducts"].pop("lip_extension")
+    text["ducts"]["inlet"]["lip_extension"] = 0.09
+    writable.write_text(yaml.safe_dump(text, sort_keys=False), encoding="utf-8")
+    m = make(scene, writable, writable)
+    assert m.state.duct.lip_extension == 0.09
+    assert m.save()
+    saved = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]
+    assert "lip_extension" not in saved["inlet"] and saved["lip_extension"] == 0.09
+
+
+def test_revert_restores_the_duct_parameters(scene, writable, clock):
+    m = make(scene, writable, writable, clock=clock)
+    saved = m.state.duct
+    clock.advance(10.0)
+    m.drag_junction(3.2, 0.5)
+    clock.advance(10.0)
+    m.set_wall_thickness(0.04)
+    assert m.dirty and m.revert() and not m.dirty and m.state.duct == saved

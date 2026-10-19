@@ -50,6 +50,11 @@ ductmgr/
   area_law.py     # A(s) along a branch (linear / cosine, junction = n x branch)
   interp.py       # arc-length resampling from a reference vertex (no twist)
   cedit.py        # section -> OpenVSP Edit Curve (CEDIT) XSec mapping
+  centreline.py   # branch / trunk cubic Beziers, G1 at the junction, arc-length mapping
+  areacurve.py    # A(s) as monotone PCHIP curves for the branch and the trunk
+  duct.py         # stations, frames, sections at A(s), negative + positive bodies
+  ductcheck.py    # external region, wall left, other Geoms, line of sight; solids.py = mesh queries
+  qt_paths.py     # side / top / area-law 2D editors
   explore_model.py / qt_sketch.py / qt_explorer.py   # section editor model + Qt UI
   checks.py       # clearance vs fuselage, area error, diffusion angle
   viz.py          # PyVista scene + matplotlib A(s) plot

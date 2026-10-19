@@ -279,8 +279,8 @@ def test_the_painter_copes_with_a_swept_pitched_plane_and_no_inlet(qapp, model, 
 
 def test_chine_corners_are_marked(qapp):
     prism = bodies.chined_prism()
-    scene = SimpleNamespace(fuselage=prism, sizing=SimpleNamespace(capture_area_per_inlet=0.05), engine_check=None,
-                            warnings=[], face_center=None)
+    scene = SimpleNamespace(fuselage=prism, sizing=SimpleNamespace(capture_area_per_inlet=0.05, n_inlets=2),
+                            engine_check=None, warnings=[], face_center=None, face_diameter=0.5)
     cfg = {"ducts": {"inlet": {"origin": [4.0, 0.0, 0.4]}}}
     m = InletModel(scene, cfg, EXAMPLE_CONFIG, None)
     assert len(m.section.chines) == 6
