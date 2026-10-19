@@ -38,15 +38,22 @@ ducts:
     pitch_deg: 0.0                 # rotation about Y: opening tilted up (+) / down (-)
     sweep_deg: 0.0                 # rotation about Z: opening swept in planform; plane normal
                                    # n = Rz(sweep) Ry(pitch) (-X), so 0 / 0 is the plane x = const facing forward
-    vertices:                      # the 5 sketch vertices [u, v] in metres relative to O, in the inlet plane
-      - [-0.09242, -0.07479]       # (u right, v up as seen from the front; counter-clockwise)
-      - [0.14268, 0.04234]
-      - [0.13367, 0.31868]
-      - [-0.00203, 0.40010]
-      - [-0.13772, 0.31868]
-    snapped: [true, true, false, false, false]   # vertex lies on the fuselage section curve; an edge between
-                                   # two snapped vertices follows the curve, other edges are straight
     lip_extension: 0.05            # m, how far the negative starts outside the skin
+  key_sections:                    # sections along each branch (right inlet; the left one is its mirror image)
+    - s: 0.0                       # normalised arc length: 0 = the inlet section, in the inlet plane
+      vertices:                    # [u, v] in metres relative to O (u right, v up seen from the front; counter-clockwise)
+        - [-0.09242, -0.07479]
+        - [0.14268, 0.04234]
+        - [0.13367, 0.31868]
+        - [-0.00203, 0.40010]
+        - [-0.13772, 0.31868]
+      snapped: [true, true, false, false, false]   # on the fuselage section curve; an edge between two snapped
+                                                   # vertices follows the curve and is not editable
+      edges: [straight, straight, straight, straight, straight]  # edge i joins vertex i to i+1: straight or curved
+      handles: [null, null, null, null, null]  # curved edges: [[du, dv], [du, dv]] tangent offsets from its two vertices
+      continuity: [corner, corner, corner, corner, corner]       # per vertex: corner, smooth (G1) or symmetric
+    # more sections: add entries with 0 < s < 1; each keeps its own shape but is sized by the area law A(s).
+    # The engine face (s = 1) is a fixed circle and is not listed.
   junction:
     point: [4.0, 0.0, 0.2]         # [x, 0, z] where the branches merge
   engine_face:

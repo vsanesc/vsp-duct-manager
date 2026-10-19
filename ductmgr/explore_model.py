@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Víctor Sánchez Escalante
 
-"""State of the inlet explorer, independent of any GUI toolkit.
+"""State of the section editor, independent of any GUI toolkit.
 
-Holds the inlet plane and the 5-vertex section sketch (vertices in the plane's (u, v), snapped flags), the
-section curve and the evaluated opening, one undo/redo history shared by the 3D view, the panel and the
-sketcher, the place-mode state machine, the lock, the dirty flag and save/revert. The Qt window and the headless
-screenshot both drive this class, so everything that matters is testable without a display.
+Holds the inlet plane and the *key sections* along a branch: the inlet section (s = 0, in the inlet plane, with
+skin snapping) and any intermediate sections at chosen s; the engine face (s = 1) is a fixed circle. One of them is
+*active*, the one the editor shows. Every key section has its own shape (any number of vertices, straight or curved
+edges) but its size follows the area law A(s). One undo / redo history is shared by the 3D view, the panel and the
+editor; there are also the place-mode state machine, the lock, the dirty flag and save / revert. The Qt window and
+the headless screenshot both drive this class, so everything that matters is testable without a display.
 """
+import math
 import time
 import warnings
 from dataclasses import dataclass, replace
@@ -15,15 +18,16 @@ from pathlib import Path
 
 import numpy as np
 
-import math
-
-from ductmgr import sketch, vspio
+from ductmgr import area_law, sketch, vspio
+from ductmgr import outline as ol
 from ductmgr.config import PRIVATE_CONFIG, load_config, save_inlet_definition
 from ductmgr.engine import EngineSizingWarning, size_from_config
 from ductmgr.geometry import InletPlane, inlet_readout, sweep_for_edge_angle
+from ductmgr.outline import SectionShape
 from ductmgr.section import Section, compute_section
 
 MIN_ALIGN_PROJECTION = 0.2  # |n.X| below this blocks an edge alignment
+MIN_S_SEPARATION = 0.01  # key sections closer than this in s are refused
 UNDO_LIMIT = 200  # history entries kept (the requirement is at least 50)
 MERGE_WINDOW_S = 0.8  # consecutive edits of one parameter / vertex within this window share one undo step
 PLANE_KEYS = ("pitch_deg", "sweep_deg")
@@ -35,12 +39,17 @@ LEGACY_INLET_KEYS = ("shape", "skin_fit", "attach_point", "centroid", "normal", 
 
 
 @dataclass(frozen=True)
+class KeySection:
+    s: float  # normalised arc length along the branch: 0 inlet, 1 engine face
+    shape: SectionShape
+
+
+@dataclass(frozen=True)
 class InletState:
     """Everything the undo history tracks."""
 
     plane: InletPlane | None  # None until an inlet has been placed
-    vertices: tuple[tuple[float, float], ...] | None  # 5 (u, v) pairs, right inlet
-    snapped: tuple[bool, ...]
+    sections: tuple[KeySection, ...]  # sorted by s; sections[0] is the inlet (s = 0) once placed
 
 
 @dataclass(frozen=True)
@@ -50,41 +59,87 @@ class Readout:
     level: str = "info"  # "info", "pass", "warn" or "error"
 
 
+@dataclass(frozen=True)
+class DuctsSettings:
+    """The ``ducts:`` values the area law needs."""
+
+    law: str = area_law.DEFAULT_LAW
+    junction_point: tuple[float, float, float] | None = None
+    junction_fraction: float = area_law.DEFAULT_JUNCTION_FRACTION
+
+
 # ---- config <-> state -----------------------------------------------------------------------------------------
 def legacy_notice(cfg: dict) -> str:
-    """One line naming old ducts.inlet keys that are ignored; empty when there are none."""
-    inlet = ((cfg.get("ducts") or {}).get("inlet")) or {}
+    """One line naming old ducts.inlet keys / formats that are ignored or migrated; empty when there are none."""
+    ducts = cfg.get("ducts") or {}
+    inlet = ducts.get("inlet") or {}
+    notes = []
     old = [k for k in LEGACY_INLET_KEYS if inlet.get(k) is not None]
-    if not old:
-        return ""
-    return (f"ducts.inlet: ignoring old key(s) {', '.join(old)}; the inlet is now origin, pitch_deg, sweep_deg, "
-            "vertices and snapped")
+    if old:
+        notes.append(f"ignoring old key(s) {', '.join(old)}")
+    if inlet.get("vertices") is not None:
+        if ducts.get("key_sections") is None:
+            notes.append("the 5-vertex ducts.inlet.vertices / snapped format is loaded as a straight-edged inlet "
+                         "section; Save writes ducts.key_sections")
+        else:
+            notes.append("ducts.inlet.vertices / snapped are superseded by ducts.key_sections and ignored")
+    return "ducts.inlet: " + "; ".join(notes) if notes else ""
+
+
+def duct_settings(cfg: dict) -> DuctsSettings:
+    ducts = cfg.get("ducts") or {}
+    point = (ducts.get("junction") or {}).get("point")
+    law = ducts.get("area_law") or area_law.DEFAULT_LAW
+    if law not in area_law.LAWS:
+        raise ValueError(f"ducts.area_law must be one of {', '.join(area_law.LAWS)} (got {law!r})")
+    fraction = ducts.get("junction_fraction")
+    return DuctsSettings(
+        law,
+        tuple(float(c) for c in point) if point is not None else None,
+        area_law.DEFAULT_JUNCTION_FRACTION if fraction is None else float(fraction),
+    )
+
+
+def parse_key_sections(raw) -> tuple[KeySection, ...]:
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("ducts.key_sections must be a list")
+    sections = []
+    for k, entry in enumerate(raw):
+        where = f"ducts.key_sections[{k}]"
+        if not isinstance(entry, dict) or entry.get("s") is None:
+            raise ValueError(f"{where}: needs an 's' (0 = inlet, between 0 and 1 for the others)")
+        s = float(entry["s"])
+        if not 0.0 <= s < 1.0:
+            raise ValueError(f"{where}: s must be 0 (the inlet) or between 0 and 1, exclusive (the engine face "
+                             "at s = 1 is fixed)")
+        sections.append(KeySection(s, ol.shape_from_config(entry, where)))
+    sections.sort(key=lambda ks: ks.s)
+    for a, b in zip(sections, sections[1:]):
+        if b.s - a.s < MIN_S_SEPARATION:
+            raise ValueError(f"ducts.key_sections: s = {a.s:g} and {b.s:g} are closer than {MIN_S_SEPARATION:g}")
+    return tuple(sections)
 
 
 def state_from_config(cfg: dict) -> InletState:
-    inlet = ((cfg.get("ducts") or {}).get("inlet")) or {}
+    ducts = cfg.get("ducts") or {}
+    inlet = ducts.get("inlet") or {}
     origin = inlet.get("origin")
     if origin is None:
-        return InletState(None, None, (False,) * sketch.N_VERTICES)
+        return InletState(None, ())
     if not (isinstance(origin, (list, tuple)) and len(origin) == 3):
         raise ValueError("ducts.inlet.origin must be [x, y, z]")
     plane = InletPlane(
         tuple(float(c) for c in origin), float(inlet.get("pitch_deg") or 0.0), float(inlet.get("sweep_deg") or 0.0)
     )
     plane.frame()  # validates the angles
-    raw = inlet.get("vertices")
-    if raw is None:
-        return InletState(plane, None, (False,) * sketch.N_VERTICES)
-    if not (isinstance(raw, (list, tuple)) and len(raw) == sketch.N_VERTICES
-            and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in raw)):
-        raise ValueError(f"ducts.inlet.vertices must be {sketch.N_VERTICES} [u, v] pairs")
-    flags = inlet.get("snapped")
-    if flags is None:
-        flags = [False] * sketch.N_VERTICES
-    if not (isinstance(flags, (list, tuple)) and len(flags) == sketch.N_VERTICES
-            and all(isinstance(f, bool) for f in flags)):
-        raise ValueError(f"ducts.inlet.snapped must be {sketch.N_VERTICES} true/false values")
-    return InletState(plane, tuple((float(u), float(v)) for u, v in raw), tuple(flags))
+    raw = ducts.get("key_sections")
+    if raw is not None:
+        return InletState(plane, parse_key_sections(raw))
+    if inlet.get("vertices") is not None:  # the old 5-vertex format: a straight-edged inlet section
+        flags = inlet.get("snapped")
+        data = {"vertices": inlet["vertices"], "snapped": flags}
+        return InletState(plane, (KeySection(0.0, ol.shape_from_config(data, "ducts.inlet")),))
+    return InletState(plane, ())
 
 
 class InletModel:
@@ -104,14 +159,16 @@ class InletModel:
         self.locked = False
         self.message = ""
         self.notice = legacy_notice(cfg)
+        self.settings = duct_settings(cfg)
         self.alignment: tuple[str, float, float] | None = None  # (edge label, edge sweep, applied plane sweep)
-        self.section: Section | None = None
-        self.opening: sketch.Opening | None = None
+        self.section: Section | None = None  # the skin curve in the inlet plane
+        self.evaluations: list[sketch.Opening] = []  # one per key section
+        self.active = 0  # index of the section the editor shows; len(sections) is the engine face
         loaded = state_from_config(cfg)
         self.state = self._normalised(loaded)
-        # a state completed here (resnapped to the section, default sketch added) differs from the file only
-        # by rounding: the file is the saved state unless a sketch had to be created
-        self.saved_state = self.state if loaded.vertices is not None or loaded.plane is None else loaded
+        # a state completed here (resnapped, default sketch added) differs from the file only by rounding: the
+        # file is the saved state unless a sketch had to be created
+        self.saved_state = self.state if loaded.sections or loaded.plane is None else loaded
         self._recompute()
 
     # ---- observers ---------------------------------------------------------------------------------
@@ -128,6 +185,7 @@ class InletModel:
     # ---- derived state --------------------------------------------------------------------------------
     @property
     def area(self) -> float:
+        """The per-inlet capture area (projected normal to the freestream): the inlet section's target."""
         return self.scene.sizing.capture_area_per_inlet
 
     @property
@@ -139,8 +197,13 @@ class InletModel:
         return self.state.plane is not None
 
     @property
+    def opening(self) -> sketch.Opening | None:
+        """The evaluated inlet section (s = 0)."""
+        return self.evaluations[0] if self.evaluations else None
+
+    @property
     def valid(self) -> bool:
-        return self.opening is not None and self.opening.valid
+        return bool(self.evaluations) and all(e.valid for e in self.evaluations)
 
     @property
     def dirty(self) -> bool:
@@ -164,16 +227,99 @@ class InletModel:
 
     @property
     def opening_centroid(self) -> np.ndarray | None:
-        """3D centroid of the opening."""
+        """3D centroid of the inlet opening."""
         if self.opening is None:
             return None
         return self.state.plane.to_3d([self.opening.centroid_uv])[0]
 
-    def left_vertices(self):
-        """The left inlet's vertices and flags (mirror image of the right one)."""
-        from ductmgr.geometry import mirror_vertices
+    # ---- the area law -------------------------------------------------------------------------------------
+    @property
+    def n_branches(self) -> int:
+        return self.scene.sizing.n_inlets
 
-        return mirror_vertices(self.state.vertices, self.state.snapped)
+    @property
+    def inlet_plane_area(self) -> float:
+        """A(0): the inlet section's in-plane area, the capture area divided by |n . X|."""
+        plane = self.state.plane
+        return self.area / max(plane.projection_factor if plane else 1.0, 1e-6)
+
+    @property
+    def face_area(self) -> float:
+        """A(1): the duct's end area, the full circle of the face diameter (the hub is the engine's, not the duct's)."""
+        return 0.25 * math.pi * self.scene.face_diameter**2
+
+    @property
+    def junction_s(self) -> float:
+        plane = self.state.plane
+        origin = plane.origin if plane else (0.0, 0.0, 0.0)
+        return area_law.junction_s(origin, self.scene.face_center, self.settings.junction_point,
+                                   self.settings.junction_fraction)
+
+    def area_at(self, s: float) -> float:
+        """A(s), the in-plane area every key section is held to."""
+        return area_law.section_area(s, self.inlet_plane_area, self.face_area, self.junction_s, self.settings.law,
+                                     self.n_branches)
+
+    def face_shape(self) -> SectionShape:
+        """The engine face (s = 1): a circle of the face diameter, fixed."""
+        return ol.circle_shape(0.5 * self.scene.face_diameter)
+
+    # ---- the active section ------------------------------------------------------------------------------------
+    @property
+    def n_sections(self) -> int:
+        return len(self.state.sections)
+
+    @property
+    def active_is_face(self) -> bool:
+        return self.placed and self.active >= self.n_sections
+
+    @property
+    def active_is_inlet(self) -> bool:
+        return self.placed and self.active == 0
+
+    @property
+    def active_s(self) -> float | None:
+        if not self.placed:
+            return None
+        return 1.0 if self.active_is_face else self.state.sections[self.active].s
+
+    @property
+    def active_shape(self) -> SectionShape | None:
+        if not self.placed:
+            return None
+        return self.face_shape() if self.active_is_face else self.state.sections[self.active].shape
+
+    @property
+    def active_opening(self) -> sketch.Opening | None:
+        """The evaluated active section; for the engine face a plain evaluation of the circle."""
+        if not self.placed:
+            return None
+        if self.active_is_face:
+            return sketch.evaluate(self.face_shape(), None, None, self.face_area)
+        return self.evaluations[self.active]
+
+    @property
+    def active_curve(self) -> Section | None:
+        """The skin curve the active section can snap to (only the inlet section has one)."""
+        return self.section if self.active_is_inlet else None
+
+    def section_list(self) -> list[tuple[float, str, bool]]:
+        """(s, label, editable) of every key section plus the fixed engine face."""
+        rows = []
+        for k, ks in enumerate(self.state.sections):
+            rows.append((ks.s, "inlet" if k == 0 else "key section", True))
+        if self.placed:
+            rows.append((1.0, "engine face (fixed)", False))
+        return rows
+
+    def select_section(self, index: int) -> bool:
+        """Show another key section (0 = inlet, n_sections = the engine face). Not part of the undo history."""
+        if not self.placed or not 0 <= index <= self.n_sections:
+            return False
+        if index != self.active:
+            self.active = index
+            self._notify()
+        return True
 
     def _section_for(self, plane: InletPlane) -> Section | None:
         if self._section_cache is None or self._section_cache[0] != plane:
@@ -181,24 +327,36 @@ class InletModel:
         return self._section_cache[1]
 
     def _normalised(self, state: InletState) -> InletState:
-        """Snapped vertices put exactly on the current section; a default sketch if there is none yet."""
+        """The inlet snapped exactly onto the current section (a default sketch if there is none yet), and every
+        other key section held at its area A(s)."""
         if state.plane is None:
             return state
         section = self._section_for(state.plane)
-        if state.vertices is None:
-            verts, flags = sketch.default_sketch(section, state.plane, self.area)
+        secs = list(state.sections)
+        if not secs or secs[0].s != 0.0:
+            secs.insert(0, KeySection(0.0, sketch.default_sketch(section, state.plane, self.area)))
         else:
-            verts, flags = sketch.resnap(state.vertices, state.snapped, section)
-        return replace(state, vertices=verts, snapped=flags)
+            secs[0] = KeySection(0.0, sketch.resnap(secs[0].shape, section))
+        a_in = self.area / max(state.plane.projection_factor, 1e-6)
+        s_j = area_law.junction_s(state.plane.origin, self.scene.face_center, self.settings.junction_point,
+                                  self.settings.junction_fraction)
+        for k in range(1, len(secs)):
+            target = area_law.section_area(secs[k].s, a_in, self.face_area, s_j, self.settings.law, self.n_branches)
+            secs[k] = KeySection(secs[k].s, sketch.rescale_to_area(secs[k].shape, target))
+        return InletState(state.plane, tuple(secs))
 
     def _recompute(self) -> None:
         st = self.state
         if st.plane is None:
-            self.section = self.opening = None
+            self.section = None
+            self.evaluations = []
+            self.active = 0
             return
         self.section = self._section_for(st.plane)
-        self.opening = (sketch.evaluate(st.vertices, st.snapped, self.section, st.plane, self.area)
-                        if st.vertices is not None else None)
+        evals = [sketch.evaluate(st.sections[0].shape, self.section, st.plane, self.area)]
+        for ks in st.sections[1:]:
+            evals.append(sketch.evaluate(ks.shape, None, None, self.area_at(ks.s)))
+        self.evaluations = evals
 
     # ---- history ----------------------------------------------------------------------------------------
     def _commit(self, new: InletState, key: str | None = None) -> bool:
@@ -212,17 +370,22 @@ class InletModel:
             del self._past[:-UNDO_LIMIT]
         self._future.clear()
         self._last_key, self._last_time = key, now
-        self.state = new
-        self._recompute()
+        self._set_state(new)
         return True
+
+    def _set_state(self, new: InletState) -> None:
+        """Make ``new`` the state; the editor stays on its section (or on the engine face), clamped to what exists."""
+        was_face = self.active_is_face
+        self.state = new
+        self.active = len(new.sections) if was_face else min(self.active, max(len(new.sections) - 1, 0))
+        self._recompute()
 
     def undo(self) -> bool:
         if not self._past:
             return False
         self._future.append(self.state)
-        self.state = self._past.pop()
         self._last_key = None
-        self._recompute()
+        self._set_state(self._past.pop())
         self._say("Undo")
         self._notify()
         return True
@@ -231,14 +394,13 @@ class InletModel:
         if not self._future:
             return False
         self._past.append(self.state)
-        self.state = self._future.pop()
         self._last_key = None
-        self._recompute()
+        self._set_state(self._future.pop())
         self._say("Redo")
         self._notify()
         return True
 
-    # ---- editing ----------------------------------------------------------------------------------------------
+    # ---- the plane --------------------------------------------------------------------------------------------
     def _changed(self, changed: bool, text: str = "") -> bool:
         if changed:
             self._say(text)
@@ -246,7 +408,8 @@ class InletModel:
         return changed
 
     def _with_plane(self, plane: InletPlane, key: str | None) -> bool:
-        """Move / rotate the plane: the sketch keeps its (u, v) and snapped vertices follow the new section."""
+        """Move / rotate the plane: the sketch keeps its (u, v), snapped vertices follow the new section and the
+        other key sections are re-held at their (changed) area A(s)."""
         plane.frame()  # validates the angles before anything changes
         if plane == self.state.plane:
             return False
@@ -272,29 +435,144 @@ class InletModel:
                            old.sweep_deg if old else 0.0)
         return self._changed(self._with_plane(plane, "origin"))
 
-    def drag_vertex(self, index: int, uv, snap_tolerance: float | None) -> bool:
-        """Move vertex ``index`` to ``uv``; it snaps onto the section curve within ``snap_tolerance`` metres
-        (None disables snapping) and unsnaps when dropped further away."""
-        if self.state.vertices is None:
+    # ---- editing the active section ------------------------------------------------------------------------------
+    def _replace_active(self, shape: SectionShape) -> InletState:
+        secs = list(self.state.sections)
+        secs[self.active] = KeySection(secs[self.active].s, shape)
+        return replace(self.state, sections=tuple(secs))
+
+    def _edit(self, fn, key: str | None = None, rescale: bool = True) -> bool:
+        """Apply ``fn(shape) -> shape`` to the active section as one undo step. A non-inlet section is brought
+        back to its area A(s) in the same step (``rescale`` False defers that, for the events of a drag)."""
+        if not self.placed or self.active_is_face:
+            self._say("The engine face section is fixed" if self.placed else "Place the inlet first")
+            self._notify()
             return False
-        point, flag = sketch.snap_point(self.section, uv, snap_tolerance)
-        verts = list(self.state.vertices)
-        flags = list(self.state.snapped)
-        verts[index], flags[index] = point, flag
-        new = replace(self.state, vertices=tuple(verts), snapped=tuple(flags))
-        return self._changed(self._commit(new, f"vertex{index}"))
+        try:
+            shape = fn(self.state.sections[self.active].shape)
+        except ValueError as exc:
+            self._say(str(exc))
+            self._notify()
+            return False
+        if rescale and self.active > 0:
+            shape = sketch.rescale_to_area(shape, self.area_at(self.state.sections[self.active].s))
+        return self._changed(self._commit(self._replace_active(shape), key))
+
+    def finish_edit(self) -> bool:
+        """End of a drag: hold a non-inlet section at its area A(s) (merged into the drag's undo step)."""
+        if not self.placed or self.active_is_face or self.active == 0:
+            return False
+        ks = self.state.sections[self.active]
+        shape = sketch.rescale_to_area(ks.shape, self.area_at(ks.s))
+        return self._changed(self._commit(self._replace_active(shape), self._last_key))
+
+    def drag_vertex(self, index: int, uv, snap_tolerance: float | None) -> bool:
+        """Move vertex ``index`` of the active section to ``uv``. The inlet vertex snaps onto the skin curve
+        within ``snap_tolerance`` metres (None disables snapping) and unsnaps when dropped further away."""
+        if not self.placed or self.active_is_face:
+            return False
+
+        def move(shape):
+            point, flag = ((float(uv[0]), float(uv[1])), False)
+            if self.active_is_inlet:
+                point, flag = sketch.snap_point(self.section, uv, snap_tolerance)
+            moved = ol.move_vertex(shape, index, point)
+            snapped = list(moved.snapped)
+            snapped[index] = flag
+            return moved.with_(snapped=tuple(snapped))
+
+        return self._edit(move, f"vertex{index}@{self.active}", rescale=False)
+
+    def drag_handle(self, edge: int, which: int, uv) -> bool:
+        """Drag a Bézier handle of a free curved edge of the active section."""
+        return self._edit(lambda sh: ol.move_handle(sh, edge, which, uv), f"handle{edge}.{which}@{self.active}",
+                          rescale=False)
+
+    def insert_vertex(self, edge: int, uv) -> int | None:
+        """Insert a vertex on ``edge`` at the point of the edge nearest ``uv``. Returns its index, or None."""
+        made = []
+
+        def insert(shape):
+            point = uv
+            if self.active_is_inlet and shape.edge_is_snapped(edge):  # a vertex on the skin edge stays on the skin
+                point = tuple(sketch.snap_point(self.section, uv, float("inf"))[0])
+            new, at = ol.insert_vertex(shape, edge, point)
+            made.append(at)
+            return new
+
+        return made[0] if self._edit(insert) and made else None
+
+    def delete_vertex(self, index: int) -> bool:
+        return self._edit(lambda sh: ol.delete_vertex(sh, index))
+
+    def set_edge_type(self, edge: int, kind: str) -> bool:
+        return self._edit(lambda sh: ol.set_edge_type(sh, edge, kind))
+
+    def set_continuity(self, index: int, mode: str) -> bool:
+        return self._edit(lambda sh: ol.set_continuity(sh, index, mode))
 
     def fit_area(self) -> bool:
-        """Scale only the free vertices so the projected area matches the capture area target."""
-        if self.state.vertices is None:
+        """Active inlet section: scale only the free vertices so the projected area matches the capture area.
+        Another key section: rescale uniformly to A(s)."""
+        if not self.placed or self.active_is_face:
             return False
-        verts, ok, message = sketch.fit_area(self.state.vertices, self.state.snapped, self.section,
-                                             self.state.plane, self.area)
-        self._commit(replace(self.state, vertices=verts))
+        if self.active > 0:
+            self._edit(lambda sh: sh)  # already holds A(s) after every edit; nothing to fit
+            self.finish_edit()
+            self._say(f"Section s = {self.state.sections[self.active].s:g} is held at A(s) = "
+                      f"{self.area_at(self.state.sections[self.active].s):.5f} m^2")
+            self._notify()
+            return True
+        shape, ok, message = sketch.fit_area(self.state.sections[0].shape, self.section, self.state.plane, self.area)
+        self._commit(self._replace_active(shape))
         self._say(message)
         self._notify()
         return ok
 
+    # ---- key sections ------------------------------------------------------------------------------------------------
+    def add_key_section(self, s: float) -> bool:
+        """Add an intermediate key section at ``s`` (between 0 and 1, exclusive). It starts as a copy of the shape
+        of the section before it, centred and held at A(s), and becomes the active one."""
+        if not self.placed:
+            self._say("Place the inlet first")
+            self._notify()
+            return False
+        s = float(s)
+        if not 0.0 < s < 1.0:
+            self._say("A key section needs s between 0 and 1 (0 is the inlet, 1 the fixed engine face)")
+            self._notify()
+            return False
+        existing = [ks.s for ks in self.state.sections] + [1.0]
+        if any(abs(s - e) < MIN_S_SEPARATION for e in existing):
+            self._say(f"There is already a section within {MIN_S_SEPARATION:g} of s = {s:g}")
+            self._notify()
+            return False
+        before = max((ks for ks in self.state.sections if ks.s < s), key=lambda ks: ks.s)
+        shape = before.shape.with_(snapped=(False,) * before.shape.n)
+        shape = ol.translate(shape, -ol.outline_centroid(before.shape, self.section if before.s == 0.0 else None))
+        shape = sketch.rescale_to_area(shape, self.area_at(s))
+        secs = sorted(list(self.state.sections) + [KeySection(s, shape)], key=lambda ks: ks.s)
+        index = [ks.s for ks in secs].index(s)
+        self._commit(replace(self.state, sections=tuple(secs)))
+        self.active = index
+        self._say(f"Added a key section at s = {s:g}")
+        self._notify()
+        return True
+
+    def remove_key_section(self, index: int) -> bool:
+        """Remove an intermediate key section (the inlet and the engine face cannot be removed)."""
+        if not self.placed or not 0 < index < self.n_sections:
+            self._say("Only the intermediate key sections can be removed")
+            self._notify()
+            return False
+        secs = [ks for k, ks in enumerate(self.state.sections) if k != index]
+        self._commit(replace(self.state, sections=tuple(secs)))
+        self.active = min(self.active, index - 1) if self.active >= index else self.active
+        self._say("Removed the key section")
+        self._notify()
+        return True
+
+    # ---- aligning the plane to an edge ---------------------------------------------------------------------------------
     def wing_edge(self, wing_index: int, edge: str) -> vspio.EdgeSweep:
         """The planform edge sweep of a wing in the section that spans the inlet's y."""
         return vspio.edge_sweep_at(self.scene.wings[wing_index], self.state.plane.origin[1], edge)
@@ -376,17 +654,19 @@ class InletModel:
 
     # ---- save / revert -----------------------------------------------------------------------------------------------
     def inlet_definition(self) -> dict | None:
-        """What Save writes to ``ducts.inlet``; None until an inlet has been placed."""
+        """What Save writes to ``ducts.inlet`` (the plane); None until an inlet has been placed."""
         st = self.state
-        if st.plane is None or st.vertices is None:
+        if st.plane is None or not st.sections:
             return None
         return {
             "origin": [float(c) for c in st.plane.origin],
             "pitch_deg": float(st.plane.pitch_deg),
             "sweep_deg": float(st.plane.sweep_deg),
-            "vertices": [[float(u), float(v)] for u, v in st.vertices],
-            "snapped": [bool(f) for f in st.snapped],
         }
+
+    def key_sections_definition(self) -> list[dict]:
+        """What Save writes to ``ducts.key_sections``: every key section, the inlet first."""
+        return [{"s": float(ks.s), **ol.shape_to_config(ks.shape)} for ks in self.state.sections]
 
     def save(self) -> bool:
         definition = self.inlet_definition()
@@ -395,14 +675,17 @@ class InletModel:
         elif definition is None:
             self._say("Nothing to save: place an inlet first.")
         elif not self.valid:
-            self._say(f"ERROR: not saved: {self.opening.errors[0]}")
+            first = next(e for ev in self.evaluations for e in ev.errors)
+            self._say(f"ERROR: not saved: {first}")
         else:
             try:
-                path = save_inlet_definition(definition, self.save_target)
+                path = save_inlet_definition(definition, self.save_target, self.key_sections_definition(),
+                                             remove_inlet_keys=("vertices", "snapped"))
             except OSError as exc:
                 self._say(f"Save failed: {exc}")
             else:
                 self.saved_state = self.state
+                self.notice = ""  # the old keys were migrated
                 self._say(f"Saved inlet to {path.name}.")
                 self._notify()
                 return True
@@ -417,18 +700,20 @@ class InletModel:
                 warnings.simplefilter("ignore", EngineSizingWarning)
                 sizing = size_from_config(cfg)
             stored = state_from_config(cfg)
+            settings = duct_settings(cfg)
         except Exception as exc:  # a broken file must not crash the window; say what is wrong
             self._say(f"Revert failed: {type(exc).__name__}: {exc}".splitlines()[0])
             self._notify()
             return False
         self.scene.sizing = sizing
+        self.settings = settings
         self.notice = legacy_notice(cfg)
         self.alignment = None
         self._section_cache = None  # the capture area (hence the default sketch) may have changed
         normalised = self._normalised(stored)
         self._commit(normalised)
         self._recompute()
-        self.saved_state = normalised if stored.vertices is not None or stored.plane is None else stored
+        self.saved_state = normalised if stored.sections or stored.plane is None else stored
         self.mode = MODE_VIEW
         self._say(f"Reverted to {self.config_path.name}.")
         self._notify()
@@ -484,6 +769,13 @@ class InletModel:
                         f"{r.offset_over_length:.3f}" if r.length > 0 else "n/a (face not aft)",
                         "info" if r.length > 0 else "warn"),
             ]
-        out += [Readout("", f"ERROR: {e}", "error") for e in op.errors]
-        out += [Readout("", f"WARN {w}", "warn") for w in op.warnings if "from the target" not in w]
+        # the intermediate key sections and the face, each at its area law value
+        for ks, ev in list(zip(self.state.sections, self.evaluations))[1:]:
+            out.append(Readout(f"Section s={ks.s:.3f}", f"{ev.area_plane:.5f} m^2 (A(s) {ev.target_area:.5f}, "
+                               f"{100 * ev.delta:+.2f} %), {ks.shape.n} vertices",
+                               "pass" if ev.valid and abs(ev.delta) <= sketch.AREA_TOLERANCE else "error"))
+        out.append(Readout("Section s=1.000", f"engine face circle, {self.face_area:.5f} m^2 (fixed)"))
+        for ks, ev in zip(self.state.sections, self.evaluations):
+            out += [Readout("", f"ERROR: s = {ks.s:g}: {e}", "error") for e in ev.errors]
+        out += [Readout("", f"WARN {w}", "warn") for w in op.warnings]
         return out + tail

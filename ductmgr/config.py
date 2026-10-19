@@ -53,8 +53,13 @@ def _round_values(value):
     return value
 
 
-def save_inlet_definition(inlet: dict, target: Path | None = None) -> Path:
+def save_inlet_definition(inlet: dict, target: Path | None = None, key_sections: list | None = None,
+                          remove_inlet_keys=()) -> Path:
     """Write ``inlet`` into ``ducts.inlet`` of the private config, keeping comments and every other key.
+
+    ``key_sections`` (a list of mappings: ``s``, ``vertices``, ``snapped``, ``edges``, ``handles``, ``continuity``)
+    replaces ``ducts.key_sections`` wholesale when given. ``remove_inlet_keys`` names superseded keys to delete
+    from ``ducts.inlet`` (the old 5-vertex ``vertices`` / ``snapped``).
 
     ``target`` defaults to ``duct_config.yaml``. If it does not exist it is first created as a copy of the
     example config. The tracked example config is never written.
@@ -104,7 +109,26 @@ def save_inlet_definition(inlet: dict, target: Path | None = None) -> Path:
         else:
             slot[key] = flow_seq(value)
 
-    slot = mapping(mapping(doc, "ducts"), "inlet")
+    def section_map(entry):
+        """One key section: lists in flow style, one [u, v] vertex / handle pair per line."""
+        out = CommentedMap()
+        for key, value in entry.items():
+            if key == "vertices":
+                out[key] = CommentedSeq([flow_seq(v) for v in value])
+            elif key == "handles":
+                out[key] = flow_seq([None if h is None else flow_seq([flow_seq(h[0]), flow_seq(h[1])])
+                                     for h in value])  # one line: [null, [[du, dv], [du, dv]], null]
+            elif isinstance(value, list):
+                out[key] = flow_seq(value)
+            else:
+                out[key] = value
+        return out
+
+    ducts = mapping(doc, "ducts")
+    slot = mapping(ducts, "inlet")
+    for key in remove_inlet_keys:
+        if key in slot:
+            del slot[key]
     for key, value in _round_values(inlet).items():
         if isinstance(value, dict):
             sub = mapping(slot, key)
@@ -114,6 +138,8 @@ def save_inlet_definition(inlet: dict, target: Path | None = None) -> Path:
             assign_list(slot, key, value)
         else:
             slot[key] = value
+    if key_sections is not None:
+        ducts["key_sections"] = CommentedSeq([section_map(e) for e in _round_values(key_sections)])
 
     tmp = target.with_name(target.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline=newline) as f:

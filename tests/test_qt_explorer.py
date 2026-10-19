@@ -81,7 +81,7 @@ def unplaced(example_env):
     cfg, _, _ = example_env
     cfg = copy.deepcopy(cfg)
     inlet = cfg["ducts"]["inlet"]
-    inlet["origin"] = inlet["vertices"] = inlet["snapped"] = None
+    inlet["origin"] = cfg["ducts"]["key_sections"] = None
     return cfg
 
 
@@ -229,16 +229,16 @@ def test_undo_and_redo_actions_also_cover_sketch_drags(make_window):
     assert not w.act_undo.isEnabled() and not w.act_redo.isEnabled()
     w.spin_sweep.setValue(20.0)
     assert w.act_undo.isEnabled() and not w.act_redo.isEnabled()
-    start = w.model.state.vertices
+    start = w.model.state.sections[0].shape.vertices
     c = w.sketch.canvas
     c.resize(*(640, 480))
     c.fit_view()
-    c.press(c.to_screen(w.model.state.vertices[3]))
+    c.press(c.to_screen(w.model.state.sections[0].shape.vertices[3]))
     c.move(c.to_screen((0.0, 0.8)), alt=True)
     c.release()
-    assert w.model.state.vertices != start and w.windowTitle().endswith("*")
+    assert w.model.state.sections[0].shape.vertices != start and w.windowTitle().endswith("*")
     w.act_undo.trigger()  # the drag
-    assert w.model.state.vertices == start and w.spin_sweep.value() == 20.0
+    assert w.model.state.sections[0].shape.vertices == start and w.spin_sweep.value() == 20.0
     w.act_undo.trigger()  # then the sweep
     assert w.spin_sweep.value() == 0.0 and not w.windowTitle().endswith("*") and w.act_redo.isEnabled()
     w.act_redo.trigger()
@@ -310,8 +310,8 @@ def wings():
 
 
 def stand_in_scene(wing_list):
-    return SimpleNamespace(fuselage=bodies.cylinder(1.0), sizing=SimpleNamespace(capture_area_per_inlet=0.1),
-                           engine_check=None, warnings=[], face_center=None, wings=wing_list)
+    return SimpleNamespace(fuselage=bodies.cylinder(1.0), sizing=SimpleNamespace(capture_area_per_inlet=0.1, n_inlets=2),
+                           engine_check=None, warnings=[], face_center=None, face_diameter=0.5, wings=wing_list)
 
 
 def test_wing_names_are_numbered_only_when_repeated():
@@ -454,7 +454,7 @@ def test_the_readout_panel_shows_the_model_lines(make_window):
 def test_an_invalid_opening_shows_a_red_error_and_disables_save(make_window, writable):
     w = make_window(save_target=writable, config_path=writable)
     assert w.btn_save.isEnabled()
-    w.model.drag_vertex(0, (w.model.state.vertices[0][0], -0.8), snap_tolerance=None)  # inside the fuselage
+    w.model.drag_vertex(0, (w.model.state.sections[0].shape.vertices[0][0], -0.8), snap_tolerance=None)  # inside the fuselage
     assert not w.model.valid
     assert not w.btn_save.isEnabled() and not w.act_save.isEnabled()  # Save is disabled while invalid
     assert "not valid" in w.btn_save.toolTip()
@@ -571,8 +571,76 @@ def test_the_unsaved_dialog_offers_no_save_for_the_read_only_example(make_window
 
 def test_the_unsaved_dialog_offers_no_save_for_an_invalid_opening(make_window, writable, monkeypatch):
     w = make_window(save_target=writable, config_path=writable)
-    w.model.drag_vertex(0, (w.model.state.vertices[0][0], -0.8), snap_tolerance=None)
+    w.model.drag_vertex(0, (w.model.state.sections[0].shape.vertices[0][0], -0.8), snap_tolerance=None)
     captured = {}
     fake_message_box(monkeypatch, captured)
     assert w.ask_unsaved() == "discard"
     assert captured["box"].buttons == ["Discard", "Cancel"] and "not valid" in captured["info"]
+
+
+# ---- Phase 3a: key sections in the panel ---------------------------------------------------------------------
+def list_rows(w):
+    return [w.section_list.item(i).text() for i in range(w.section_list.count())]
+
+
+def test_the_key_section_list_shows_the_inlet_and_the_fixed_engine_face(make_window):
+    w = make_window()
+    rows = list_rows(w)
+    assert len(rows) == 2 and "s = 0.000" in rows[0] and "inlet" in rows[0]
+    assert "s = 1.000" in rows[1] and "fixed" in rows[1]
+    assert w.section_list.currentRow() == 0
+    assert w.btn_add_section.isEnabled() and not w.btn_remove_section.isEnabled()  # the inlet cannot be removed
+
+
+def test_adding_a_key_section_from_the_panel_opens_it_in_the_editor(make_window, monkeypatch):
+    w = make_window()
+    monkeypatch.setattr(w, "ask_section_s", lambda: 0.4)
+    w.btn_add_section.click()
+    assert [ks.s for ks in w.model.state.sections] == [0.0, 0.4] and w.model.active == 1
+    rows = list_rows(w)
+    assert len(rows) == 3 and "s = 0.400" in rows[1] and w.section_list.currentRow() == 1
+    assert w.btn_remove_section.isEnabled()
+    assert "s = 0.400" in w.sketch.title.text()  # the editor shows it
+    assert w.model.dirty and w.windowTitle().endswith("*")
+
+
+def test_cancelling_the_add_dialog_changes_nothing(make_window, monkeypatch):
+    w = make_window()
+    monkeypatch.setattr(w, "ask_section_s", lambda: None)
+    w.btn_add_section.click()
+    assert len(w.model.state.sections) == 1 and not w.model.can_undo
+
+
+def test_a_refused_s_is_reported_in_the_status_bar(make_window, monkeypatch):
+    w = make_window()
+    monkeypatch.setattr(w, "ask_section_s", lambda: 1.0)
+    w.btn_add_section.click()
+    assert len(w.model.state.sections) == 1 and "between 0 and 1" in w.message_label.text()
+
+
+def test_selecting_a_row_changes_the_edited_section_and_remove_deletes_it(make_window, monkeypatch):
+    w = make_window()
+    monkeypatch.setattr(w, "ask_section_s", lambda: 0.4)
+    w.btn_add_section.click()
+    w.section_list.setCurrentRow(0)
+    assert w.model.active == 0 and "s = 0.000" in w.sketch.title.text() and not w.btn_remove_section.isEnabled()
+    w.section_list.setCurrentRow(2)  # the engine face
+    assert w.model.active_is_face and not w.btn_remove_section.isEnabled()
+    assert not w.sketch.btn_fit_area.isEnabled()
+    w.section_list.setCurrentRow(1)
+    w.btn_remove_section.click()
+    assert len(w.model.state.sections) == 1 and len(list_rows(w)) == 2
+    assert not w.model.state.sections[0].s
+
+
+def test_the_list_is_empty_before_an_inlet_is_placed(make_window, example_env):
+    w = make_window(cfg=unplaced(example_env))
+    assert list_rows(w) == [] and not w.btn_add_section.isEnabled() and not w.btn_remove_section.isEnabled()
+
+
+def test_undo_restores_the_list_after_an_add(make_window, monkeypatch):
+    w = make_window()
+    monkeypatch.setattr(w, "ask_section_s", lambda: 0.4)
+    w.btn_add_section.click()
+    w.act_undo.trigger()
+    assert len(list_rows(w)) == 2 and w.model.active == 0

@@ -111,7 +111,7 @@ def test_fit_view_frames_the_opening_and_the_origin(canvas, model):
 
 # ---- hit testing ------------------------------------------------------------------------------------------------
 def test_hit_testing_picks_the_nearest_handle_within_its_radius(canvas, model):
-    for i, v in enumerate(model.state.vertices):
+    for i, v in enumerate(model.state.sections[0].shape.vertices):
         p = at(canvas, v)
         assert canvas.hit_vertex(p) == i
         assert canvas.hit_vertex(QtCore.QPointF(p.x() + qs.HANDLE_RADIUS_PX - 1, p.y())) == i
@@ -123,14 +123,14 @@ def test_hit_testing_picks_the_nearest_handle_within_its_radius(canvas, model):
 def test_dragging_a_vertex_moves_it_to_the_cursor(canvas, model, clock):
     start = model.state
     idx = 3  # the apex: free
-    assert canvas.press(at(canvas, model.state.vertices[idx]), alt=False)
-    target = np.array(model.state.vertices[idx]) + [0.02, 0.05]  # well above the skin
+    assert canvas.press(at(canvas, model.state.sections[0].shape.vertices[idx]), alt=False)
+    target = np.array(model.state.sections[0].shape.vertices[idx]) + [0.02, 0.05]  # well above the skin
     canvas.move(at(canvas, target), alt=False)
-    assert np.array(model.state.vertices[idx]) == pytest.approx(target, abs=1e-9)
-    assert model.state.snapped[idx] is False
+    assert np.array(model.state.sections[0].shape.vertices[idx]) == pytest.approx(target, abs=1e-9)
+    assert model.state.sections[0].shape.snapped[idx] is False
     canvas.release()
     canvas.move(at(canvas, target + [0.1, 0.1]), alt=False)  # released: moving does nothing
-    assert np.array(model.state.vertices[idx]) == pytest.approx(target, abs=1e-9)
+    assert np.array(model.state.sections[0].shape.vertices[idx]) == pytest.approx(target, abs=1e-9)
     assert model.undo() and model.state == start  # the whole drag is one step on the shared undo stack
 
 
@@ -143,15 +143,15 @@ def test_pressing_on_empty_space_drags_nothing(canvas, model):
 
 def test_a_vertex_dropped_near_the_curve_snaps_on_and_marks_itself(canvas, model):
     idx = 3
-    _, _, _ = nearest_on_section(model.section, model.state.vertices[idx])
+    _, _, _ = nearest_on_section(model.section, model.state.sections[0].shape.vertices[idx])
     foot = nearest_on_section(model.section, (0.0, 0.2))[0]  # a skin point under the apex
-    canvas.press(at(canvas, model.state.vertices[idx]))
+    canvas.press(at(canvas, model.state.sections[0].shape.vertices[idx]))
     # 5 pixels from the curve: inside the 12 px snap radius
     offset = 5.0 / canvas.scale
     canvas.move(at(canvas, foot + [0.0, offset]), alt=False)
     canvas.release()
-    assert model.state.snapped[idx] is True
-    assert distance_to_section(model.section, np.array(model.state.vertices[idx]))[0] < 1e-6  # exactly on the curve
+    assert model.state.sections[0].shape.snapped[idx] is True
+    assert distance_to_section(model.section, np.array(model.state.sections[0].shape.vertices[idx]))[0] < 1e-6  # exactly on the curve
 
 
 def test_the_snap_distance_is_a_pixel_tolerance(canvas, model):
@@ -164,46 +164,46 @@ def test_the_snap_distance_is_a_pixel_tolerance(canvas, model):
 
 def test_dropping_further_than_the_tolerance_does_not_snap_and_unsnaps(canvas, model, clock):
     snapped_idx = 0
-    assert model.state.snapped[snapped_idx]
-    canvas.press(at(canvas, model.state.vertices[snapped_idx]))
-    away = np.array(model.state.vertices[snapped_idx]) + [0.0, (qs.SNAP_PIXELS + 25) / canvas.scale]  # drag it away
+    assert model.state.sections[0].shape.snapped[snapped_idx]
+    canvas.press(at(canvas, model.state.sections[0].shape.vertices[snapped_idx]))
+    away = np.array(model.state.sections[0].shape.vertices[snapped_idx]) + [0.0, (qs.SNAP_PIXELS + 25) / canvas.scale]  # drag it away
     canvas.move(at(canvas, away), alt=False)
     canvas.release()
-    assert model.state.snapped[snapped_idx] is False  # unsnapped
-    assert np.array(model.state.vertices[snapped_idx]) == pytest.approx(away, abs=1e-9)
+    assert model.state.sections[0].shape.snapped[snapped_idx] is False  # unsnapped
+    assert np.array(model.state.sections[0].shape.vertices[snapped_idx]) == pytest.approx(away, abs=1e-9)
     clock.advance(5.0)
     # and dropping a free vertex far from the curve stays free
-    canvas.press(at(canvas, model.state.vertices[3]))
-    canvas.move(at(canvas, np.array(model.state.vertices[3]) + [0.0, 40 / canvas.scale]))
+    canvas.press(at(canvas, model.state.sections[0].shape.vertices[3]))
+    canvas.move(at(canvas, np.array(model.state.sections[0].shape.vertices[3]) + [0.0, 40 / canvas.scale]))
     canvas.release()
-    assert model.state.snapped[3] is False
+    assert model.state.sections[0].shape.snapped[3] is False
 
 
 def test_alt_disables_snapping(canvas, model):
     idx = 3
     foot = nearest_on_section(model.section, (0.0, 0.2))[0]
     spot = foot + [0.0, 3.0 / canvas.scale]  # 3 px from the curve: would snap without Alt
-    canvas.press(at(canvas, model.state.vertices[idx]))
+    canvas.press(at(canvas, model.state.sections[0].shape.vertices[idx]))
     canvas.move(at(canvas, spot), alt=True)
     canvas.release()
-    assert model.state.snapped[idx] is False
-    assert np.array(model.state.vertices[idx]) == pytest.approx(spot, abs=1e-9)
+    assert model.state.sections[0].shape.snapped[idx] is False
+    assert np.array(model.state.sections[0].shape.vertices[idx]) == pytest.approx(spot, abs=1e-9)
 
 
 def test_snapping_two_neighbours_makes_their_edge_follow_the_curve(canvas, model):
     # vertices 0 and 1 are snapped, so edge 0 follows the curve; snap vertex 2 too and edge 1 (1 -> 2) follows it
     assert model.opening.snapped_edges == (True, False, False, False, False)
     foot = nearest_on_section(model.section, (0.2, 0.0))[0]
-    canvas.press(at(canvas, model.state.vertices[2]))
+    canvas.press(at(canvas, model.state.sections[0].shape.vertices[2]))
     canvas.move(at(canvas, foot + [0.0, 2.0 / canvas.scale]), alt=False)
     canvas.release()
-    assert model.state.snapped[2] is True
+    assert model.state.sections[0].shape.snapped[2] is True
     assert model.opening.snapped_edges == (True, True, False, False, False)
     assert model.opening.snapped_length > 0
 
 
 def test_dragging_a_vertex_across_the_body_invalidates_the_opening(canvas, model):
-    canvas.press(at(canvas, model.state.vertices[3]))
+    canvas.press(at(canvas, model.state.sections[0].shape.vertices[3]))
     canvas.move(at(canvas, (0.0, -0.8)), alt=True)  # inside the fuselage
     canvas.release()
     assert not model.valid and model.opening.errors
@@ -250,7 +250,7 @@ def test_the_snapped_edge_is_painted_in_the_accent_colour_and_the_curve_is_drawn
 def test_an_invalid_opening_is_painted_red_with_an_error_message(canvas, model):
     before = pixels(canvas)
     assert count_colour(before, ERROR_COLOR) == 0
-    canvas.press(at(canvas, model.state.vertices[3]))
+    canvas.press(at(canvas, model.state.sections[0].shape.vertices[3]))
     canvas.move(at(canvas, (0.0, -0.8)), alt=True)
     canvas.release()
     after = pixels(canvas)
@@ -304,15 +304,15 @@ def test_the_dock_shows_the_readouts_and_fit_area_restores_the_target(qapp, mode
     model.drag_vertex(3, (0.0, 0.9), snap_tolerance=None)  # the area is off now
     assert abs(model.opening.delta) > sk.AREA_TOLERANCE
     assert "#E0A030" in dock.info.text() or "E0A030".lower() in dock.info.text().lower()  # amber: not within 0.5 %
-    snapped_before = [model.state.vertices[i] for i in (0, 1)]
+    snapped_before = [model.state.sections[0].shape.vertices[i] for i in (0, 1)]
     dock.btn_fit_area.click()
     assert abs(model.opening.delta) < sk.AREA_TOLERANCE and "#4CAF50".lower() in dock.info.text().lower()
-    assert [model.state.vertices[i] for i in (0, 1)] == snapped_before
+    assert [model.state.sections[0].shape.vertices[i] for i in (0, 1)] == snapped_before
 
 
 def test_the_dock_reports_errors_in_red(qapp, model):
     dock = qs.SketchDock(model)
-    model.drag_vertex(0, (model.state.vertices[0][0], -0.8), snap_tolerance=None)
+    model.drag_vertex(0, (model.state.sections[0].shape.vertices[0][0], -0.8), snap_tolerance=None)
     assert "ERROR" in dock.info.text() and "#F85149".lower() in dock.info.text().lower()
 
 
@@ -330,3 +330,194 @@ def test_fit_area_is_disabled_before_an_inlet_exists(qapp, scene, example_env):
     cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["inlet"]["vertices"] = cfg["ducts"]["inlet"]["snapped"] = None
     dock = qs.SketchDock(InletModel(scene, cfg, EXAMPLE_CONFIG, None))
     assert not dock.btn_fit_area.isEnabled() and dock.info.text() == ""
+
+
+# ---- Phase 3a: general section editor -----------------------------------------------------------------------
+RIGHT = QtCore.Qt.MouseButton.RightButton
+
+
+def shape_of(model):
+    return model.active_shape
+
+
+def mid_of_edge(canvas, edge):
+    """Screen position in the middle of an edge's drawn path."""
+    path = canvas.model.active_opening.edge_paths[edge]
+    if len(path) == 2:  # a straight edge is just its two end points
+        return canvas.to_screen((path[0] + path[1]) / 2)
+    return canvas.to_screen(path[len(path) // 2])
+
+
+def test_double_clicking_a_free_edge_inserts_a_vertex_there(canvas, model, clock):
+    before = shape_of(model)
+    assert not before.edge_is_snapped(2)
+    clock.advance(10.0)
+    at_edge = mid_of_edge(canvas, 2)
+    index = canvas.double_click(at_edge)
+    assert index == 3 and shape_of(model).n == before.n + 1
+    assert canvas.selected_vertex == 3
+    new = canvas.to_screen(shape_of(model).vertices[3])
+    assert abs(new.x() - at_edge.x()) < 2.0 and abs(new.y() - at_edge.y()) < 2.0  # where it was clicked (on the edge)
+    assert model.valid
+
+
+def test_double_clicking_empty_space_or_a_vertex_inserts_nothing(canvas, model):
+    n = shape_of(model).n
+    assert canvas.double_click(QtCore.QPointF(5, 5)) is None
+    assert canvas.double_click(at(canvas, shape_of(model).vertices[3])) is None
+    assert shape_of(model).n == n and not model.can_undo
+
+
+def test_double_clicking_a_snapped_edge_inserts_a_snapped_vertex_on_the_skin(canvas, model):
+    assert shape_of(model).edge_is_snapped(0)
+    index = canvas.double_click(mid_of_edge(canvas, 0))
+    assert index == 1 and shape_of(model).snapped[1] is True
+    assert distance_to_section(model.section, np.array(shape_of(model).vertices[1]))[0] < 1e-6
+
+
+def test_right_click_on_a_vertex_removes_it_and_on_empty_space_pans(canvas, model, clock):
+    n = shape_of(model).n
+    clock.advance(10.0)
+    assert canvas.press(at(canvas, shape_of(model).vertices[4]), button=RIGHT)
+    assert shape_of(model).n == n - 1 and canvas.selected_vertex is None
+    centre = canvas.centre.copy()
+    canvas.press(QtCore.QPointF(5, 5), button=RIGHT)
+    canvas.move(QtCore.QPointF(45, 25))
+    canvas.release()
+    assert not np.allclose(canvas.centre, centre) and shape_of(model).n == n - 1  # a pan, not an edit
+
+
+def test_the_delete_key_removes_the_selected_vertex_but_never_below_three(canvas, model, clock):
+    canvas.press(at(canvas, shape_of(model).vertices[3]))
+    canvas.release()
+    assert canvas.selected_vertex == 3
+    clock.advance(10.0)
+    assert canvas.delete_selected() and shape_of(model).n == 4
+    canvas.selected_vertex = 2
+    clock.advance(10.0)
+    assert canvas.delete_selected() and shape_of(model).n == 3
+    canvas.selected_vertex = 0
+    assert not canvas.delete_selected() and shape_of(model).n == 3  # the model refuses the 3rd -> 2nd
+
+
+def test_a_selected_edge_can_be_made_curved_and_its_handles_dragged(canvas, model, clock):
+    canvas.press(mid_of_edge(canvas, 3))
+    canvas.release()
+    assert canvas.selected_edge == 3 and canvas.selected_vertex is None
+    clock.advance(10.0)
+    model.set_edge_type(3, "curved")
+    handles = canvas.handle_positions()
+    assert set(handles) == {(3, 0), (3, 1)}  # a free curved edge shows two handles
+    target = at(canvas, np.array(shape_of(model).control_points(3)[1]) + [0.03, 0.05])
+    clock.advance(10.0)
+    assert canvas.press(handles[(3, 0)])
+    canvas.move(target)
+    canvas.release()
+    ctrl = shape_of(model).control_points(3)
+    assert canvas.to_screen(ctrl[1]).x() == pytest.approx(target.x(), abs=1e-6)
+    assert canvas.to_screen(ctrl[1]).y() == pytest.approx(target.y(), abs=1e-6)
+
+
+def test_snapped_and_straight_edges_have_no_handles(canvas, model):
+    assert canvas.handle_positions() == {}
+    model.set_edge_type(3, "curved")
+    assert all(e == 3 for e, _ in canvas.handle_positions())  # the snapped edge 0 shows none
+
+
+def test_the_continuity_buttons_follow_the_selection(qapp, model, clock):
+    dock = qs.SketchDock(model)
+    c = dock.canvas
+    c.resize(*SIZE)
+    c.fit_view()
+    assert not dock.btn_smooth.isEnabled() and not dock.btn_curved.isEnabled()  # nothing selected
+    c.press(at(c, shape_of(model).vertices[3]))
+    c.release()
+    assert dock.btn_smooth.isEnabled() and dock.btn_symmetric.isEnabled() and not dock.btn_corner.isEnabled()
+    clock.advance(10.0)
+    dock.btn_smooth.click()
+    assert shape_of(model).continuity[3] == "smooth" and not dock.btn_smooth.isEnabled()
+    c.press(mid_of_edge(c, 2))
+    c.release()
+    assert dock.btn_curved.isEnabled() and not dock.btn_straight.isEnabled()
+    clock.advance(10.0)
+    dock.btn_curved.click()
+    assert shape_of(model).edge_is_curved(2) and dock.btn_straight.isEnabled()
+    c.press(mid_of_edge(c, 0))  # a snapped edge cannot be edited
+    c.release()
+    assert not dock.btn_curved.isEnabled() and not dock.btn_straight.isEnabled()
+
+
+def test_delete_button_is_off_at_three_vertices(qapp, model, clock):
+    dock = qs.SketchDock(model)
+    for _ in range(2):
+        clock.advance(10.0)
+        model.delete_vertex(4 if model.active_shape.n == 5 else 3)
+    assert model.active_shape.n == 3
+    dock.canvas.selected_vertex = 1
+    dock.refresh()
+    assert not dock.btn_delete.isEnabled()
+
+
+def test_the_selection_is_cleared_when_the_vertex_count_changes(canvas, model, clock):
+    canvas.selected_vertex = 4
+    clock.advance(10.0)
+    model.insert_vertex(2, np.array(shape_of(model).vertices[2]) * 0.5 + np.array(shape_of(model).vertices[3]) * 0.5)
+    assert canvas.selected_vertex is None
+
+
+def test_markers_differ_by_continuity_and_a_curved_outline_is_painted(canvas, model, clock):
+    canvas.resize(*SIZE)
+    plain = count_colour(pixels(canvas), "#E6EDF3")
+    clock.advance(10.0)
+    model.set_edge_type(3, "curved")
+    clock.advance(10.0)
+    model.drag_handle(3, 0, np.array(shape_of(model).control_points(3)[1]) + [0.05, 0.12])
+    model.set_continuity(3, "symmetric")
+    arr = pixels(canvas)
+    assert count_colour(arr, "#58A6FF") > 20  # the Bézier handles and tangent lines
+    assert count_colour(arr, "#E6EDF3") != plain
+
+
+def test_a_key_section_has_no_skin_and_no_snapping(qapp, model, clock):
+    model.add_key_section(0.4)
+    c = qs.SketchCanvas(model)
+    c.resize(*SIZE)
+    assert model.active_curve is None and c.editable
+    v = np.array(shape_of(model).vertices[1])
+    clock.advance(10.0)
+    c.press(c.to_screen(v))
+    c.move(c.to_screen(v + [0.002, 0.003]))
+    c.release()
+    assert not any(shape_of(model).snapped)  # nothing to snap to
+    assert model.active_opening.area_plane == pytest.approx(model.area_at(0.4), rel=1e-9)  # resized at drag end
+
+
+def test_the_engine_face_is_shown_fixed_and_cannot_be_edited(qapp, model):
+    model.select_section(model.n_sections)
+    c = qs.SketchCanvas(model)
+    c.resize(*SIZE)
+    assert not c.editable and c.handle_positions() == {}
+    before = model.state
+    assert not c.press(at(c, shape_of(model).vertices[0])) and not c.double_click(mid_of_edge(c, 0))
+    assert model.state == before
+    assert count_colour(pixels(c), qs.FIXED_COLOR) > 100  # the circle is drawn
+
+
+def test_switching_sections_reframes_the_view_and_clears_the_selection(qapp, model):
+    c = qs.SketchCanvas(model)
+    c.resize(*SIZE)
+    c.selected_vertex = 2
+    model.add_key_section(0.5)
+    assert c.selected_vertex is None
+    model.select_section(model.n_sections)
+    assert c.selected_vertex is None and c.selected_edge is None
+
+
+def test_the_dock_title_names_the_active_section(qapp, model):
+    dock = qs.SketchDock(model)
+    assert "s = 0.000" in dock.title.text() and "inlet" in dock.title.text()
+    model.add_key_section(0.4)
+    assert "s = 0.400" in dock.title.text() and "A(s)" in dock.title.text()
+    assert "A(s)" in dock.info.text()
+    model.select_section(model.n_sections)
+    assert "engine face" in dock.title.text() and not dock.btn_fit_area.isEnabled()

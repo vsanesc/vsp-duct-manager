@@ -68,18 +68,28 @@ def place(model, scene, x=3.0, y=0.4):
     assert model.begin_place() and model.handle_click(skin_point(scene, x, y))
 
 
+def vs(state):
+    """Vertices of the inlet section (s = 0)."""
+    return state.sections[0].shape.vertices
+
+
+def sn(state):
+    return state.sections[0].shape.snapped
+
+
 def unplaced_cfg(example_env):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
-    inlet = cfg["ducts"]["inlet"]
-    inlet["origin"] = inlet["vertices"] = inlet["snapped"] = None
+    cfg["ducts"]["inlet"]["origin"] = None
+    cfg["ducts"]["key_sections"] = None
     return cfg, path
 
 
-def body_scene(body, area=0.1, wings=()):
+def body_scene(body, area=0.1, wings=(), face_diameter=0.5):
     """A stand-in scene around an analytic body (no OpenVSP)."""
-    return SimpleNamespace(fuselage=body, sizing=SimpleNamespace(capture_area_per_inlet=area), engine_check=None,
-                           warnings=[], face_center=np.array([6.0, 0.0, 0.0]), wings=list(wings))
+    return SimpleNamespace(fuselage=body, sizing=SimpleNamespace(capture_area_per_inlet=area, n_inlets=2),
+                           engine_check=None, warnings=[], face_center=np.array([6.0, 0.0, 0.0]),
+                           face_diameter=face_diameter, wings=list(wings))
 
 
 def body_model(body, origin, area=0.1, pitch=0.0, sweep=0.0, clock=None):
@@ -92,13 +102,15 @@ def test_the_inlet_is_loaded_from_the_config(scene, example_env):
     cfg, path, _ = example_env
     m = make(scene, path)
     ref = cfg["ducts"]["inlet"]
+    section = cfg["ducts"]["key_sections"][0]
     assert m.state.plane == InletPlane(tuple(ref["origin"]), 0.0, 0.0)
-    assert list(m.state.snapped) == ref["snapped"]
-    assert np.array(m.state.vertices) == pytest.approx(np.array(ref["vertices"]), abs=1e-5)
+    assert list(sn(m.state)) == section["snapped"] and len(m.state.sections) == 1
+    assert np.array(vs(m.state)) == pytest.approx(np.array(section["vertices"]), abs=1e-5)
+    assert m.state.sections[0].s == 0.0 and not m.notice
     assert m.section is not None and m.opening is not None and m.valid
     assert not m.dirty and not m.can_undo and m.mode == "view" and m.mode_text == "View"
     for i in (0, 1):  # snapped vertices are exactly on the current section
-        assert distance_to_section(m.section, np.array(m.state.vertices[i]))[0] < 1e-6
+        assert distance_to_section(m.section, np.array(vs(m.state)[i]))[0] < 1e-6
 
 
 def test_the_loaded_sketch_matches_the_phase_1_capture_area(scene, example_env):
@@ -130,13 +142,9 @@ def test_null_old_keys_give_no_notice(example_env):
 
 @pytest.mark.parametrize("patch, message", [
     ({"origin": [1.0, 2.0]}, "origin"),
-    ({"vertices": [[0, 0]] * 4}, "5"),
-    ({"vertices": [[0, 0, 0]] * 5}, "pairs"),
-    ({"snapped": [True, False]}, "snapped"),
-    ({"snapped": [1, 0, 0, 0, 0]}, "snapped"),
     ({"pitch_deg": 95.0}, "pitch"),
 ])
-def test_malformed_inlets_are_rejected_clearly(example_env, patch, message):
+def test_malformed_inlet_planes_are_rejected_clearly(example_env, patch, message):
     cfg, _, _ = example_env
     cfg = copy.deepcopy(cfg)
     cfg["ducts"]["inlet"].update(patch)
@@ -144,12 +152,40 @@ def test_malformed_inlets_are_rejected_clearly(example_env, patch, message):
         state_from_config(cfg)
 
 
-def test_an_origin_without_vertices_gets_a_default_sketch_and_is_dirty(scene, example_env):
+@pytest.mark.parametrize("patch, message", [
+    ({"vertices": [[0, 0]] * 2}, "3"),
+    ({"vertices": [[0, 0, 0]] * 5}, "pairs"),
+    ({"snapped": [True, False]}, "snapped"),
+    ({"edges": ["straight"] * 4}, "edges"),
+    ({"edges": ["wavy"] * 5}, "edges"),
+    ({"s": 1.0}, "s"),
+    ({"s": -0.1}, "s"),
+    ({"s": None}, "'s'"),
+])
+def test_malformed_key_sections_are_rejected_clearly(example_env, patch, message):
+    cfg, _, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    cfg["ducts"]["key_sections"][0].update(patch)
+    with pytest.raises(ValueError, match=message):
+        state_from_config(cfg)
+
+
+def test_two_key_sections_too_close_in_s_are_rejected(example_env):
+    cfg, _, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    second = copy.deepcopy(cfg["ducts"]["key_sections"][0])
+    second["s"] = 0.005
+    cfg["ducts"]["key_sections"].append(second)
+    with pytest.raises(ValueError, match="closer"):
+        state_from_config(cfg)
+
+
+def test_an_origin_without_key_sections_gets_a_default_sketch_and_is_dirty(scene, example_env):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
-    cfg["ducts"]["inlet"]["vertices"] = cfg["ducts"]["inlet"]["snapped"] = None
+    cfg["ducts"]["key_sections"] = None
     m = InletModel(scene, cfg, path, None)
-    assert m.state.vertices is not None and m.state.snapped[:2] == (True, True) and m.valid
+    assert sn(m.state)[:2] == (True, True) and m.valid
     assert m.dirty  # the sketch was created, not read from the file
 
 
@@ -157,28 +193,28 @@ def test_an_origin_without_vertices_gets_a_default_sketch_and_is_dirty(scene, ex
 def test_dragging_a_vertex_near_the_curve_snaps_it_onto_the_curve(scene, example_env, clock):
     _, path, _ = example_env
     m = make(scene, path, clock=clock)
-    assert m.state.snapped[2] is False
-    target = np.array(m.state.vertices[2])
+    assert sn(m.state)[2] is False
+    target = np.array(vs(m.state)[2])
     p, _, _ = __import__("ductmgr.section", fromlist=["nearest_on_section"]).nearest_on_section(m.section, target)
     near = tuple(p + np.array([0.0, 0.004]))  # 4 mm off the curve
     assert m.drag_vertex(2, near, snap_tolerance=0.01)
-    assert m.state.snapped[2] is True
-    assert distance_to_section(m.section, np.array(m.state.vertices[2]))[0] < 1e-6  # on the curve
+    assert sn(m.state)[2] is True
+    assert distance_to_section(m.section, np.array(vs(m.state)[2]))[0] < 1e-6  # on the curve
     assert m.dirty
 
 
 def test_dragging_away_unsnaps_and_alt_disables_snapping(scene, example_env, clock):
     _, path, _ = example_env
     m = make(scene, path, clock=clock)
-    assert m.state.snapped[0] is True
-    far = (m.state.vertices[0][0], m.state.vertices[0][1] + 0.2)
+    assert sn(m.state)[0] is True
+    far = (vs(m.state)[0][0], vs(m.state)[0][1] + 0.2)
     clock.advance(5.0)
-    assert m.drag_vertex(0, far, snap_tolerance=0.01) and m.state.snapped[0] is False  # dropped far: unsnapped
-    assert m.state.vertices[0] == far
+    assert m.drag_vertex(0, far, snap_tolerance=0.01) and sn(m.state)[0] is False  # dropped far: unsnapped
+    assert vs(m.state)[0] == far
     clock.advance(5.0)
-    on_curve = tuple(np.array(m.state.vertices[1]))  # exactly on the curve, snapped vertex 1
+    on_curve = tuple(np.array(vs(m.state)[1]))  # exactly on the curve, snapped vertex 1
     m.drag_vertex(1, (on_curve[0], on_curve[1] + 0.0005), snap_tolerance=None)  # Alt: no snapping even when close
-    assert m.state.snapped[1] is False and m.state.vertices[1] == (on_curve[0], on_curve[1] + 0.0005)
+    assert sn(m.state)[1] is False and vs(m.state)[1] == (on_curve[0], on_curve[1] + 0.0005)
 
 
 def test_a_vertex_can_slide_along_the_curve_staying_snapped(scene, example_env, clock):
@@ -186,12 +222,12 @@ def test_a_vertex_can_slide_along_the_curve_staying_snapped(scene, example_env, 
     from ductmgr.section import nearest_on_section, point_at
 
     m = make(scene, path, clock=clock)
-    _, s0, _ = nearest_on_section(m.section, m.state.vertices[0])
+    _, s0, _ = nearest_on_section(m.section, vs(m.state)[0])
     ahead = point_at(m.section, s0 - 0.03)  # a point 3 cm further along the curve
     m.drag_vertex(0, tuple(ahead + [0.0, 0.001]), snap_tolerance=0.05)  # dropped 1 mm off it
-    assert m.state.snapped[0]
-    assert distance_to_section(m.section, np.array(m.state.vertices[0]))[0] < 1e-6
-    _, s1, _ = nearest_on_section(m.section, m.state.vertices[0])
+    assert sn(m.state)[0]
+    assert distance_to_section(m.section, np.array(vs(m.state)[0]))[0] < 1e-6
+    _, s1, _ = nearest_on_section(m.section, vs(m.state)[0])
     assert s1 == pytest.approx(s0 - 0.03, abs=0.002)  # it moved 3 cm along the curve, staying on it
 
 
@@ -219,11 +255,11 @@ def test_moving_the_plane_keeps_the_sketch_and_resnaps_the_snapped_vertices(scen
     clock.advance(10.0)
     assert m.set_origin(new_x, y, z_new)
     after = m.state
-    assert after.snapped == before.snapped
+    assert sn(after) == sn(before)
     for i in (2, 3, 4):
-        assert after.vertices[i] == before.vertices[i]  # free vertices keep their (u, v)
+        assert vs(after)[i] == vs(before)[i]  # free vertices keep their (u, v)
     for i in (0, 1):
-        assert distance_to_section(m.section, np.array(after.vertices[i]))[0] < 1e-6  # on the NEW curve
+        assert distance_to_section(m.section, np.array(vs(after)[i]))[0] < 1e-6  # on the NEW curve
     assert m.undo() and m.state == before
 
 
@@ -255,10 +291,10 @@ def test_fit_area_through_the_model(scene, example_env, clock):
     m.drag_vertex(3, (0.0, 0.9), snap_tolerance=None)  # push the apex up: the area is off now
     assert abs(m.opening.delta) > sk.AREA_TOLERANCE
     clock.advance(10.0)
-    snapped_before = [m.state.vertices[i] for i in (0, 1)]
+    snapped_before = [vs(m.state)[i] for i in (0, 1)]
     assert m.fit_area() and "Area fitted" in m.message
     assert abs(m.opening.delta) < sk.AREA_TOLERANCE
-    assert [m.state.vertices[i] for i in (0, 1)] == snapped_before  # the snapped vertices did not move
+    assert [vs(m.state)[i] for i in (0, 1)] == snapped_before  # the snapped vertices did not move
     assert m.undo() and abs(m.opening.delta) > sk.AREA_TOLERANCE  # fitting is an ordinary undo step
 
 
@@ -437,7 +473,7 @@ def test_place_mode_places_once_then_switches_itself_off(scene, example_env):
     assert m.handle_click(p)
     assert m.mode == "view" and m.mode_text == "View" and m.placed and m.dirty
     assert m.state.plane.origin == pytest.approx(tuple(p)) and m.valid  # a default sketch appears on the skin
-    assert m.state.snapped[:2] == (True, True)
+    assert sn(m.state)[:2] == (True, True)
     placed = m.state
     assert not m.handle_click(skin_point(scene, 4.0, 0.2)) and m.state == placed  # the mode ended
 
@@ -446,11 +482,11 @@ def test_placing_again_moves_the_origin_and_keeps_the_sketch_and_angles(scene, e
     _, path, _ = example_env
     m = make(scene, path, clock=clock)
     m.set_param("sweep_deg", 15.0)
-    verts = m.state.vertices
+    verts = vs(m.state)
     free = [verts[i] for i in (2, 3, 4)]
     assert m.begin_place() and m.handle_click(skin_point(scene, 3.4, 0.5))
     assert m.state.plane.sweep_deg == 15.0 and m.state.plane.origin[0] == pytest.approx(3.4)
-    assert [m.state.vertices[i] for i in (2, 3, 4)] == free
+    assert [vs(m.state)[i] for i in (2, 3, 4)] == free
 
 
 def test_escape_cancels_placement(scene, example_env):
@@ -520,7 +556,7 @@ def test_the_lock_is_neither_history_nor_a_change(scene, example_env):
 # ---- validity and saving ---------------------------------------------------------------------------------------------------------
 def invalidate(m, clock):
     clock.advance(10.0)
-    m.drag_vertex(0, (m.state.vertices[0][0], -0.8), snap_tolerance=None)  # a free vertex deep inside the fuselage
+    m.drag_vertex(0, (vs(m.state)[0][0], -0.8), snap_tolerance=None)  # a free vertex deep inside the fuselage
 
 
 def test_an_opening_inside_the_fuselage_is_invalid_and_cannot_be_saved(scene, writable, clock):
@@ -561,15 +597,17 @@ def test_save_writes_the_inlet_and_round_trips_uv_vertices(scene, writable, cloc
     inlet = after["ducts"]["inlet"]
     assert inlet["origin"] == pytest.approx([round(c, 6) for c in m.state.plane.origin])
     assert inlet["pitch_deg"] == -6.0 and inlet["sweep_deg"] == 12.0
-    assert np.array(inlet["vertices"]) == pytest.approx(np.array([[round(u, 6), round(v, 6)] for u, v in m.state.vertices]))
-    assert inlet["snapped"] == list(m.state.snapped) and all(isinstance(f, bool) for f in inlet["snapped"])
+    saved = after["ducts"]["key_sections"][0]
+    assert np.array(saved["vertices"]) == pytest.approx(np.array([[round(u, 6), round(v, 6)] for u, v in vs(m.state)]))
+    assert saved["snapped"] == list(sn(m.state)) and all(isinstance(f, bool) for f in saved["snapped"])
+    assert "vertices" not in inlet and "snapped" not in inlet
     for section in ("model", "engine", "design_point", "checks"):
         assert after[section] == before[section]
     # a fresh model reads the same inlet back, in (u, v)
     again = make(scene, writable, writable)
     assert again.state.plane == InletPlane(tuple(inlet["origin"]), -6.0, 12.0)
-    assert np.array(again.state.vertices) == pytest.approx(np.array(m.state.vertices), abs=1e-5)
-    assert again.state.snapped == m.state.snapped and not again.dirty
+    assert np.array(vs(again.state)) == pytest.approx(np.array(vs(m.state)), abs=1e-5)
+    assert sn(again.state) == sn(m.state) and not again.dirty
 
 
 def test_saving_is_not_an_edit_so_undo_still_works(scene, writable, clock):
@@ -712,3 +750,286 @@ def test_without_an_engine_face_the_readouts_say_so(scene, example_env):
     m = InletModel(s, cfg, path, None)
     rows = {r.label: r for r in m.readouts() if r.label}
     assert rows["Engine face"].level == "warn" and "Distance to face" not in rows
+
+
+# ---- Phase 3a: the general section editor --------------------------------------------------------------------------------------------------
+def legacy_cfg(example_env):
+    """The old 5-vertex format: ducts.inlet.vertices / snapped and no key_sections."""
+    cfg, path, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    section = cfg["ducts"].pop("key_sections")[0]
+    cfg["ducts"]["inlet"]["vertices"] = section["vertices"]
+    cfg["ducts"]["inlet"]["snapped"] = section["snapped"]
+    return cfg, path, section
+
+
+def test_an_old_five_vertex_config_loads_as_a_straight_inlet_section_with_a_notice(scene, example_env):
+    cfg, path, section = legacy_cfg(example_env)
+    m = InletModel(scene, cfg, path, None)
+    shape = m.state.sections[0].shape
+    assert len(m.state.sections) == 1 and m.state.sections[0].s == 0.0
+    assert shape.n == 5 and set(shape.edges) == {"straight"} and set(shape.continuity) == {"corner"}
+    assert list(shape.snapped) == section["snapped"]
+    assert np.array(shape.vertices) == pytest.approx(np.array(section["vertices"]), abs=1e-5)
+    assert "\n" not in m.notice and "5-vertex" in m.notice and "straight-edged" in m.notice
+    assert any(r.value == m.notice and r.level == "warn" for r in m.readouts())
+    assert m.valid
+
+
+def test_saving_a_legacy_config_migrates_it_to_key_sections(scene, example_env, writable):
+    cfg, _, _ = legacy_cfg(example_env)
+    inlet = cfg["ducts"]["inlet"]
+    text = yaml.safe_load(writable.read_text(encoding="utf-8"))
+    text["ducts"].pop("key_sections")
+    text["ducts"]["inlet"].update(vertices=inlet["vertices"], snapped=inlet["snapped"])
+    writable.write_text(yaml.safe_dump(text, sort_keys=False), encoding="utf-8")
+    m = make(scene, writable, writable)
+    assert m.notice and m.save() and m.notice == ""
+    saved = yaml.safe_load(writable.read_text(encoding="utf-8"))["ducts"]
+    assert "vertices" not in saved["inlet"] and "snapped" not in saved["inlet"]
+    assert saved["key_sections"][0]["s"] == 0.0 and saved["key_sections"][0]["edges"] == ["straight"] * 5
+    assert make(scene, writable, writable).notice == ""
+
+
+def test_key_sections_next_to_old_vertices_say_so(example_env):
+    cfg, _, _ = example_env
+    cfg = copy.deepcopy(cfg)
+    cfg["ducts"]["inlet"]["vertices"] = [[0, 0]] * 5
+    assert "superseded" in legacy_notice(cfg)
+
+
+def test_inserting_a_vertex_on_an_edge(scene, example_env, clock):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    before = m.state
+    a, b = np.array(vs(before)[2]), np.array(vs(before)[3])
+    mid = tuple((a + b) / 2 + [0.002, 0.0])  # the edge from vertex 2 to 3 is free and straight
+    assert not before.sections[0].shape.edge_is_snapped(2)
+    clock.advance(10.0)
+    at = m.insert_vertex(2, mid)
+    assert at == 3 and len(vs(m.state)) == 6 and len(sn(m.state)) == 6 and sn(m.state)[3] is False
+    assert m.valid
+    # the new vertex lies on the old straight edge (the click was 2 mm off it)
+    p = np.array(vs(m.state)[3])
+    t = np.dot(p - a, b - a) / np.dot(b - a, b - a)
+    assert 0.0 < t < 1.0 and np.linalg.norm(a + t * (b - a) - p) < 1e-9
+    assert m.undo() and m.state == before
+
+
+def test_a_vertex_inserted_on_a_snapped_edge_lands_on_the_skin_and_stays_snapped(scene, example_env, clock):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    before = m.state
+    assert before.sections[0].shape.edge_is_snapped(0)
+    a, b = np.array(vs(before)[0]), np.array(vs(before)[1])
+    click = tuple((a + b) / 2 + [0.0, 0.003])  # a little off the curve
+    at = m.insert_vertex(0, click)
+    assert at == 1 and sn(m.state)[1] is True and len(vs(m.state)) == 6
+    assert distance_to_section(m.section, np.array(vs(m.state)[1]))[0] < 1e-6
+    assert m.state.sections[0].shape.edge_is_snapped(0) and m.state.sections[0].shape.edge_is_snapped(1)
+    assert m.valid and m.undo() and m.state == before
+
+
+def test_deleting_vertices_keeps_a_valid_outline_down_to_three(scene, example_env, clock):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    clock.advance(10.0)
+    assert m.delete_vertex(4) and len(vs(m.state)) == 4 and m.valid
+    clock.advance(10.0)
+    assert m.delete_vertex(3) and len(vs(m.state)) == 3
+    before = m.state
+    clock.advance(10.0)
+    assert not m.delete_vertex(2) and m.state == before  # a section needs at least 3 vertices
+    assert m.undo() and len(vs(m.state)) == 4
+
+
+def test_curved_edges_and_continuity_through_the_model(scene, example_env, clock):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    base_area = m.opening.area_plane
+    clock.advance(10.0)
+    assert m.set_edge_type(3, "curved")
+    shape = m.state.sections[0].shape
+    assert shape.edge_is_curved(3) and shape.handles[3] is not None
+    clock.advance(10.0)
+    assert m.drag_handle(3, 0, (vs(m.state)[3][0] + 0.03, vs(m.state)[3][1] + 0.06))
+    assert m.opening.area_plane != pytest.approx(base_area, abs=1e-9)  # the area is that of the curved outline
+    clock.advance(10.0)
+    assert m.set_continuity(3, "smooth") and m.state.sections[0].shape.continuity[3] == "smooth"
+    assert m.valid
+    before = m.state
+    assert not m.set_edge_type(0, "curved") and m.state == before  # a snapped edge is not editable
+
+
+def test_a_free_curved_edge_changes_the_projected_area_the_fit_works_on(scene, example_env, clock):
+    _, path, _ = example_env
+    m = make(scene, path, clock=clock)
+    clock.advance(10.0)
+    m.set_edge_type(3, "curved")
+    clock.advance(10.0)
+    m.drag_handle(3, 0, (vs(m.state)[3][0] + 0.05, vs(m.state)[3][1] + 0.1))
+    assert abs(m.opening.delta) > sk.AREA_TOLERANCE
+    snapped = [vs(m.state)[i] for i in (0, 1)]
+    clock.advance(10.0)
+    assert m.fit_area() and abs(m.opening.delta) < sk.AREA_TOLERANCE
+    assert [vs(m.state)[i] for i in (0, 1)] == snapped
+
+
+# ---- key sections --------------------------------------------------------------------------------------------------------------------
+@pytest.fixture()
+def cyl_model(clock):
+    return body_model(bodies.cylinder(1.0), (4.0, 0.3, 0.9), area=0.12, clock=clock)
+
+
+def test_the_engine_face_is_listed_last_and_is_fixed(cyl_model):
+    m = cyl_model
+    assert m.section_list() == [(0.0, "inlet", True), (1.0, "engine face (fixed)", False)]
+    assert m.select_section(m.n_sections) and m.active_is_face and m.active_s == 1.0
+    assert m.active_shape.n >= 3 and all(e == "curved" for e in m.active_shape.edges)  # a circle
+    face = m.active_opening
+    assert face.area_plane == pytest.approx(m.face_area, rel=2e-3)
+    before = m.state
+    assert not m.drag_vertex(0, (0.0, 0.0), None) and not m.delete_vertex(0) and not m.fit_area()
+    assert m.state == before
+
+
+def test_adding_a_key_section_copies_the_previous_shape_at_the_area_law_size(cyl_model, clock):
+    m = cyl_model
+    clock.advance(10.0)
+    assert m.add_key_section(0.3)
+    assert [ks.s for ks in m.state.sections] == [0.0, 0.3] and m.active == 1 and not m.active_is_inlet
+    ks = m.state.sections[1]
+    assert ks.shape.n == m.state.sections[0].shape.n and not any(ks.shape.snapped)
+    assert m.active_opening.area_plane == pytest.approx(m.area_at(0.3), rel=1e-9)
+    assert abs(m.active_opening.delta) < 1e-9 and m.valid
+    assert m.undo() and len(m.state.sections) == 1
+
+
+def test_key_section_areas_follow_the_area_law_before_and_after_the_junction(cyl_model, clock):
+    from ductmgr import area_law
+
+    m = cyl_model
+    sj = m.junction_s
+    for s in (sj * 0.5, (1 + sj) / 2):
+        clock.advance(10.0)
+        m.add_key_section(round(s, 4))
+    s_branch, s_trunk = (ks.s for ks in m.state.sections[1:])
+    assert s_branch < sj < s_trunk
+    a_in = m.inlet_plane_area
+    for ks, ev in zip(m.state.sections[1:], m.evaluations[1:]):
+        expect = area_law.section_area(ks.s, a_in, m.face_area, sj, m.settings.law, 2)
+        assert ev.area_plane == pytest.approx(expect, rel=1e-9)
+
+
+def test_a_key_section_keeps_its_shape_when_edited_but_not_its_size(cyl_model, clock):
+    m = cyl_model
+    m.add_key_section(0.4)
+    target = m.area_at(0.4)
+    clock.advance(10.0)
+    n = m.active_shape.n
+    start = m.active_shape.vertices[2]
+    for k in range(5):  # a drag, then the end of the drag
+        clock.advance(0.01)
+        m.drag_vertex(2, (start[0] + 0.01 * (k + 1), start[1] + 0.02 * (k + 1)), None)
+    m.finish_edit()
+    assert m.active_shape.n == n
+    assert m.active_opening.area_plane == pytest.approx(target, rel=1e-9)  # resized back to A(s)
+    assert m.active_shape.vertices[2] != start  # but the shape did change
+
+
+def test_a_drag_of_a_key_section_and_its_rescale_are_one_undo_step(cyl_model, clock):
+    m = cyl_model
+    clock.advance(10.0)
+    m.add_key_section(0.4)
+    start_state = m.state
+    clock.advance(10.0)
+    v = m.active_shape.vertices[1]
+    for k in range(4):
+        clock.advance(0.01)
+        m.drag_vertex(1, (v[0] + 0.01 * (k + 1), v[1]), None)
+    m.finish_edit()
+    assert m.undo() and m.state == start_state
+
+
+def test_rescaling_a_section_that_already_has_its_area_is_a_no_op(cyl_model):
+    m = cyl_model
+    m.add_key_section(0.4)
+    state = m.state
+    assert not m.finish_edit() and m.state == state  # nothing to do: no spurious history
+
+
+def test_removing_key_sections(cyl_model, clock):
+    m = cyl_model
+    clock.advance(10.0)
+    m.add_key_section(0.3)
+    clock.advance(10.0)
+    m.add_key_section(0.6)
+    assert [ks.s for ks in m.state.sections] == [0.0, 0.3, 0.6]
+    assert m.remove_key_section(1) and [ks.s for ks in m.state.sections] == [0.0, 0.6]
+    assert not m.remove_key_section(0) and not m.remove_key_section(5)  # the inlet and bad indexes stay
+    assert m.undo() and len(m.state.sections) == 3
+
+
+def test_bad_key_section_positions_are_refused_with_a_message(cyl_model):
+    m = cyl_model
+    for s in (0.0, 1.0, -0.2, 1.5):
+        assert not m.add_key_section(s) and m.message
+    assert m.add_key_section(0.3) and not m.add_key_section(0.305)  # too close to an existing one
+    assert len(m.state.sections) == 2
+
+
+def test_selecting_a_section_shows_it_in_the_editor_without_touching_history(cyl_model):
+    m = cyl_model
+    m.add_key_section(0.3)
+    history = len(m._past)
+    assert m.select_section(0) and m.active_is_inlet and m.active_curve is m.section
+    assert m.select_section(1) and m.active_curve is None  # only the inlet section has a skin to snap to
+    assert not m.select_section(7) and len(m._past) == history
+
+
+def test_key_sections_survive_a_save_and_a_reload(scene, writable, clock):
+    m = make(scene, writable, writable, clock=clock)
+    clock.advance(10.0)
+    m.add_key_section(0.45)
+    clock.advance(10.0)
+    m.set_edge_type(0, "curved")
+    m.finish_edit()
+    clock.advance(10.0)
+    m.select_section(0)
+    m.insert_vertex(2, np.array(vs(m.state)[2]) * 0.5 + np.array(vs(m.state)[3]) * 0.5)
+    assert m.save()
+    again = make(scene, writable, writable)
+    assert [ks.s for ks in again.state.sections] == [0.0, 0.45] and not again.dirty
+    for a, b in zip(again.state.sections, m.state.sections):
+        assert a.shape.n == b.shape.n and a.shape.edges == b.shape.edges and a.shape.continuity == b.shape.continuity
+        assert np.array(a.shape.vertices) == pytest.approx(np.array(b.shape.vertices), abs=2e-6)
+    assert again.valid
+
+
+def test_an_invalid_intermediate_section_blocks_saving(scene, writable, clock):
+    m = make(scene, writable, writable, clock=clock)
+    clock.advance(10.0)
+    m.add_key_section(0.45)
+    v = m.active_shape.vertices
+    clock.advance(10.0)
+    m.drag_vertex(3, tuple(1.3 * np.array(v[0])), None)  # the apex dragged to the opposite corner: a bow tie
+    m.finish_edit()
+    assert not m.valid and not m.save() and m.message.startswith("ERROR: not saved")
+
+
+def test_readouts_list_the_intermediate_sections_and_the_face(cyl_model):
+    m = cyl_model
+    m.add_key_section(0.3)
+    rows = {r.label: r for r in m.readouts() if r.label}
+    assert "Section s=0.300" in rows and "Section s=1.000" in rows
+    assert rows["Section s=0.300"].level == "pass" and "A(s)" in rows["Section s=0.300"].value
+    assert "fixed" in rows["Section s=1.000"].value
+
+
+def test_moving_the_plane_rescales_the_other_sections_to_the_new_area_law(cyl_model, clock):
+    m = cyl_model
+    m.add_key_section(0.3)
+    clock.advance(10.0)
+    m.set_param("sweep_deg", 40.0)  # the in-plane inlet area grows by 1 / cos(40)
+    assert m.evaluations[1].area_plane == pytest.approx(m.area_at(0.3), rel=1e-9)
+    assert m.inlet_plane_area == pytest.approx(0.12 / math.cos(math.radians(40.0)))

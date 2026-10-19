@@ -100,7 +100,7 @@ Run the tests (they use only hard-coded values and the example config):
 
 The viewer reads the fuselage, engine and every other component straight from the `.vsp3` through the
 OpenVSP API (a temporary set and a temporary STL, both removed afterwards; the model is never written). It is a
-Qt window (PySide6 + pyvistaqt): the 3D view in the centre, the **section sketcher** docked on the left and a
+Qt window (PySide6 + pyvistaqt): the 3D view in the centre, the **section editor** docked on the left and a
 compact dark panel on the right. Nothing is drawn inside the 3D view except the scene itself (translucent
 fuselage, other components as grey context, the engine, the engine-face disc and the inlets).
 
@@ -125,20 +125,44 @@ inlet's outer edge trail aft (the left inlet is the mirror image). The readouts 
 (Λ = xx.x°)` while the sweep is the aligned one and `custom` as soon as you edit it; the alignment itself is not
 saved, only the sweep. An alignment that would leave `|n . X|` below 0.2 is refused, with the reason.
 
-**The sketcher.** The curve where the plane cuts the fuselage skin is computed in `(u, v)`, with chine corners
-(turning angle above 30 degrees) marked. The opening is a 5-vertex polygon that you drag with the mouse:
+**The section editor.** The curve where the plane cuts the fuselage skin is computed in `(u, v)`, with chine
+corners (turning angle above 30 degrees) marked. The inlet opening is a closed outline of any number of vertices
+(at least 3) that you edit with the mouse:
 
-- A vertex dropped within 12 pixels of the section curve **snaps** onto it (drawn filled); drag it away to
-  unsnap, or hold `Alt` to disable snapping.
-- An edge whose two end vertices are both snapped **follows the section curve** between them (the shorter arc,
-  chine corners included), drawn in the accent colour. Every other edge is a straight line.
+- **Vertices** are dragged. A vertex dropped within 12 pixels of the section curve **snaps** onto it (drawn
+  filled); drag it away to unsnap, or hold `Alt` to disable snapping. **Double-click an edge** to insert a vertex
+  there (on a skin-following edge it lands on the skin); **right-click a vertex** (or select it and press `Del`)
+  to remove it, down to 3.
+- **Edges** are straight or curved. Select an edge and press *Curved* to turn it into a cubic Bezier with two
+  draggable tangent handles (blue squares). An edge whose two end vertices are both snapped **follows the
+  section curve** between them (the shorter arc, chine corners included), drawn in the accent colour; it is not
+  editable.
+- **Vertex continuity** (buttons *Corner*, *Smooth*, *Symmetric*): a corner keeps the two edges at an angle,
+  *Smooth* keeps the tangent continuous (G1) with independent handle lengths, *Symmetric* also equalises them.
+  Markers: square = corner, circle = smooth, circle with a ring = symmetric.
 - Live readouts: the projected area against the Phase 1 target, the snapped edge length and the minimum clearance
-  of the free edges above the skin. **Fit area** scales only the free vertices about the centre of the snapped
-  edge until the area matches the target (within 0.5 %); the snapped vertices never move.
+  of the free edges above the skin, all on the true curved outline. **Fit area** scales only the free vertices
+  about the centre of the snapped edges until the area matches the target (within 0.5 %); the snapped vertices
+  never move.
 - If any part of the opening lies inside the fuselage section the outline turns red, the readout says ERROR and
   **Save is disabled**.
 - The mirrored left inlet is shown greyed, with the symmetry plane y = 0, a grid and a scale bar. The wheel zooms
   and a middle-drag pans.
+
+**Key sections.** A branch is described by key sections at a normalised arc length `s`: `s = 0` is the inlet
+section above, `s = 1` (the trunk end) is the engine face, a fixed circle of `engine.face_diameter`. The
+**Key sections** list in the panel adds (*Add...*, at a chosen `s`, e.g. at the junction) and removes
+intermediate sections; selecting a row opens that section in the editor. A new section starts as a copy of the one
+before it. Its *shape* is free (same editing tools, no skin to snap to) but its *size* always follows the area law
+`A(s)`: the editor rescales it to exactly that area when an edit ends. `A(s)` runs from the inlet's in-plane area
+to the face area (`ducts.area_law`, `linear` or `cosine`), and the trunk carries `n_inlets` branches, so the area
+at the junction is `n_inlets` times the branch area there.
+
+Between key sections, outlines are resampled to N points by arc length from a reference vertex (the one closest
+to the section's local `+v`), so a pentagon morphs into a circle without twisting. `ductmgr/cedit.py` maps a
+section to an OpenVSP **Edit Curve** cross-section (type `CEDIT`) for the export phase: straight edges as
+degenerate Beziers with handles at 1/3 and 2/3, curved edges as Beziers, corners kept, G1 flags only where the
+handles are collinear, so every point stays editable in the OpenVSP GUI.
 
 The 3D view draws both openings on their planes, the section curve and the plane's `u`/`v`/`n` arrows at `O`.
 
@@ -157,10 +181,14 @@ Other controls:
   key; **Revert to saved** re-reads it. The title bar shows `*` while there are unsaved changes, and closing the
   window then asks first.
 - **View** toolbar: side / top / front / iso (`1`-`4`), toggles for the context components, the engine envelope
-  and the sketcher dock.
+  and the section editor dock.
 
-The config stores the inlet as `ducts.inlet.origin` `[x, y, z]`, `pitch_deg`, `sweep_deg`, `vertices` (five
-`[u, v]` pairs) and `snapped` (five booleans). Older keys (`shape`, `skin_fit`, `centroid`, `normal`, `tilt_deg`,
+The config stores the inlet plane as `ducts.inlet.origin` `[x, y, z]`, `pitch_deg` and `sweep_deg`, and the
+sections as `ducts.key_sections`, a list of `{s, vertices, snapped, edges, handles, continuity}` (`vertices` as
+`[u, v]` pairs, `edges` per edge `straight` / `curved`, `handles` per edge `null` or two `[du, dv]` offsets from its
+two vertices, `continuity` per vertex `corner` / `smooth` / `symmetric`); see `duct_config.example.yaml`. The old
+5-vertex `ducts.inlet.vertices` / `snapped` format still loads, as a straight-edged inlet section with a one-line
+notice, and Save migrates it. Other older keys (`shape`, `skin_fit`, `centroid`, `normal`, `tilt_deg`,
 `attach_point`, `station_x`, `polygon`) are ignored with a one-line notice.
 
 The engine face is centred on the front (min-x) end of the Geom named by `engine.geom_name`. Its diameter is

@@ -28,7 +28,7 @@ def gui(example_env):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
     inlet = cfg["ducts"]["inlet"]
-    inlet["origin"] = inlet["vertices"] = inlet["snapped"] = None  # start without an inlet
+    inlet["origin"] = cfg["ducts"]["key_sections"] = None  # start without an inlet
     scene = load_scene(cfg, path)
     model = InletModel(scene, cfg, path, None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -120,7 +120,7 @@ def test_the_3d_view_shows_the_opening_the_section_and_the_frame_and_follows_the
     c = win.sketch.canvas
     c.resize(640, 480)
     c.fit_view()
-    c.press(c.to_screen(model.state.vertices[3]))
+    c.press(c.to_screen(model.state.sections[0].shape.vertices[3]))
     c.move(c.to_screen((0.0, 0.7)), alt=True)  # drag the apex up in the sketch
     c.release()
     after = np.asarray(win.plotter.renderer.actors["inlet_right_edge"].GetMapper().GetInput().points)
@@ -133,7 +133,7 @@ def test_an_invalid_sketch_turns_the_3d_opening_red(gui):
     win.view.set_view("top")
     win.plotter.render()
     click(win, display_of(win.plotter, [3.0, 0.4, top_of(model, 3.0, 0.4)]))
-    model.drag_vertex(0, (model.state.vertices[0][0], -0.8), snap_tolerance=None)
+    model.drag_vertex(0, (model.state.sections[0].shape.vertices[0][0], -0.8), snap_tolerance=None)
     assert not model.valid and not win.btn_save.isEnabled()
     colour = win.plotter.renderer.actors["inlet_right_edge"].GetProperty().GetColor()
     assert colour[0] > 0.8 and colour[1] < 0.5  # red

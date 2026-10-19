@@ -43,7 +43,14 @@ duct_config.yaml
 ductmgr/
   vspio.py        # open model, find geoms, tessellate, write DUCT_* stacks
   engine.py       # ISA, mass flow, capture/face areas, Mach checks
-  geometry.py     # centreline, frames, area law, section morphing
+  geometry.py     # inlet plane frame, projected area, centreline, frames
+  section.py      # plane ∩ fuselage skin as a (u, v) curve, snapping, signed distance
+  outline.py      # SectionShape: any number of vertices, straight / Bezier edges, continuity
+  sketch.py       # inlet section on the skin: snapping, validity, Fit area
+  area_law.py     # A(s) along a branch (linear / cosine, junction = n x branch)
+  interp.py       # arc-length resampling from a reference vertex (no twist)
+  cedit.py        # section -> OpenVSP Edit Curve (CEDIT) XSec mapping
+  explore_model.py / qt_sketch.py / qt_explorer.py   # section editor model + Qt UI
   checks.py       # clearance vs fuselage, area error, diffusion angle
   viz.py          # PyVista scene + matplotlib A(s) plot
 run_explore.py    # interactive viewer: place the inlets, save them to the config

@@ -32,7 +32,7 @@ def model_for(scene, example_env, placed=True):
     cfg, path, _ = example_env
     cfg = copy.deepcopy(cfg)
     if not placed:
-        cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["inlet"]["vertices"] = cfg["ducts"]["inlet"]["snapped"] = None
+        cfg["ducts"]["inlet"]["origin"] = cfg["ducts"]["key_sections"] = None
     return InletModel(scene, cfg, path, None)
 
 
@@ -190,7 +190,7 @@ def test_an_invalid_opening_is_drawn_red(plotter, scene, example_env):
     model = model_for(scene, example_env)
     view.update_inlet(model)
     ok_colour = plotter.renderer.actors["inlet_right_edge"].GetProperty().GetColor()
-    model.drag_vertex(0, (model.state.vertices[0][0], -0.8), snap_tolerance=None)  # inside the fuselage
+    model.drag_vertex(0, (model.state.sections[0].shape.vertices[0][0], -0.8), snap_tolerance=None)  # inside the fuselage
     assert not model.valid
     view.update_inlet(model)
     red = tuple(int(ERROR_COLOR[i:i + 2], 16) / 255 for i in (1, 3, 5))

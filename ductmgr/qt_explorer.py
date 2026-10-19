@@ -35,6 +35,8 @@ POSITION_MARGIN = 0.05  # of the fuselage size, beyond its bounds, for the posit
 PITCH_RANGE_DEG = (-85.0, 85.0)
 SWEEP_RANGE_DEG = (-90.0, 90.0)
 CLICK_TOLERANCE_PX = 4  # a press-release further apart than this is a camera drag, not a click
+SECTION_LIST_HEIGHT = 110
+NEW_SECTION_S = 0.5  # the s suggested for a new key section
 MANUAL_ANGLE_DEFAULT_DEG = 30.0  # the edge picker's starting manual angle
 COLORS = {"info": "#C9D1D9", "pass": "#4CAF50", "warn": "#E0A030", "error": "#F85149"}  # readout text colours
 
@@ -402,6 +404,26 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.grp_position.form.addRow(self.btn_align)
         col.addWidget(self.grp_position)
 
+        # Key sections along the branch
+        self.grp_sections = CollapsibleGroup("Key sections")
+        self.section_list = QtWidgets.QListWidget()
+        self.section_list.setMaximumHeight(SECTION_LIST_HEIGHT)
+        self.section_list.setToolTip("The section shown in the editor. s = 0 is the inlet, s = 1 the fixed engine "
+                                     "face; the others take their size from the area law A(s)")
+        self.section_list.currentRowChanged.connect(self._on_section_row)
+        self.btn_add_section = QtWidgets.QPushButton("Add…")
+        self.btn_add_section.setToolTip("Add a key section at a chosen s (e.g. at the junction)")
+        self.btn_remove_section = QtWidgets.QPushButton("Remove")
+        self.btn_remove_section.setToolTip("Remove the selected intermediate key section")
+        self.btn_add_section.clicked.connect(lambda *_: self._on_add_section())
+        self.btn_remove_section.clicked.connect(lambda *_: self._on_remove_section())
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addWidget(self.btn_add_section)
+        buttons.addWidget(self.btn_remove_section)
+        self.grp_sections.form.addRow(self.section_list)
+        self.grp_sections.form.addRow(buttons)
+        col.addWidget(self.grp_sections)
+
         # Readouts
         self.grp_readouts = CollapsibleGroup("Readouts")
         self.readout_view = QtWidgets.QTextEdit()
@@ -463,6 +485,26 @@ class ExploreWindow(QtWidgets.QMainWindow):
     def _on_lock(self, locked: bool) -> None:
         if not self._syncing:
             self.model.set_locked(locked)
+
+    def ask_section_s(self) -> float | None:
+        """Ask for the s of a new key section; None when cancelled."""
+        s, ok = QtWidgets.QInputDialog.getDouble(self, "Add key section", "s (0 = inlet, 1 = engine face):",
+                                                 NEW_SECTION_S, 0.0, 1.0, 3)
+        return s if ok else None
+
+    def _on_add_section(self) -> None:
+        if not self.model.placed:
+            return
+        s = self.ask_section_s()
+        if s is not None:
+            self.model.add_key_section(s)
+
+    def _on_remove_section(self) -> None:
+        self.model.remove_key_section(self.model.active)
+
+    def _on_section_row(self, row: int) -> None:
+        if not self._syncing and row >= 0:
+            self.model.select_section(row)
 
     def ask_edge(self) -> tuple[float, str] | None:
         """Show the edge picker; (edge sweep in degrees, label) or None when cancelled."""
@@ -541,6 +583,13 @@ class ExploreWindow(QtWidgets.QMainWindow):
             for box in (self.spin_pitch, self.spin_sweep):
                 box.setEnabled(placed)
             self.btn_align.setEnabled(placed)
+            self.section_list.clear()
+            for s, label, _ in m.section_list():
+                self.section_list.addItem(f"s = {s:.3f}   {label}")
+            if placed:
+                self.section_list.setCurrentRow(m.active)
+            self.btn_add_section.setEnabled(placed)
+            self.btn_remove_section.setEnabled(placed and 0 < m.active < m.n_sections)
             self.btn_place.setEnabled(not m.locked)
             self.act_undo.setEnabled(m.can_undo)
             self.act_redo.setEnabled(m.can_redo)
