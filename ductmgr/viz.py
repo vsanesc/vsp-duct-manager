@@ -16,7 +16,7 @@ import pyvista as pv
 from vtkmodules.vtkRenderingCore import vtkCellPicker
 
 from ductmgr import vspio
-from ductmgr.config import resolve_model_path
+from ductmgr.config import resolve_model_path, skin_names_from_config
 from ductmgr.engine import EngineSizingWarning, SizingResult, size_from_config
 
 # ---- appearance (dark theme) ---------------------------------------------------------------
@@ -64,6 +64,9 @@ class Scene:
     warnings: list[str] = field(default_factory=list)
     wings: list[vspio.WingPlanform] = field(default_factory=list)  # planform edges, from the VSP parameters
     context_parts: list[tuple[str, pv.PolyData]] = field(default_factory=list)  # (Geom name, mesh) of each other Geom
+    parts: list[tuple[str, pv.PolyData]] = field(default_factory=list)  # (Geom name, mesh) of EVERY Geom but the engine
+    skin_names: tuple[str, ...] = ()  # the Geoms of the skin the config asks for (parts[...] by name)
+    engine_name: str | None = None
 
 
 def load_scene(cfg: dict, config_path: Path) -> Scene:
@@ -78,13 +81,11 @@ def load_scene(cfg: dict, config_path: Path) -> Scene:
     msgs.extend(f"WARN {w}" for w in sizing.warnings)
 
     vspio.open_model(model_path)
-    fuselage_name = cfg["model"]["fuselage_name"]
+    skin_names = skin_names_from_config(cfg)
+    if not skin_names:
+        raise ValueError("the config needs model.skin_bodies (or the older model.fuselage_name)")
     geoms = vspio.list_geoms()
-    fus_geom = vspio.find_geom(fuselage_name, geoms)
-    fuselage = vspio.export_mesh([fus_geom])
-    note = vspio.check_mesh_bounds(fuselage, [fus_geom])
-    if note:
-        msgs.append(note)
+    skin_geoms = [vspio.find_geom(n, geoms) for n in skin_names]
 
     engine_name = eng.get("geom_name")
     engine_geom = None
@@ -112,9 +113,23 @@ def load_scene(cfg: dict, config_path: Path) -> Scene:
             + ("taken from ducts.engine_face.centre" if centre is not None else "unknown")
         )
 
-    skip = {fus_geom.id} | ({engine_geom.id} if engine_geom else set())
-    others = [g for g in geoms if g.id not in skip]
-    context_parts = [(g.name, vspio.export_mesh([g])) for g in others]  # one mesh per Geom, for the intersection checks
+    # every Geom but the engine, one mesh each (the skin, the visibility list and the intersection checks use them)
+    parts, used = [], {}
+    meshes = {}
+    for g in geoms:
+        if engine_geom is not None and g.id == engine_geom.id:
+            continue
+        used[g.name] = used.get(g.name, 0) + 1
+        name = g.name if used[g.name] == 1 else f"{g.name} #{used[g.name]}"
+        meshes[g.id] = vspio.export_mesh([g])
+        parts.append((name, meshes[g.id]))
+    skin_ids = {g.id for g in skin_geoms}
+    fuselage = pv.merge([meshes[i] for i in meshes if i in skin_ids]) if len(skin_ids) > 1 else meshes[skin_geoms[0].id]
+    note = vspio.check_mesh_bounds(fuselage, skin_geoms)
+    if note:
+        msgs.append(note)
+    skin_set = set(skin_names)
+    context_parts = [(n, m) for n, m in parts if n not in skin_set]
     context = pv.merge([m for _, m in context_parts]) if context_parts else pv.PolyData()
     engine_mesh = vspio.export_mesh([engine_geom]) if engine_geom else pv.PolyData()
 
@@ -132,6 +147,9 @@ def load_scene(cfg: dict, config_path: Path) -> Scene:
         warnings=msgs,
         wings=vspio.read_wings(geoms),
         context_parts=context_parts,
+        parts=parts,
+        skin_names=tuple(skin_names),
+        engine_name=engine_geom.name if engine_geom is not None else None,
     )
 
 
@@ -160,20 +178,16 @@ class SceneView:
         self.actors: dict[str, object] = {}
         self._other_inlet_actors: set[str] = set()
         self._duct_actors: set[str] = set()
+        self._body_style: dict[str, str] = {}  # body name -> "skin" / "context" as drawn
         self._draw_static()
 
     # ---- static scene ----------------------------------------------------------------------------------
     def _draw_static(self) -> None:
         p, s = self.plotter, self.scene
         p.set_background(BACKGROUND)
-        self.actors["fuselage"] = p.add_mesh(
-            s.fuselage, color=FUSELAGE_COLOR, opacity=FUSELAGE_OPACITY, smooth_shading=True,
-            name="fuselage", pickable=True,
-        )
-        if s.context.n_points:
-            self.actors["context"] = p.add_mesh(
-                s.context, color=CONTEXT_COLOR, opacity=CONTEXT_OPACITY, name="context", pickable=False
-            )
+        skin = set(s.skin_names) if getattr(s, "skin_names", ()) else {self.parts()[0][0]}
+        for name, mesh in self.parts():
+            self._draw_body(name, mesh, "skin" if name in skin else "context")
         if s.engine_mesh.n_points:
             self.actors["engine"] = p.add_mesh(
                 s.engine_mesh, color=ENGINE_COLOR, opacity=ENGINE_OPACITY, name="engine", pickable=False
@@ -194,10 +208,8 @@ class SceneView:
                     line_width=1, name="envelope", pickable=False,
                 )
 
-        everything = s.fuselage.bounds
-        if s.context.n_points:
-            b = np.array([everything, s.context.bounds]).reshape(2, 3, 2)
-            everything = tuple(np.stack([b[:, :, 0].min(0), b[:, :, 1].max(0)], axis=1).ravel())
+        b = np.array([m.bounds for _, m in self.parts() if m.n_points]).reshape(-1, 3, 2)
+        everything = tuple(np.stack([b[:, :, 0].min(0), b[:, :, 1].max(0)], axis=1).ravel())
         p.show_bounds(
             bounds=everything, xtitle="X aft (m)", ytitle="Y right (m)", ztitle="Z up (m)",
             ticks="both", minor_ticks=True, grid=False, location="outer", color=RULER_COLOR, font_size=9,
@@ -205,6 +217,45 @@ class SceneView:
         )
         p.add_axes()
         p.camera_position = "iso"
+
+    # ---- the bodies: skin or context, visible or not -----------------------------------------------------------------
+    def parts(self) -> list[tuple[str, pv.PolyData]]:
+        s = self.scene
+        parts = getattr(s, "parts", None)
+        return list(parts) if parts else [("fuselage", s.fuselage)] + list(getattr(s, "context_parts", None) or [])
+
+    @staticmethod
+    def body_actor(name: str) -> str:
+        return f"body_{name}"
+
+    def _draw_body(self, name: str, mesh: pv.PolyData, style: str) -> None:
+        if not mesh.n_points:
+            return
+        skin = style == "skin"
+        self.actors[self.body_actor(name)] = self.plotter.add_mesh(
+            mesh, color=FUSELAGE_COLOR if skin else CONTEXT_COLOR, opacity=FUSELAGE_OPACITY if skin else CONTEXT_OPACITY,
+            smooth_shading=skin, name=self.body_actor(name), pickable=skin, render=False)
+        self._body_style[name] = style
+
+    def update_bodies(self, model) -> None:
+        """Bring the body actors in line with the model: skin bodies in the skin style (and pickable), the rest as
+        context, hidden ones switched off. Hidden bodies stay in the scene (and in the checks)."""
+        for name, mesh in self.parts():
+            style = "skin" if name in model.state.skin else "context"
+            if self._body_style.get(name) != style:
+                self._draw_body(name, mesh, style)
+            self.set_visible(self.body_actor(name), name not in model.hidden)
+        if model.engine_name:
+            self.set_visible("engine", model.engine_name not in model.hidden)
+
+    def scene_bounds(self) -> tuple:
+        """Bounds of every body."""
+        b = np.array([m.bounds for _, m in self.parts() if m.n_points]).reshape(-1, 3, 2)
+        return tuple(np.stack([b[:, :, 0].min(0), b[:, :, 1].max(0)], axis=1).ravel())
+
+    def skin_actors(self) -> list:
+        return [self.actors[self.body_actor(n)] for n, st in self._body_style.items()
+                if st == "skin" and self.body_actor(n) in self.actors and self.actors[self.body_actor(n)].GetVisibility()]
 
     # ---- inlets ------------------------------------------------------------------------------------------
     def update_inlet(self, model) -> None:
@@ -260,7 +311,7 @@ class SceneView:
         else:
             p.remove_actor("section_curve", render=False)
 
-        b = self.scene.fuselage.bounds
+        b = self.scene_bounds()
         length = FRAME_ARROW_FRACTION * max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
         u, v, n = plane.frame()
         for name, direction in (("u", u), ("v", v), ("n", n)):
@@ -358,12 +409,13 @@ class SceneView:
     def pick_fuselage(self, x: int, y: int) -> np.ndarray | None:
         """Point on the fuselage under the display position (x, y) in render-window pixels, else None.
 
-        Only the fuselage can be hit: the context, engine and inlet actors are not in the pick list.
+        Only the visible skin bodies can be hit: the context, engine and inlet actors are not in the pick list.
         """
         picker = vtkCellPicker()
         picker.SetTolerance(PICK_TOLERANCE)
         picker.InitializePickList()
-        picker.AddPickList(self.actors["fuselage"])
+        for actor in self.skin_actors():
+            picker.AddPickList(actor)
         picker.PickFromListOn()
         if not picker.Pick(int(x), int(y), 0, self.plotter.renderer) or picker.GetCellId() < 0:
             return None

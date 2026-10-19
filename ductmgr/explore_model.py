@@ -27,12 +27,13 @@ from ductmgr import interp
 from ductmgr import outline as ol
 from ductmgr.areacurve import AreaCurves, AreaPoints
 from ductmgr.centreline import Centreline, CentrelineParams
-from ductmgr.config import PRIVATE_CONFIG, load_config, save_inlet_definition
+from ductmgr.config import PRIVATE_CONFIG, load_config, save_inlet_definition, skin_names_from_config
 from ductmgr.engine import EngineSizingWarning, size_from_config
 from ductmgr.geometry import InletPlane, inlet_readout, polygon_centroid, sweep_for_edge_angle
 from ductmgr.outline import SectionShape
-from ductmgr.section import Section, compute_section
-from ductmgr.solids import Solid
+from ductmgr import silhouette
+from ductmgr.section import Section, compute_section, compute_union_section
+from ductmgr.solids import Solid, UnionSolid
 
 MIN_ALIGN_PROJECTION = 0.2  # |n.X| below this blocks an edge alignment
 MIN_S_SEPARATION = 0.01  # key sections closer than this in s are refused
@@ -100,6 +101,7 @@ class InletState:
     symmetry: str = DEFAULT_SYMMETRY
     duct: DuctParams = DuctParams()
     selected: int = field(default=0, compare=False)
+    skin: tuple[str, ...] = ()  # the Geoms that form the fuselage skin (their union), by name
 
     @property
     def inlet(self) -> Inlet:
@@ -383,6 +385,8 @@ class InletModel:
         self._last_key: str | None = None
         self._last_time = -1e9
         self._skin_cache: dict = {}
+        self._sil_cache: dict = {}
+        self.hidden: set[str] = set()  # bodies switched off in every view (never removed from the checks)
         self._plan_cache: dict = {}
         self._built: dict = {}  # state-keyed cache of the Duct, its bodies and checks
         self._solids: dict = {}
@@ -395,7 +399,7 @@ class InletModel:
         self.settings = duct_settings(cfg)
         self.alignment: tuple[str, float, float] | None = None  # (edge label, edge sweep, applied plane sweep)
         self.active = 0  # index of the section the editor shows (of the selected inlet)
-        loaded = state_from_config(cfg)
+        loaded = replace(state_from_config(cfg), skin=self._skin_for(cfg))
         self.state = self._normalised(loaded)
         # a state completed here (resnapped, default sketch added) differs from the file only by rounding: the
         # file is the saved state unless a sketch had to be created
@@ -575,7 +579,7 @@ class InletModel:
         ins = state.inlets[k]
         if not ins.placed or not ins.sections:
             return None
-        return sketch.evaluate(ins.sections[0].shape, self._section_for(ins.plane), ins.plane,
+        return sketch.evaluate(ins.sections[0].shape, self._section_for(ins.plane, state.skin), ins.plane,
                                self.capture_target(k, state))
 
     def _build_spec(self, st: InletState, ks_outlines: dict, op_areas: dict) -> dm.DuctSpec:
@@ -603,7 +607,7 @@ class InletModel:
         if not placed:
             return _Plan(None, {}, {k: AreaCurves(1.0, 1.0, st.duct.area, self.settings.law, 1) for k in range(len(st.inlets))},
                          "", self.settings.junction_fraction)
-        key = (st.symmetry, st.duct, tuple(
+        key = (st.symmetry, st.skin, st.duct, tuple(
             (st.inlets[k].name, st.inlets[k].plane, tuple(ks.shape for ks in st.inlets[k].sections),
              tuple(ks.s for ks in st.inlets[k].sections), st.inlets[k].flow_fraction, st.inlets[k].mirror,
              st.inlets[k].start_handle, st.inlets[k].junction_in_handle, st.inlets[k].area_branch) for k in placed),
@@ -737,12 +741,17 @@ class InletModel:
             self._notify()
         return True
 
-    def _section_for(self, plane: InletPlane) -> Section | None:
-        if plane not in self._skin_cache:
+    def _section_for(self, plane: InletPlane, skin: tuple[str, ...] | None = None) -> Section | None:
+        """The curve where the plane cuts the skin: of one skin body, or of the union of several."""
+        skin = self.state.skin if skin is None else skin
+        key = (plane, skin)
+        if key not in self._skin_cache:
             if len(self._skin_cache) > 16:
                 self._skin_cache.clear()
-            self._skin_cache[plane] = compute_section(self.scene.fuselage, plane)
-        return self._skin_cache[plane]
+            meshes = self.skin_meshes(skin)
+            self._skin_cache[key] = (compute_section(meshes[0], plane) if len(meshes) == 1
+                                     else compute_union_section(meshes, plane))
+        return self._skin_cache[key]
 
     def _normalised(self, state: InletState) -> InletState:
         """Every placed inlet snapped exactly onto its current section (a default sketch if it has none yet), and
@@ -751,7 +760,7 @@ class InletModel:
         for k, ins in enumerate(inlets):
             if not ins.placed:
                 continue
-            section = self._section_for(ins.plane)
+            section = self._section_for(ins.plane, state.skin)
             secs = list(ins.sections)
             if not secs or secs[0].s != 0.0:
                 secs.insert(0, KeySection(0.0, sketch.default_sketch(section, ins.plane, self.capture_target(k, state))))
@@ -777,7 +786,7 @@ class InletModel:
                 self._skins.append(None)
                 self._evals.append([])
                 continue
-            skin = self._section_for(ins.plane)
+            skin = self._section_for(ins.plane, st.skin)
             evs = [sketch.evaluate(ins.sections[0].shape, skin, ins.plane, self.capture_target(k, st))]
             for ks in ins.sections[1:]:
                 evs.append(sketch.evaluate(ks.shape, None, None,
@@ -1292,12 +1301,122 @@ class InletModel:
             self._solids[key] = make()
         return self._solids[key]
 
-    def fuselage_solid(self) -> Solid:
-        return self._solid("fuselage", lambda: Solid(self.scene.fuselage, "fuselage"))
+    def fuselage_solid(self):
+        """The skin as a solid: one body's, or the union of several."""
+        skin = self.state.skin
+        names = skin
+
+        def make():
+            solids = [self._solid(("body", n), lambda n=n: Solid(dict(self.parts)[n], n)) for n in names]
+            return solids[0] if len(solids) == 1 else UnionSolid(solids, "skin")
+
+        return self._solid(("skin", skin), make)
 
     def other_solids(self) -> list[Solid]:
-        parts = getattr(self.scene, "context_parts", None) or []
-        return [self._solid(("part", k), lambda m=m, n=n: Solid(m, n)) for k, (n, m) in enumerate(parts)]
+        """Every Geom that is not part of the skin and not the engine, hidden or not: what the duct must not hit."""
+        skin = set(self.state.skin)
+        return [self._solid(("body", n), lambda m=m, n=n: Solid(m, n)) for n, m in self.parts if n not in skin]
+
+    # ---- the bodies: skin selection and visibility ------------------------------------------------------------------------------
+    @property
+    def parts(self) -> list[tuple[str, object]]:
+        """(name, mesh) of every Geom but the engine. A stand-in scene without ``parts`` has its fuselage and its
+        context parts."""
+        parts = getattr(self.scene, "parts", None)
+        if parts:
+            return list(parts)
+        return [("fuselage", self.scene.fuselage)] + list(getattr(self.scene, "context_parts", None) or [])
+
+    def skin_meshes(self, skin: tuple[str, ...]) -> list:
+        by_name = dict(self.parts)
+        return [by_name[n] for n in skin]
+
+    def _skin_for(self, cfg: dict) -> tuple[str, ...]:
+        """The configured skin Geoms (checked against the model), else the scene's, else the first body."""
+        names = skin_names_from_config(cfg) or list(getattr(self.scene, "skin_names", ()) or ())
+        known = [n for n, _ in self.parts]
+        if not names:
+            return (known[0],)
+        missing = [n for n in names if n not in known]
+        if missing:
+            raise ValueError(f"model.skin_bodies: no Geom called {', '.join(repr(n) for n in missing)} "
+                             f"(the model has {', '.join(known)})")
+        return tuple(n for n in known if n in names)  # in the model's order, each once
+
+    @property
+    def engine_name(self) -> str | None:
+        return getattr(self.scene, "engine_name", None) if getattr(self.scene, "engine_mesh", None) is not None \
+            and self.scene.engine_mesh.n_points else None
+
+    def body_rows(self) -> list[tuple[str, bool, bool, str]]:
+        """(name, visible, in the skin, kind) of every body; kind is "skin", "context" or "engine"."""
+        skin = set(self.state.skin)
+        rows = [(n, n not in self.hidden, n in skin, "skin" if n in skin else "context") for n, _ in self.parts]
+        if self.engine_name:
+            rows.append((self.engine_name, self.engine_name not in self.hidden, False, "engine"))
+        return rows
+
+    def set_body_visible(self, name: str, visible: bool) -> bool:
+        """Show or hide a body in every view (3D, Side, Top). The checks always use every body."""
+        if name not in {r[0] for r in self.body_rows()}:
+            return False
+        if visible == (name not in self.hidden):
+            return True
+        (self.hidden.discard if visible else self.hidden.add)(name)
+        self._notify()
+        return True
+
+    def set_context_visible(self, visible: bool) -> None:
+        """Show or hide every body that is neither a skin body nor the engine."""
+        for name, _, _, kind in self.body_rows():
+            if kind == "context":
+                (self.hidden.discard if visible else self.hidden.add)(name)
+        self._notify()
+
+    @property
+    def context_visible(self) -> bool:
+        return all(v for _, v, _, kind in self.body_rows() if kind == "context")
+
+    def set_skin_bodies(self, names) -> bool:
+        """Choose the Geoms that form the skin (their union): the section, snapping, clearance and external-region
+        checks all follow. One undo step; a name is never treated specially (a store is a skin if you say so)."""
+        known = [n for n, _ in self.parts]
+        names = [n for n in known if n in set(names)]
+        if not names:
+            self._say("The skin needs at least one body")
+            self._notify()
+            return False
+        if tuple(names) == self.state.skin:
+            return False
+        return self._changed(self._commit_state(replace(self.state, skin=tuple(names))),
+                             f"Skin: {', '.join(names)}")
+
+    def toggle_skin_body(self, name: str, flag: bool) -> bool:
+        names = set(self.state.skin)
+        (names.add if flag else names.discard)(name)
+        return self.set_skin_bodies(names)
+
+    def scene_bounds(self) -> tuple:
+        """(xmin, xmax, ymin, ymax, zmin, zmax) of every body."""
+        b = np.array([m.bounds for _, m in self.parts if m.n_points]).reshape(-1, 3, 2)
+        return tuple(np.stack([b[:, :, 0].min(0), b[:, :, 1].max(0)], axis=1).ravel())
+
+    def silhouettes(self, across: int) -> list[tuple[str, str, list]]:
+        """(name, kind, rings) of every visible body's exact outline in a 2D view (``across``: 2 = side, 1 = top).
+        Cached per body and view: the meshes do not change while the model is open."""
+        out = []
+        engine = getattr(self.scene, "engine_mesh", None)
+        meshes = dict(self.parts)
+        if self.engine_name:
+            meshes[self.engine_name] = engine
+        for name, visible, _, kind in self.body_rows():
+            if not visible:
+                continue
+            key = (name, across)
+            if key not in self._sil_cache:
+                self._sil_cache[key] = silhouette.outline_rings(meshes[name], across)
+            out.append((name, kind, self._sil_cache[key]))
+        return out
 
     @property
     def checks_current(self) -> bool:
@@ -1458,7 +1577,8 @@ class InletModel:
         else:
             try:
                 path = save_inlet_definition(None, self.save_target, None, remove_ducts_keys=("inlet", "key_sections"),
-                                             ducts_values=self.ducts_definition())
+                                             ducts_values=self.ducts_definition(),
+                                             model_values={"skin_bodies": list(self.state.skin)})
             except OSError as exc:
                 self._say(f"Save failed: {exc}")
             else:
@@ -1477,7 +1597,7 @@ class InletModel:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", EngineSizingWarning)
                 sizing = size_from_config(cfg)
-            stored = state_from_config(cfg)
+            stored = replace(state_from_config(cfg), skin=self._skin_for(cfg))
             settings = duct_settings(cfg)
         except Exception as exc:  # a broken file must not crash the window; say what is wrong
             self._say(f"Revert failed: {type(exc).__name__}: {exc}".splitlines()[0])

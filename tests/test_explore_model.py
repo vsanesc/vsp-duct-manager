@@ -605,8 +605,10 @@ def test_save_writes_the_inlet_and_round_trips_uv_vertices(scene, writable, cloc
     assert np.array(saved["vertices"]) == pytest.approx(np.array([[round(u, 6), round(v, 6)] for u, v in vs(m.state)]))
     assert saved["snapped"] == list(sn(m.state)) and all(isinstance(f, bool) for f in saved["snapped"])
     assert "vertices" not in inlet and "snapped" not in inlet
-    for section in ("model", "engine", "design_point", "checks"):
+    for section in ("engine", "design_point", "checks"):
         assert after[section] == before[section]
+    assert {k: v for k, v in after["model"].items() if k != "skin_bodies"} == before["model"]  # only the skin is added
+    assert after["model"]["skin_bodies"] == [before["model"]["fuselage_name"]]
     # a fresh model reads the same inlet back, in (u, v)
     again = make(scene, writable, writable)
     assert again.state.plane == InletPlane(tuple(inlet["origin"]), -6.0, 12.0)
@@ -1328,8 +1330,10 @@ def test_duct_parameters_survive_a_save_and_a_reload(scene, writable, clock):
     assert ducts["area_points"]["junction_area"] == 0.19 and ducts["inlets"][0]["area_points"][1] == [0.5, 0.1]
     assert ducts["wall_thickness"] == 0.03 and ducts["lip_extension"] == 0.06 and ducts["lip_mode"] == "blunt"
     after = yaml.safe_load(writable.read_text(encoding="utf-8"))
-    for section in ("model", "engine", "design_point", "checks"):
+    for section in ("engine", "design_point", "checks"):
         assert after[section] == before[section]
+    assert {k: v for k, v in after["model"].items() if k != "skin_bodies"} == before["model"]  # only the skin is added
+    assert after["model"]["skin_bodies"] == [before["model"]["fuselage_name"]]
     again = make(scene, writable, writable)
     assert not again.dirty and again.state.duct.centreline == m.state.duct.centreline
     assert again.state.inlet.start_handle == 0.7

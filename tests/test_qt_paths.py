@@ -87,13 +87,6 @@ def drag(canvas, name, target_hv):
 
 
 # ---- the side and top views --------------------------------------------------------------------------------------------------
-def test_the_envelope_of_a_mesh_is_a_closed_outline_of_its_projection():
-    pts = np.array([[0, 0, 0], [1, 0, 1], [2, 0, 0], [1, 0, -1.0], [1, 2, 0]], dtype=float)
-    env = qp.envelope(pts, 2, bins=4)
-    assert env[:, 1].max() == pytest.approx(1.0) and env[:, 1].min() == pytest.approx(-1.0)
-    assert env[:, 0].min() < 0.5 and env[:, 0].max() > 1.5
-
-
 def test_the_views_project_x_z_and_x_y(model):
     side, top = canvas_for(model, "side"), canvas_for(model, "top")
     p = np.array([[1.0, 2.0, 3.0]])

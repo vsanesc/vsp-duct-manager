@@ -38,6 +38,7 @@ SWEEP_RANGE_DEG = (-90.0, 90.0)
 CLICK_TOLERANCE_PX = 4  # a press-release further apart than this is a camera drag, not a click
 SECTION_LIST_HEIGHT = 110
 INLET_LIST_HEIGHT = 96
+BODY_TABLE_HEIGHT = 150
 PATHS_HEIGHT = 300  # the 2D duct tabs dock at the bottom
 HEAVY_DELAY_MS = 150  # bodies and checks are rebuilt this long after the last change (the rest updates at once)
 WALL_RANGE_M = (0.0005, 0.2)
@@ -320,13 +321,14 @@ class ExploreWindow(QtWidgets.QMainWindow):
                                tip=f"{name.capitalize()} view ({i + 1})")
             for i, name in enumerate(("side", "top", "front", "iso"))
         }
-        self.act_context = self._action("Context", lambda: self._toggle("context", self.act_context), checkable=True,
-                                        tip="Show / hide the other components (wing, fins, stores...)")
+        self.act_context = self._action("Context", lambda: self.model.set_context_visible(self.act_context.isChecked()),
+                                        checkable=True,
+                                        tip="Show / hide every body that is not a skin body or the engine, in all views")
         self.act_envelope = self._action("Envelope", lambda: self._toggle("envelope", self.act_envelope),
                                          checkable=True, tip="Show / hide the engine envelope outline")
-        for act, name in ((self.act_context, "context"), (self.act_envelope, "envelope")):
-            act.setChecked(True)
-            act.setEnabled(self.view is not None and self.view.has(name))
+        self.act_context.setChecked(True)
+        self.act_envelope.setChecked(True)
+        self.act_envelope.setEnabled(self.view is not None and self.view.has("envelope"))
 
     def _build_toolbar(self) -> None:
         bar = self.addToolBar("View")
@@ -416,6 +418,25 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.grp_inlets.form.addRow("Symmetry", self.combo_symmetry)
         col.addWidget(self.grp_inlets)
 
+        # Bodies: visibility and skin of every Geom
+        self.grp_bodies = CollapsibleGroup("Bodies", expanded=False)
+        self.body_table = QtWidgets.QTableWidget(0, 3)
+        self.body_table.setHorizontalHeaderLabels(["Geom", "Show", "Skin"])
+        self.body_table.verticalHeader().setVisible(False)
+        self.body_table.setMaximumHeight(BODY_TABLE_HEIGHT)
+        self.body_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.body_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        head = self.body_table.horizontalHeader()
+        head.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for col_index in (1, 2):
+            head.setSectionResizeMode(col_index, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.body_table.setToolTip("Show: hide a body in the 3D, Side and Top views (hidden bodies stay in the clash "
+                                   "checks). Skin: the Geoms (their union) that form the fuselage skin for the "
+                                   "section sketch, snapping, clearance and external-region checks.")
+        self.body_table.itemChanged.connect(self._on_body_item)
+        self.grp_bodies.form.addRow(self.body_table)
+        col.addWidget(self.grp_bodies)
+
         # Placement
         self.grp_place = CollapsibleGroup("Placement")
         self.btn_place = QtWidgets.QPushButton("Place inlet  (P)")
@@ -431,7 +452,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
         col.addWidget(self.grp_place)
 
         # Inlet plane: origin, pitch, sweep
-        b = self.scene.fuselage.bounds
+        b = self.model.scene_bounds()
         pad = POSITION_MARGIN * max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
         self.grp_position = CollapsibleGroup("Inlet plane")
         self.spin_pos = {
@@ -595,6 +616,36 @@ class ExploreWindow(QtWidgets.QMainWindow):
         else:
             self.model.set_lip_extension(value)
 
+    def _on_body_item(self, item) -> None:
+        """A Show / Skin checkbox of the Bodies list."""
+        if self._syncing:
+            return
+        name = self.body_table.item(item.row(), 0).text()
+        checked = item.checkState() == QtCore.Qt.CheckState.Checked
+        if item.column() == 1:
+            self.model.set_body_visible(name, checked)
+        elif item.column() == 2:
+            if not self.model.toggle_skin_body(name, checked):
+                self.sync()  # refused (the last skin body) or unchanged: put the box back
+
+    def _sync_bodies(self, m) -> None:
+        rows = m.body_rows()
+        self.body_table.blockSignals(True)
+        self.body_table.setRowCount(len(rows))
+        for r, (name, visible, skin, kind) in enumerate(rows):
+            name_item = QtWidgets.QTableWidgetItem(name)
+            name_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self.body_table.setItem(r, 0, name_item)
+            for c, flag, enabled in ((1, visible, True), (2, skin, kind != "engine")):
+                box = QtWidgets.QTableWidgetItem()
+                flags = QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled
+                box.setFlags(flags if enabled else QtCore.Qt.ItemFlag.NoItemFlags)
+                box.setCheckState(QtCore.Qt.CheckState.Checked if flag else QtCore.Qt.CheckState.Unchecked)
+                self.body_table.setItem(r, c, box)
+        self.body_table.blockSignals(False)
+        self.act_context.setChecked(m.context_visible)
+        self.act_context.setEnabled(any(kind == "context" for _, _, _, kind in rows))
+
     def _on_inlet_row(self, row: int) -> None:
         if not self._syncing and row >= 0:
             self.model.select_inlet(row)
@@ -723,6 +774,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
                 box.setEnabled(placed)
             self.btn_align.setEnabled(placed)
             self._sync_inlets(m)
+            self._sync_bodies(m)
             self._set_value(self.spin_wall, m.state.duct.wall_thickness)
             self._set_value(self.spin_lip, m.state.duct.lip_extension)
             self.lbl_lip_mode.setText(m.state.duct.lip_mode)
@@ -756,6 +808,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
         if m.placed and m.can_build:
             self._heavy_timer.start()
         if self.plotter is not None:
+            self.view.update_bodies(m)
             self.view.update_inlet(m)
             self.view.update_ducts(m)
             self.plotter.setCursor(QtCore.Qt.CursorShape.CrossCursor if m.mode == MODE_PLACING

@@ -80,3 +80,42 @@ class RayCaster:
         pts, ids = vtkPoints(), vtkIdList()
         return bool(self._tree.IntersectWithLine(np.asarray(a, dtype=float).tolist(),
                                                  np.asarray(b, dtype=float).tolist(), self.TOLERANCE, pts, ids))
+
+
+class UnionSolid:
+    """The union of several closed solids (the skin when it is made of several Geoms). A point is inside when it is
+    inside any of them; the signed distance is the smallest of theirs (exact outside)."""
+
+    def __init__(self, solids, name: str = ""):
+        self.solids = list(solids)
+        self.name = name
+
+    @property
+    def closed(self) -> bool:
+        return all(s.closed for s in self.solids)
+
+    @property
+    def bounds(self):
+        b = np.array([s.bounds for s in self.solids])
+        return (b[:, 0].min(), b[:, 1].max(), b[:, 2].min(), b[:, 3].max(), b[:, 4].min(), b[:, 5].max())
+
+    def signed(self, points) -> np.ndarray:
+        return np.min([s.signed(points) for s in self.solids], axis=0)
+
+    def distance(self, points) -> np.ndarray:
+        return np.abs(self.signed(points))
+
+    def inside(self, points, tol: float = 0.0) -> np.ndarray:
+        return self.signed(points) < -tol
+
+    def closest_points(self, points) -> np.ndarray:
+        """The nearest point of the union's boundary: of the solid that is nearest to each point."""
+        pts = np.atleast_2d(np.asarray(points, dtype=float))
+        d = np.array([s.signed(pts) for s in self.solids])
+        near = np.argmin(d, axis=0)
+        out = np.empty_like(pts)
+        for k, s in enumerate(self.solids):
+            m = near == k
+            if m.any():
+                out[m] = s.closest_points(pts[m])
+        return out

@@ -6,7 +6,9 @@
 model:
   vsp3_path: example_model.vsp3    # input model; never overwritten (output: <name>_ducts.vsp3)
                                    # create the dummy model with: python make_example_model.py
-  fuselage_name: Test Fuselage     # name of the fuselage Geom in the model
+  fuselage_name: Test Fuselage     # the fuselage Geom (read when skin_bodies is not set)
+  # skin_bodies: [Test Fuselage]   # the Geom(s), their union, that form the skin used for the section sketch, snapping,
+                                   # clearance and external-region checks (set from the Bodies list; default fuselage_name)
   duct_prefix: DUCT_               # only Geoms with this prefix are ever touched
 
 # ---- Phase 1: engine and area sizing ------------------------------------

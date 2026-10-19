@@ -120,6 +120,26 @@ def compute_section(mesh: pv.PolyData, plane: InletPlane) -> Section | None:
     return make_section(uv_all[best[0]], best[1])
 
 
+def compute_union_section(meshes, plane: InletPlane) -> Section | None:
+    """The section of the UNION of several skin bodies: the plane's cut of each body, united as 2D polygons (the
+    piece containing the origin, else the largest). One body gives exactly its own section."""
+    sections = [s for s in (compute_section(m, plane) for m in meshes) if s is not None]
+    if len(sections) <= 1:
+        return sections[0] if sections else None
+    import shapely
+
+    polys = [shapely.make_valid(shapely.Polygon(s.points)) for s in sections if s.closed and len(s.points) >= 3]
+    if not polys:
+        return min(sections, key=lambda s: float(np.min(np.linalg.norm(s.points, axis=1))))
+    merged = shapely.union_all(polys)
+    parts = [merged] if merged.geom_type == "Polygon" else [g for g in getattr(merged, "geoms", []) if g.geom_type == "Polygon"]
+    if not parts:
+        return sections[0]
+    origin = shapely.Point(0.0, 0.0)
+    best = next((p for p in parts if p.contains(origin)), None) or max(parts, key=lambda p: p.area)
+    return make_section(np.asarray(best.exterior.coords)[:-1], True)
+
+
 # ---- queries on the curve -------------------------------------------------------------------------------
 def nearest_on_section(section: Section, uv) -> tuple[np.ndarray, float, float]:
     """Nearest point on the section curve to ``uv``: (point, arclength position, distance)."""

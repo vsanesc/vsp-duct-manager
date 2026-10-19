@@ -39,7 +39,6 @@ MARKER_PX = 5
 MIN_SCALE, MAX_SCALE = 5.0, 50000.0
 ZOOM_STEP = 1.15
 FIT_MARGIN = 0.12
-ENVELOPE_BINS = 160
 GRID_MIN_PX = 60
 CURVE_SAMPLES = 120
 PLOT_MARGIN = (46, 14, 14, 30)  # left, top, right, bottom in pixels
@@ -53,25 +52,6 @@ def nice_step(minimum: float) -> float:
         if m * 10.0**exp >= minimum:
             return m * 10.0**exp
     return 10.0 ** (exp + 1)
-
-
-def envelope(points: np.ndarray, across: int, bins: int = ENVELOPE_BINS) -> np.ndarray:
-    """Closed outline of the projection of ``points`` onto (x, axis ``across``): per x bin the min and max."""
-    if len(points) == 0:
-        return np.zeros((0, 2))
-    x, v = points[:, 0], points[:, across]
-    edges = np.linspace(x.min(), x.max(), bins + 1)
-    idx = np.clip(np.digitize(x, edges) - 1, 0, bins - 1)
-    upper, lower = [], []
-    for b in range(bins):
-        m = idx == b
-        if m.any():
-            xc = 0.5 * (edges[b] + edges[b + 1])
-            upper.append((xc, v[m].max()))
-            lower.append((xc, v[m].min()))
-    if not upper:
-        return np.zeros((0, 2))
-    return np.vstack([np.array(upper), np.array(lower)[::-1]])
 
 
 class Canvas2D(QtWidgets.QWidget):
@@ -161,13 +141,6 @@ class PathCanvas(Canvas2D):
             raise ValueError("view must be 'side' or 'top'")
         self.view = view
         self.across = 2 if view == "side" else 1  # the world axis shown vertically
-        scene = model.scene
-        self._fuselage = envelope(np.asarray(scene.fuselage.points), self.across)
-        self._engine = envelope(np.asarray(scene.engine_mesh.points), self.across) \
-            if getattr(scene, "engine_mesh", None) is not None and scene.engine_mesh.n_points else np.zeros((0, 2))
-        self._context = [envelope(np.asarray(m.points), self.across)
-                         for _, m in (getattr(scene, "context_parts", None) or []) if m.n_points]
-        self._fitted = False
         model.add_listener(self.update)
         self.fit_view()
 
@@ -177,7 +150,8 @@ class PathCanvas(Canvas2D):
         return np.c_[p[:, 0], p[:, self.across]]
 
     def fit_view(self) -> None:
-        pts = [self._fuselage] if len(self._fuselage) else [np.zeros((1, 2))]
+        pts = [r for _, kind, rings in self.model.silhouettes(self.across) if kind == "skin" for r in rings]
+        pts = pts or [np.zeros((1, 2))]
         duct = self.model.duct if self.model.placed else None
         if duct is not None:
             for bg in duct.branches:
@@ -357,17 +331,16 @@ class PathCanvas(Canvas2D):
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), QtGui.QColor(CANVAS_BACKGROUND))
         self._grid(p)
-        if len(self._fuselage):
-            p.setPen(self._pen(FUSELAGE_LINE, 1.5))
-            p.setBrush(QtGui.QColor(FUSELAGE_FILL))
-            self._polyline(p, self._fuselage, close=True)
-            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        p.setPen(self._pen(CONTEXT_LINE, 1.0))
-        for poly in self._context:
-            self._polyline(p, poly, close=True)
-        if len(self._engine):
-            p.setPen(self._pen(ENGINE_LINE, 1.2))
-            self._polyline(p, self._engine, close=True)
+        # every visible body, exact outline: the skin filled, the engine and the other bodies as lines
+        look = {"skin": (FUSELAGE_LINE, 1.5, FUSELAGE_FILL), "engine": (ENGINE_LINE, 1.2, None),
+                "context": (CONTEXT_LINE, 1.0, None)}
+        for _, kind, rings in sorted(self.model.silhouettes(self.across), key=lambda x: x[1] != "skin"):
+            line, width, fill = look[kind]
+            p.setPen(self._pen(line, width))
+            p.setBrush(QtGui.QColor(fill) if fill else QtCore.Qt.BrushStyle.NoBrush)
+            for ring in rings:
+                self._polyline(p, ring, close=True)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         m = self.model
         duct = m.duct if m.placed else None
         if duct is None:

@@ -54,7 +54,8 @@ def _round_values(value):
 
 
 def save_inlet_definition(inlet: dict | None, target: Path | None = None, key_sections: list | None = None,
-                          remove_inlet_keys=(), ducts_values: dict | None = None, remove_ducts_keys=()) -> Path:
+                          remove_inlet_keys=(), ducts_values: dict | None = None, remove_ducts_keys=(),
+                          model_values: dict | None = None) -> Path:
     """Write ``inlet`` into ``ducts.inlet`` of the private config (skipped when None), keeping comments and every
     other key. ``remove_ducts_keys`` names superseded keys to delete from ``ducts`` (the old ``inlet`` and
     ``key_sections``). In ``ducts_values`` the key ``inlets`` is a list of mappings (one per inlet, with its own
@@ -183,12 +184,26 @@ def save_inlet_definition(inlet: dict | None, target: Path | None = None, key_se
         ducts["key_sections"] = CommentedSeq([section_map(e) for e in _round_values(key_sections)])
     if ducts_values:
         assign_tree(ducts, _round_values(ducts_values))
+    if model_values:  # e.g. model.skin_bodies; fuselage_name and the other keys are left as they are
+        assign_tree(mapping(doc, "model"), model_values)
 
     tmp = target.with_name(target.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline=newline) as f:
         yaml.dump(doc, f)
     tmp.replace(target)
     return target
+
+
+def skin_names_from_config(cfg: dict) -> list[str]:
+    """The Geoms that form the fuselage skin: ``model.skin_bodies`` (a list) or, for older configs, the single
+    ``model.fuselage_name``. Empty when neither is given."""
+    model = cfg.get("model") or {}
+    names = model.get("skin_bodies")
+    if names is not None:
+        if not isinstance(names, (list, tuple)) or not names or not all(isinstance(n, str) and n for n in names):
+            raise ValueError("model.skin_bodies must be a non-empty list of Geom names")
+        return [str(n) for n in names]
+    return [model["fuselage_name"]] if model.get("fuselage_name") else []
 
 
 def resolve_model_path(cfg: dict, config_path: Path) -> Path:

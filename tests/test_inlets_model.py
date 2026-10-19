@@ -39,7 +39,7 @@ def clock():
 def scene_for(body, area=AREA, face_diameter=0.5):
     return SimpleNamespace(fuselage=body, sizing=SimpleNamespace(capture_area_per_inlet=area, n_inlets=2),
                            engine_check=None, warnings=[], face_center=np.array([6.0, 0.0, 0.0]),
-                           face_diameter=face_diameter, wings=[])
+                           face_diameter=face_diameter, wings=[], parts=[("Test Fuselage", body)])
 
 
 def inlet_entry(name, y, z, fraction=None, mirror=False, x=4.0, sweep=0.0, pitch=0.0):

@@ -222,6 +222,17 @@ handles in `ducts.centreline` (`null` = default), the junction and trunk area po
 `ducts.lip_extension` (formerly `ducts.inlet.lip_extension`, still read) and `ducts.lip_mode`. Each inlet keeps its own
 handles and branch area points in `ducts.inlets`. Save writes them all, keeping comments.
 
+**Bodies.** The **Bodies** list in the panel has every Geom of the model (and the engine) with two checkboxes.
+*Show* hides a body in all three views (3D, Side, Top) at once, and the toolbar's *Context* switch hides every body
+that is neither skin nor the engine; hiding is a view setting, hidden bodies stay in the checks, and the clash checks
+always use every Geom except the engine and the skin. *Skin* marks the Geom(s) that form the fuselage skin for the
+section sketch, snapping, clearance and the external-region check; several skin bodies are used as their union (the
+section is the union of their cuts, a point is inside when it is inside any of them). Changing it rebuilds the
+section and reruns the checks, with undo, and Save writes `model.skin_bodies` (a list; the older single
+`model.fuselage_name` is still read when it is absent and is never rewritten). Bodies are never treated specially by
+name: a missile is a skin only if you say so. The Side and Top views draw the exact projected outline of each body
+(the union of its projected triangles), so a coarse nose tessellation gives the true silhouette.
+
 **Inlets (1..N).** The design has any number of inlets, listed in the **Inlets** group of the panel (add, duplicate,
 remove, rename); the section editor, the 2D views and the panel edit the *selected* one (click an opening in a 2D
 view to select it). Each inlet has its own plane and key sections, a **flow share** (the fraction of the total flow
