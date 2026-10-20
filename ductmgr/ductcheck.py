@@ -125,6 +125,8 @@ def external_region(duct: dm.Duct, bodies: dict, fuselage: Solid, c: DuctChecks,
     for name in [f"pos_branch_{b}" for b in branch_names(bodies)] + ["pos_trunk"]:
         body = bodies[name]
         rings, dist = body.rings, body.dist
+        if name == "pos_trunk":  # the trunk measures from the junction: add the way from the nearest opening
+            dist = dist + duct.nearest_opening_length()
         n_r, n_p, _ = rings.shape
         sd = fuselage.signed(rings.reshape(-1, 3)).reshape(n_r, n_p)
         margin = float(np.diff(dist).max()) if n_r > 1 else 0.0

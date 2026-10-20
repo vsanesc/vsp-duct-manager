@@ -373,7 +373,8 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.inlet_list = QtWidgets.QListWidget()
         self.inlet_list.setMaximumHeight(INLET_LIST_HEIGHT)
         self.inlet_list.setToolTip("The inlet the section editor, the 2D views and the panel edit. Mirrored twins are "
-                                   "generated and not listed.")
+                                   "generated and not listed. The Trunk row (always last, fixed) selects the trunk: its "
+                                   "key sections in the section editor and its area curve in the Area tab.")
         self.inlet_list.currentRowChanged.connect(self._on_inlet_row)
         self.btn_add_inlet = QtWidgets.QPushButton("Add")
         self.btn_dup_inlet = QtWidgets.QPushButton("Duplicate")
@@ -381,15 +382,23 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.btn_ren_inlet = QtWidgets.QPushButton("Rename…")
         self.btn_add_inlet.setToolTip("Add an inlet, then click on the fuselage to place it")
         self.btn_dup_inlet.setToolTip("Copy the selected inlet (same plane and sections); then move the copy")
+        self.btn_up_inlet = QtWidgets.QPushButton("Up")
+        self.btn_down_inlet = QtWidgets.QPushButton("Down")
+        self.btn_up_inlet.setToolTip("Move the selected inlet up the list (the trunk is not affected)")
+        self.btn_down_inlet.setToolTip("Move the selected inlet down the list (the trunk is not affected)")
+        self.btn_up_inlet.clicked.connect(lambda *_: self.model.move_inlet(self.model.selected, -1))
+        self.btn_down_inlet.clicked.connect(lambda *_: self.model.move_inlet(self.model.selected, 1))
         self.btn_add_inlet.clicked.connect(lambda *_: self.model.add_inlet())
         self.btn_dup_inlet.clicked.connect(lambda *_: self.model.duplicate_inlet())
         self.btn_del_inlet.clicked.connect(lambda *_: self.model.remove_inlet())
         self.btn_ren_inlet.clicked.connect(lambda *_: self._on_rename_inlet())
-        row1, row2 = QtWidgets.QHBoxLayout(), QtWidgets.QHBoxLayout()
+        row1, row2, row3 = QtWidgets.QHBoxLayout(), QtWidgets.QHBoxLayout(), QtWidgets.QHBoxLayout()
         for b in (self.btn_add_inlet, self.btn_dup_inlet):
             row1.addWidget(b)
         for b in (self.btn_del_inlet, self.btn_ren_inlet):
             row2.addWidget(b)
+        for b in (self.btn_up_inlet, self.btn_down_inlet):
+            row3.addWidget(b)
         self.chk_mirror = QtWidgets.QCheckBox("Mirrored twin")
         self.chk_mirror.setToolTip("With symmetry xz: also generate the mirror image of this inlet about y = 0 "
                                    "(not for an inlet centred on y = 0, which is its own mirror image)")
@@ -413,6 +422,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.grp_inlets.form.addRow(self.inlet_list)
         self.grp_inlets.form.addRow(row1)
         self.grp_inlets.form.addRow(row2)
+        self.grp_inlets.form.addRow(row3)
         self.grp_inlets.form.addRow(self.chk_mirror)
         self.grp_inlets.form.addRow("Flow share", flow_row)
         self.grp_inlets.form.addRow("Symmetry", self.combo_symmetry)
@@ -647,7 +657,11 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.act_context.setEnabled(any(kind == "context" for _, _, _, kind in rows))
 
     def _on_inlet_row(self, row: int) -> None:
-        if not self._syncing and row >= 0:
+        if self._syncing or row < 0:
+            return
+        if row == len(self.model.state.inlets):  # the fixed Trunk row
+            self.model.select_trunk()
+        else:
             self.model.select_inlet(row)
 
     def ask_inlet_name(self, current: str) -> str | None:
@@ -678,8 +692,8 @@ class ExploreWindow(QtWidgets.QMainWindow):
 
     def ask_section_s(self) -> float | None:
         """Ask for the s of a new key section; None when cancelled."""
-        s, ok = QtWidgets.QInputDialog.getDouble(self, "Add key section", "s (0 = inlet, 1 = engine face):",
-                                                 NEW_SECTION_S, 0.0, 1.0, 3)
+        what = "s (0 = trunk start, 1 = engine face):" if self.model.trunk_selected else "s (0 = inlet, 1 = engine face):"
+        s, ok = QtWidgets.QInputDialog.getDouble(self, "Add key section", what, NEW_SECTION_S, 0.0, 1.0, 3)
         return s if ok else None
 
     def _on_add_section(self) -> None:
@@ -758,6 +772,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self._syncing = True
         try:
             placed = m.placed
+            inlet_edit = placed and not m.trunk_selected  # the plane belongs to the inlet, not to the trunk
             if placed:
                 for axis, value in zip("xyz", m.state.plane.origin):
                     self._set_value(self.spin_pos[axis], float(value))
@@ -768,11 +783,11 @@ class ExploreWindow(QtWidgets.QMainWindow):
             for checkable in (self.btn_place, self.act_place):
                 checkable.setChecked(placing)
             for box in self.spin_pos.values():
-                box.setEnabled(placed and not m.locked)
-            self.combo_step.setEnabled(placed and not m.locked)
+                box.setEnabled(inlet_edit and not m.locked)
+            self.combo_step.setEnabled(inlet_edit and not m.locked)
             for box in (self.spin_pitch, self.spin_sweep):
-                box.setEnabled(placed)
-            self.btn_align.setEnabled(placed)
+                box.setEnabled(inlet_edit)
+            self.btn_align.setEnabled(inlet_edit)
             self._sync_inlets(m)
             self._sync_bodies(m)
             self._set_value(self.spin_wall, m.state.duct.wall_thickness)
@@ -787,7 +802,7 @@ class ExploreWindow(QtWidgets.QMainWindow):
                 self.section_list.setCurrentRow(m.active)
             self.btn_add_section.setEnabled(placed)
             self.btn_remove_section.setEnabled(placed and 0 < m.active < m.n_sections)
-            self.btn_place.setEnabled(not m.locked)
+            self.btn_place.setEnabled(not m.locked and not m.trunk_selected)
             self.act_undo.setEnabled(m.can_undo)
             self.act_redo.setEnabled(m.can_redo)
             can_save = m.can_save
@@ -827,17 +842,26 @@ class ExploreWindow(QtWidgets.QMainWindow):
                 tag = "self-symmetric" if ins.self_symmetric else "+ mirror" if m.has_twin(k) else ""
                 status = f"{100 * fractions[k]:.1f} %" + (f", {tag}" if tag else "")
             self.inlet_list.addItem(f"{ins.name}   ({status})")
-        self.inlet_list.setCurrentRow(m.selected)
+        trunk_item = QtWidgets.QListWidgetItem(f"Trunk   ({len(st.trunk)} section(s))")
+        font = trunk_item.font()
+        font.setBold(True)
+        trunk_item.setFont(font)
+        self.inlet_list.addItem(trunk_item)  # always last; cannot be removed, renamed or moved
+        self.inlet_list.setCurrentRow(len(st.inlets) if m.trunk_selected else m.selected)
         ins = m.inlet
-        self.btn_del_inlet.setEnabled(len(st.inlets) > 1)
-        self.btn_dup_inlet.setEnabled(ins.placed)
+        on_inlet = not m.trunk_selected  # the inlet's own controls do not apply to the trunk
+        self.btn_del_inlet.setEnabled(on_inlet and len(st.inlets) > 1)
+        self.btn_dup_inlet.setEnabled(on_inlet and ins.placed)
+        self.btn_ren_inlet.setEnabled(on_inlet)
+        self.btn_up_inlet.setEnabled(on_inlet and m.selected > 0)
+        self.btn_down_inlet.setEnabled(on_inlet and m.selected < len(st.inlets) - 1)
         self.chk_mirror.setChecked(ins.mirror)
-        self.chk_mirror.setEnabled(st.symmetry == "xz" and not ins.self_symmetric)
+        self.chk_mirror.setEnabled(on_inlet and st.symmetry == "xz" and not ins.self_symmetric)
         f = fractions.get(m.selected)
-        self.spin_flow.setEnabled(f is not None)
+        self.spin_flow.setEnabled(on_inlet and f is not None)
         if f is not None:
             self._set_value(self.spin_flow, 100.0 * f)
-        self.btn_flow_equal.setEnabled(f is not None and ins.flow_fraction is not None)
+        self.btn_flow_equal.setEnabled(on_inlet and f is not None and ins.flow_fraction is not None)
         self.combo_symmetry.setCurrentIndex(self.combo_symmetry.findData(st.symmetry))
 
     def refresh_heavy(self) -> None:

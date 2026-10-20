@@ -85,8 +85,9 @@ def rows(w):
 def test_the_inlets_list_shows_name_flow_share_and_twin(window):
     w, m, _ = window([entry("R", 0.5, True), entry("C", 0.0)])
     r = rows(w)
-    assert len(r) == 2 and r[0].startswith("R") and "33.3 %" in r[0] and "+ mirror" in r[0]
+    assert len(r) == 3 and r[0].startswith("R") and "33.3 %" in r[0] and "+ mirror" in r[0]
     assert r[1].startswith("C") and "self-symmetric" in r[1]
+    assert r[2].startswith("Trunk")  # the fixed last row
     assert w.inlet_list.currentRow() == 0 and w.chk_mirror.isChecked() and w.chk_mirror.isEnabled()
     assert w.spin_flow.value() == pytest.approx(100 / 3, abs=0.01)
     assert not w.btn_flow_equal.isEnabled()  # nothing explicit to reset
@@ -162,6 +163,60 @@ def test_the_readouts_list_the_inlets(window):
     w, m, _ = window([entry("R", 0.5, True), entry("C", 0.0)])
     text = w.readout_view.toPlainText()
     assert "3 branch(es)" in text and "symmetry xz" in text and "self-symmetric" in text
+
+
+# ---- the Trunk row ---------------------------------------------------------------------------------------------------------------------
+def test_the_trunk_row_is_fixed_last_and_selects_the_trunk(window):
+    w, m, _ = window([entry("R", 0.5, True), entry("C", 0.0)])
+    assert rows(w)[-1].startswith("Trunk") and w.inlet_list.count() == len(m.state.inlets) + 1
+    w.inlet_list.setCurrentRow(2)
+    assert m.trunk_selected and w.inlet_list.currentRow() == 2
+    # the section editor shows the trunk's sections; the Area tab its curve; the inlet's own controls are off
+    assert [w.section_list.item(i).text().split("   ")[1] for i in range(w.section_list.count())] == [
+        "trunk start", "engine face (fixed)"]
+    assert "Trunk" in w.sketch.title.text() and "trunk start" in w.sketch.title.text()
+    for off in (w.btn_del_inlet, w.btn_dup_inlet, w.btn_ren_inlet, w.btn_up_inlet, w.btn_down_inlet, w.chk_mirror,
+                w.spin_flow, w.btn_place, w.spin_pitch, w.spin_sweep, w.btn_align, *w.spin_pos.values()):
+        assert not off.isEnabled()
+    assert w.btn_add_section.isEnabled() and w.spin_wall.isEnabled()
+    w.inlet_list.setCurrentRow(1)  # back to an inlet
+    assert not m.trunk_selected and w.btn_ren_inlet.isEnabled() and w.section_list.count() == 3
+
+
+def test_the_trunk_row_cannot_be_removed_or_moved_and_inlets_can_move(window):
+    w, m, clock = window([entry("a", 0.6), entry("b", -0.3), entry("c", 0.0)], "none")
+    w.inlet_list.setCurrentRow(1)
+    assert w.btn_up_inlet.isEnabled() and w.btn_down_inlet.isEnabled()
+    clock.advance(10.0)
+    w.btn_down_inlet.click()
+    assert [i.name for i in m.state.inlets] == ["a", "c", "b"] and m.selected == 2 and rows(w)[-1].startswith("Trunk")
+    assert not w.btn_down_inlet.isEnabled() and w.inlet_list.currentRow() == 2
+    clock.advance(10.0)
+    w.btn_up_inlet.click()
+    assert [i.name for i in m.state.inlets] == ["a", "b", "c"] and m.selected == 1
+    w.inlet_list.setCurrentRow(3)
+    assert not w.btn_del_inlet.isEnabled()
+    assert not m.remove_inlet(3) and len(m.state.inlets) == 3  # there is no inlet 3: the trunk row is not an inlet
+
+
+def test_adding_a_trunk_key_section_from_the_panel(window, monkeypatch):
+    w, m, clock = window([entry("a", 0.6), entry("b", -0.3)], "none")
+    w.inlet_list.setCurrentRow(2)
+    monkeypatch.setattr(w, "ask_section_s", lambda: 0.5)
+    clock.advance(10.0)
+    w._on_add_section()
+    assert [ks.s for ks in m.state.trunk] == [0.0, 0.5] and w.section_list.count() == 3
+    assert w.btn_remove_section.isEnabled() and m.active == 1
+    w.btn_remove_section.click()
+    assert [ks.s for ks in m.state.trunk] == [0.0]
+
+
+def test_the_readouts_list_the_trunk(window):
+    w, m, _ = window([entry("a", 0.6), entry("b", -0.3)], "none")
+    assert "Trunk" in w.readout_view.toPlainText()
+    w.inlet_list.setCurrentRow(2)
+    text = w.readout_view.toPlainText()
+    assert "Trunk start" in text and "engine face circle" in text
 
 
 # ---- the 2D views --------------------------------------------------------------------------------------------------------------------
@@ -250,6 +305,33 @@ def test_the_area_plot_edits_the_selected_inlets_curve_and_its_share(qapp):
     assert end_b[4] == pytest.approx(0.3 * m.areas.junction_area)
 
 
+def test_the_area_plot_shows_only_the_trunk_curve_while_the_trunk_is_selected(qapp):
+    scene, m, clock = build([entry("a", 0.6), entry("b", -0.5)], "none")
+    c = qp.AreaCanvas(m)
+    c.resize(*SIZE)
+    assert c.plots() == ("branch", "trunk") and any(i[0] == "branch" for i in c.items())
+    m.select_trunk()
+    assert c.plots() == ("trunk",) and all(i[0] == "trunk" for i in c.items())
+    assert c.plot_rect("trunk").width() > SIZE[0] * 0.8 and c.which_plot(c.plot_rect("trunk").center()) == "trunk"
+    clock.advance(10.0)
+    end = next(i for i in c.items() if i[1] == "junction")
+    c.press(c.to_px("trunk", 0.0, end[4]))
+    c.move(c.to_px("trunk", 0.0, 0.12))
+    c.release()
+    assert m.areas.junction_area == pytest.approx(0.12, rel=1e-6)
+    assert all(i.area_branch is None for i in m.state.inlets)
+    c.grab()  # paints without the branch plot
+
+
+def test_the_paths_show_only_the_trunks_handles_while_it_is_selected(qapp):
+    scene, m, _ = build([entry("a", 0.6), entry("b", -0.5)], "none")
+    c = canvas(m, "side")
+    assert set(c.handles()) == {"start", "junction_in", "junction", "junction_out", "end"}
+    m.select_trunk()
+    assert set(c.handles()) == {"junction", "junction_out", "end"}
+    c.grab()
+
+
 # ---- the 3D drawing ---------------------------------------------------------------------------------------------------------------------
 @pytest.fixture()
 def plotter():
@@ -277,6 +359,18 @@ def test_every_branch_has_its_centreline_and_body_actors_and_stale_ones_go(plott
     acts = set(plotter.renderer.actors)
     assert "cl_b" not in acts and "duct_neg_branch_b" not in acts and "inlet_other1_fill" not in acts
     assert "cl_a_mirror" in acts
+
+
+def test_no_inlet_is_highlighted_while_the_trunk_is_selected(plotter):
+    scene, m, _ = build([entry("a", 0.6), entry("b", -0.5)], "none")
+    view = SceneView(plotter, scene)
+    view.update_inlet(m)
+    acts = set(plotter.renderer.actors)
+    assert "inlet_right_fill" in acts and "inlet_other1_fill" in acts
+    m.select_trunk()
+    view.update_inlet(m)
+    acts = set(plotter.renderer.actors)
+    assert "inlet_right_fill" not in acts and "inlet_other0_fill" in acts and "inlet_other1_fill" in acts
 
 
 def test_the_twin_is_greyed_and_a_non_mirrored_inlet_has_no_left_opening(plotter):

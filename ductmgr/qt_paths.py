@@ -171,7 +171,8 @@ class PathCanvas(Canvas2D):
         cl = self.selected_centreline()
         if cl is None:
             return {}
-        return {name: self.project(p)[0] for name, p in cl.handle_points().items()}
+        own = ("junction", "junction_out", "end") if self.model.trunk_selected else None  # the inlet's are not the trunk's
+        return {name: self.project(p)[0] for name, p in cl.handle_points().items() if own is None or name in own}
 
     def selected_centreline(self):
         """The centreline of the selected inlet's primary branch (None without a duct)."""
@@ -376,8 +377,10 @@ class PathCanvas(Canvas2D):
         self._polyline(p, self.project(duct.branches[0].centreline.trunk.points(t)))
         # key section positions along the selected inlet's path
         p.setPen(self._pen(KEY_COLOR, 1.5))
-        for ks in m.state.sections[1:]:
-            c = self.project(cl.point_at(ks.s))[0]
+        trunk = m.trunk_selected  # the trunk's sections have s along the trunk: 0 is the junction
+        for ks in (m.state.sections if trunk else m.state.sections[1:]):
+            s_path = cl.s_junction + ks.s * (1.0 - cl.s_junction) if trunk else ks.s
+            c = self.project(cl.point_at(s_path))[0]
             q = self.to_screen(c)
             p.drawEllipse(q, 4, 4)
         # tangent handles, CAD style: a dashed line to a square, a larger circle for the junction
@@ -411,11 +414,18 @@ class AreaCanvas(Canvas2D):
         model.add_listener(self.update)
 
     # ---- layout ------------------------------------------------------------------------------------------------------------
+    def plots(self) -> tuple[str, ...]:
+        """The plots shown: the selected inlet's branch and the trunk, or only the trunk while it is selected."""
+        return ("trunk",) if self.model.trunk_selected else ("branch", "trunk")
+
     def plot_rect(self, which: str) -> QtCore.QRectF:
         l, t, r, b = PLOT_MARGIN
+        height = max(self.height() - t - b, 10.0)
+        if self.model.trunk_selected:
+            return QtCore.QRectF(l, t, max(self.width() - l - r, 10.0), height)
         w = (self.width() - l - r - PLOT_GAP) / 2.0
         x0 = l if which == "branch" else l + w + PLOT_GAP
-        return QtCore.QRectF(x0, t, max(w, 10.0), max(self.height() - t - b, 10.0))
+        return QtCore.QRectF(x0, t, max(w, 10.0), height)
 
     def y_range(self, which: str) -> tuple[float, float]:
         """Each plot has its own vertical range (the trunk carries n times the area of a branch)."""
@@ -436,7 +446,7 @@ class AreaCanvas(Canvas2D):
         return ((pos.x() - r.left()) / r.width(), lo + (r.bottom() - pos.y()) / r.height() * (hi - lo))
 
     def which_plot(self, pos) -> str | None:
-        for w in ("branch", "trunk"):
+        for w in self.plots():
             if self.plot_rect(w).adjusted(-8, -8, 8, 8).contains(pos):
                 return w
         return None
@@ -445,11 +455,12 @@ class AreaCanvas(Canvas2D):
     def items(self) -> list[tuple[str, str, int, float, float]]:
         """(plot, kind, index, s, area) of every draggable point: interior points and the junction ends."""
         a, out = self.model.areas, []
-        for k, (s, v) in enumerate(a.branch_interior):
-            out.append(("branch", "point", k, s, v))
+        if "branch" in self.plots():
+            for k, (s, v) in enumerate(a.branch_interior):
+                out.append(("branch", "point", k, s, v))
+            out.append(("branch", "junction", -1, 1.0, a.junction_area * a.share))
         for k, (s, v) in enumerate(a.trunk_interior):
             out.append(("trunk", "point", k, s, v))
-        out.append(("branch", "junction", -1, 1.0, a.junction_area * a.share))
         out.append(("trunk", "junction", -1, 0.0, a.junction_area))
         return out
 
@@ -510,6 +521,8 @@ class AreaCanvas(Canvas2D):
         limit = m.settings.checks.max_half_angle_deg
         p.setFont(QtGui.QFont("Consolas", 8))
         for which, fn, knots in (("branch", a.branch_area, a.branch_knots), ("trunk", a.trunk_area, a.trunk_knots)):
+            if which not in self.plots():
+                continue
             r = self.plot_rect(which)
             lo, hi = self.y_range(which)
             p.setPen(self._pen(AXIS_COLOR))
@@ -526,7 +539,8 @@ class AreaCanvas(Canvas2D):
                 p.drawText(QtCore.QPointF(2, y + 4), f"{k * step:.3f}")
                 k += 1
             p.setPen(self._pen(TEXT_COLOR))
-            title = "branch  A(s)" if which == "branch" else "trunk  A(s)"
+            title = ("branch  A(s)" if which == "branch" else "trunk  A(s)") + (
+                f"   [{m.inlet.name}]" if which == "branch" and len(m.state.inlets) > 1 else "")
             p.drawText(QtCore.QPointF(r.left() + 4, r.top() + 12), title)
             p.drawText(QtCore.QPointF(r.left(), r.bottom() + 14), "0")
             p.drawText(QtCore.QPointF(r.right() - 8, r.bottom() + 14), "1")
@@ -548,10 +562,13 @@ class AreaCanvas(Canvas2D):
             if duct is not None:
                 sj = duct.branches[m.branch_index() or 0].s_junction
                 for ks in m.state.sections:
-                    in_branch = ks.s <= sj
+                    if m.trunk_selected:  # the trunk's sections already have their local s
+                        in_branch, sl = False, ks.s
+                    else:
+                        in_branch = ks.s <= sj
+                        sl = ks.s / sj if in_branch else (ks.s - sj) / (1.0 - sj)
                     if (which == "branch") != in_branch:
                         continue
-                    sl = ks.s / sj if in_branch else (ks.s - sj) / (1.0 - sj)
                     x = self.to_px(which, sl, 0.0).x()
                     p.setPen(self._pen(KEY_COLOR, 1.0, QtCore.Qt.PenStyle.DashLine))
                     p.drawLine(QtCore.QPointF(x, r.top()), QtCore.QPointF(x, r.bottom()))

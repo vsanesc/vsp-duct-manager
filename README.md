@@ -149,14 +149,15 @@ corners (turning angle above 30 degrees) marked. The inlet opening is a closed o
 - The mirrored left inlet is shown greyed, with the symmetry plane y = 0, a grid and a scale bar. The wheel zooms
   and a middle-drag pans.
 
-**Key sections.** A branch is described by key sections at a normalised arc length `s`: `s = 0` is the inlet
-section above, `s = 1` (the trunk end) is the engine face, a fixed circle of `engine.face_diameter`. The
-**Key sections** list in the panel adds (*Add...*, at a chosen `s`, e.g. at the junction) and removes
+**Key sections.** A branch is described by key sections at a normalised arc length `s`, from the inlet to the
+junction: `s = 0` is the inlet section above. (The trunk has its own key sections, see **The trunk** below; the engine
+face, a fixed circle of `engine.face_diameter`, closes the trunk at its `s = 1`.) The
+**Key sections** list in the panel adds (*Add...*, at a chosen `s` before the junction) and removes
 intermediate sections; selecting a row opens that section in the editor. A new section starts as a copy of the one
 before it. Its *shape* is free (same editing tools, no skin to snap to) but its *size* always follows the area law
 `A(s)`: the editor rescales it to exactly that area when an edit ends. `A(s)` runs from the inlet's in-plane area
-to the face area (`ducts.area_law`, `linear` or `cosine`), and the trunk carries `n_inlets` branches, so the area
-at the junction is `n_inlets` times the branch area there.
+to the face area (`ducts.area_law`, `linear` or `cosine`), and the trunk carries all the branches, so the area at the
+junction is the sum of the branch areas there.
 
 Between key sections, outlines are resampled to N points by arc length from a reference vertex (the one closest
 to the section's local `+v`), so a pentagon morphs into a circle without twisting. `ductmgr/cedit.py` maps a
@@ -169,10 +170,11 @@ and the same undo history as the section editor, and the 3D view follows at once
 
 - **Topology.** Two branches (the right inlet and its mirror image) join in a Y junction on `y = 0`, and one trunk
   runs to the engine face (centre from the engine Geom, axis `ducts.engine_face.normal`, default +X).
-- **The Y junction.** The trunk start section is made mirror symmetric and split by the plane `y = 0` into two
-  halves; each branch ends with exactly its half (same shape, position and half the area), so the two branch ends
-  tile the trunk start section with no overlap and no gap. That branch end is a fixed key section in the list
-  (like the engine face): derived, not editable, and the branch interpolation morphs into it. The branch
+- **The Y junction.** The trunk start section (the trunk's own `s = 0` key section, see **The trunk**; mirror
+  symmetric with symmetry `xz`) is split by the plane `y = 0` into two halves; each branch ends with exactly its half
+  (same shape, position and half the area), so the two branch ends tile the trunk start section with no overlap and no
+  gap. That branch end is a fixed key section in the list (like the engine face): derived, not editable, and the
+  branch interpolation morphs into it. Editing the trunk start therefore reshapes every branch end. The branch
   centrelines end at the halves' centroids rather than on `y = 0`, with the junction tangent (G1). For clean
   booleans each branch negative continues into the trunk by `ducts.junction.overlap` (default 0.02 m) as a
   half-section and the trunk negative starts as far upstream, all inside the duct. With
@@ -194,7 +196,8 @@ and the same undo history as the section editor, and the 3D view follows at once
   inlet area and the face area; the interior points default to `ducts.area_law` (`linear` or `cosine`).
   Double-click a curve to add a point, right-click a point to remove it. The curve is red where it decreases or
   where the equivalent cone half-angle exceeds `checks.max_diffuser_half_angle_deg`. Key sections are held at
-  `A(s)` of these curves, `s` being the arc-length fraction of the whole path.
+  `A(s)` of these curves: an inlet's sections by the arc-length fraction of its own branch, the trunk's by the
+  fraction of the trunk. Selecting the **Trunk** row of the Inlets list shows the trunk curve alone, full width.
 - **Bodies.** Stations lie along the centrelines (`ducts.n_stations_branch` / `n_stations_trunk`); the section at a
   station is the blend of the neighbouring key sections (arc-length correspondence, no twist), scaled to exactly
   `A(s)`, with frames from parallel transport (the branch's accumulated roll is spread so it meets the trunk's
@@ -216,11 +219,32 @@ and the same undo history as the section editor, and the 3D view follows at once
   half-angle per part; A(s) must not decrease. The cheap numbers update with every edit; the bodies and the mesh
   checks are rebuilt a moment after the last one.
 
-The config keeps the junction in `ducts.junction.point` `[x, y, z]` (y is 0 with symmetry xz), the shared tangent and
-handles in `ducts.centreline` (`null` = default), the junction and trunk area points in `ducts.area_points`
-(`junction_area`, interior `trunk` points; `null` = derived from `ducts.area_law`), and `ducts.wall_thickness`,
-`ducts.lip_extension` (formerly `ducts.inlet.lip_extension`, still read) and `ducts.lip_mode`. Each inlet keeps its own
-handles and branch area points in `ducts.inlets`. Save writes them all, keeping comments.
+**The trunk.** The trunk (junction to engine face) is its own entity, not derived from any inlet: `ducts.trunk` holds
+its key sections (`key_sections`, with `s` along the trunk: `0` is the trunk start at the junction, `0 < s < 1` are
+intermediate ones, the engine face at `1` is the fixed circle), its area curve (`junction_area`, interior
+`area_points`) and its two handles (`junction_out_handle`, `end_handle`). The trunk start (`s = 0`) is an editable
+section like any other, by default a superellipse of exponent 2.5; its size is held at the junction area, and the
+other trunk sections at the trunk's `A(s)`. Every branch end is cut from the trunk start section (D-split or
+sectors), so editing it reshapes all of them and the pieces keep tiling it exactly. With symmetry `xz` the trunk
+sections are kept mirror symmetric about `u = 0` (edit one side). The **Inlets** list ends with a fixed **Trunk** row
+(it cannot be removed, renamed or moved): select it to edit the trunk's key sections in the section editor and its
+area curve in the Area tab. Inlets take no key sections beyond the junction. Nothing about the trunk depends on how
+many inlets there are, their order or their names (the junction point and the junction area, when not given, are
+symmetric functions of the inlets, so reordering or renaming never moves the trunk; give them explicitly and adding
+or removing an inlet leaves it bit for bit as it was). The panel's *Up* / *Down* buttons reorder the inlets.
+
+Configs from before (no `ducts.trunk`; the trunk start section was derived from the first inlet's sections at the
+junction, its key sections beyond the junction shaped the trunk, and the junction / trunk area points and handles
+were in `ducts.area_points` and `ducts.centreline`) are migrated on load with a one-line notice: the derived trunk
+start becomes the trunk's `s = 0` section (a polygon of the section samples), the first inlet's sections beyond the
+junction move to the trunk (their `s` converted to the trunk's), sections beyond the junction on other inlets are
+dropped, and the old locations of the values are still read. Save writes the new format.
+
+The config keeps the junction in `ducts.junction.point` `[x, y, z]` (y is 0 with symmetry xz), the shared tangent in
+`ducts.centreline` (`null` = default), the trunk in `ducts.trunk` (`null` = derived from `ducts.area_law` and the
+inlets), and `ducts.wall_thickness`, `ducts.lip_extension` (formerly `ducts.inlet.lip_extension`, still read) and
+`ducts.lip_mode`. Each inlet keeps its own handles and branch area points in `ducts.inlets`. Save writes them all,
+keeping comments.
 
 **Bodies.** The **Bodies** list in the panel has every Geom of the model (and the engine) with two checkboxes.
 *Show* hides a body in all three views (3D, Side, Top) at once, and the toolbar's *Context* switch hides every body
@@ -256,7 +280,6 @@ pieces tile the section with no gap and no overlap.
 The config holds `ducts.symmetry` and `ducts.inlets`, a list of `{name, origin, pitch_deg, sweep_deg, flow_fraction,
 mirror, start_handle, junction_in_handle, area_points, key_sections}`. The old single-inlet format (`ducts.inlet` +
 `ducts.key_sections`) still loads, as one mirrored inlet with symmetry xz, with a one-line notice; Save migrates it.
-Key sections beyond the junction shape the trunk and are taken from the first inlet.
 
 The 3D view draws both openings on their planes, the section curve and the plane's `u`/`v`/`n` arrows at `O`.
 

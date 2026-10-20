@@ -266,9 +266,10 @@ class SceneView:
         for name in self._other_inlet_actors:  # the others are redrawn every time
             p.remove_actor(name, render=False)
         self._other_inlet_actors = set()
+        selected = -1 if model.trunk_selected else model.selected  # with the Trunk selected no inlet is highlighted
         for k, ins in enumerate(model.state.inlets):
             evs = model._evals[k] if k < len(model._evals) else []
-            if k == model.selected or not evs:
+            if k == selected or not evs:
                 continue
             twin = model.has_twin(k)
             for tag, mirror in (("", False), ("m", True)) if twin else (("", False),):
@@ -282,7 +283,7 @@ class SceneView:
                     colour = ERROR_COLOR if bad else (TWIN_COLOR if mirror else OTHER_INLET_COLOR)
                     p.add_mesh(mesh, color=colour, name=name, pickable=False, render=False, **kw)
                     self._other_inlet_actors.add(name)
-        op = model.opening
+        op = None if model.trunk_selected else model.opening
         if op is None:
             for name in self.INLET_ACTORS:
                 p.remove_actor(name, render=False)

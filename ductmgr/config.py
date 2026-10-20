@@ -121,6 +121,10 @@ def save_inlet_definition(inlet: dict | None, target: Path | None = None, key_se
         for key, value in mapping.items():
             if key == "inlets" and isinstance(value, list):
                 slot[key] = CommentedSeq([entry_map(e) for e in value])
+            elif key == "key_sections" and isinstance(value, list):  # the trunk's
+                slot[key] = CommentedSeq([section_map(e) for e in value])
+            elif key == "area_points" and isinstance(value, list):  # [[s, area], ...]
+                slot[key] = CommentedSeq([flow_seq(p) for p in value])
             elif isinstance(value, dict):
                 assign_tree(mapping_of(slot, key), value)
             elif isinstance(value, list):
@@ -164,8 +168,12 @@ def save_inlet_definition(inlet: dict | None, target: Path | None = None, key_se
 
     ducts = mapping(doc, "ducts")
     for key in remove_ducts_keys:
-        if key in ducts:
-            del ducts[key]
+        parent, _, leaf = key.rpartition(".")  # "centreline.end_handle" removes a nested key
+        node = ducts
+        for part in filter(None, parent.split(".")):
+            node = node.get(part) if isinstance(node, dict) else None
+        if isinstance(node, dict) and leaf in node:
+            del node[leaf]
     if inlet is not None:
         slot = mapping(ducts, "inlet")
         for key in remove_inlet_keys:

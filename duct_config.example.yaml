@@ -62,8 +62,8 @@ ducts:
           edges: [straight, straight, straight, straight, straight]  # edge i joins vertex i to i+1: straight or curved
           handles: [null, null, null, null, null]  # curved edges: [[du, dv], [du, dv]] tangent offsets from its two vertices
           continuity: [corner, corner, corner, corner, corner]       # per vertex: corner, smooth (G1) or symmetric
-        # more sections: add entries with 0 < s < 1; each keeps its own shape but is sized by the area law A(s).
-        # The engine face (s = 1) is a fixed circle and is not listed.
+        # more sections: add entries with 0 < s < the junction (s of the junction is shown in the explorer); each keeps its
+        # own shape but is sized by the area law A(s). Sections of the trunk (after the junction) go in ducts.trunk.
   junction:
     point: [4.0, 0.0, 0.2]         # [x, y, z] where the branches merge (drag it in the SIDE / TOP tabs); y is 0 with
                                    # symmetry xz. With one branch: an intermediate point (G1) instead of a junction
@@ -74,12 +74,25 @@ ducts:
   centreline:                      # cubic Bezier centrelines; null = default (handle_fraction x chord length)
     junction_pitch_deg: null       # tangent direction at the junction in the XZ plane (0 = +X, + up)
     junction_yaw_deg: null         # tangent yaw towards +Y at the junction (only with symmetry none; else 0)
-    junction_out_handle: null      # m, trunk side of the junction (collinear with the in-handle: G1)
-    end_handle: null               # m, handle at the engine face, along the engine axis
     handle_fraction: 0.3333        # default handle length / chord length
-  area_points:                     # area law A(s), PCHIP through these; null = derived from area_law below
-    junction_area: null            # m^2 at the junction (trunk start); each branch ends with its flow share of it
-    trunk: null                    # interior control points [[s, area], ...], s = local arc length 0..1
+  trunk:                           # the trunk (junction -> engine face) is its own entity, independent of the inlets
+    junction_area: null            # m^2 at the junction (trunk start); null = sqrt(sum of inlet areas x face area).
+                                   # Each branch ends with its flow share of it
+    area_points: null              # interior control points [[s, area], ...] of A(s) along the trunk, s = 0..1;
+                                   # null = derived from area_law below
+    junction_out_handle: null      # m, trunk side of the junction (collinear with the branches' in-handles: G1)
+    end_handle: null               # m, handle at the engine face, along the engine axis
+    key_sections:                  # s = 0 is the trunk start at the junction: the section every branch end is cut from
+      - s: 0.0                     # (editable like any other; its size is held at junction_area). More sections:
+        vertices:                  # 0 < s < 1, along the trunk. The engine face (s = 1) is a fixed circle.
+          - [0.0, 1.0]
+          - [-1.0, 0.0]
+          - [0.0, -1.0]
+          - [1.0, 0.0]
+        snapped: [false, false, false, false]
+        edges: [curved, curved, curved, curved]    # a superellipse; any size, it is scaled to the junction area
+        handles: [[[-0.687622, 0.0], [0.0, 0.687622]], [[0.0, -0.687622], [-0.687622, 0.0]], [[0.687622, 0.0], [0.0, -0.687622]], [[0.0, 0.687622], [0.687622, 0.0]]]
+        continuity: [smooth, smooth, smooth, smooth]
   wall_thickness: 0.004            # m, the positive body is the inner section offset outward by this
   lip_extension: 0.05              # m, the negative starts this far upstream of the opening plane
   lip_mode: blunt                  # lip shape of the positive at the opening ("blunt" for now)

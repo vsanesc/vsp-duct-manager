@@ -970,18 +970,17 @@ def test_adding_a_key_section_copies_the_previous_shape_at_the_area_law_size(cyl
     assert m.undo() and len(m.state.sections) == 1
 
 
-def test_key_section_areas_follow_the_area_law_before_and_after_the_junction(cyl_model, clock):
+def test_key_section_areas_follow_the_branch_curve_and_the_trunk_curve(cyl_model, clock):
     m = cyl_model
-    sj = m.junction_s
-    for s in (sj * 0.5, (1 + sj) / 2):
-        clock.advance(10.0)
-        m.add_key_section(round(s, 4))
-    sj = m.junction_s  # the junction section is derived from the key sections: it moves a little with them
-    s_branch, s_trunk = (ks.s for ks in m.state.sections[1:])
-    assert s_branch < sj < s_trunk
-    for ks, ev in zip(m.state.sections[1:], m.evaluations[1:]):
-        expect = float(m.areas.area(ks.s, sj)[0])  # branch curve before the junction, trunk curve after it
-        assert ev.area_plane == pytest.approx(expect, rel=1e-9)
+    clock.advance(10.0)
+    assert m.add_key_section(round(m.junction_s * 0.5, 4))  # the inlet's branch: the branch curve
+    [(ks, ev)] = list(zip(m.state.sections[1:], m.evaluations[1:]))
+    assert ev.area_plane == pytest.approx(float(m.areas.branch_area(ks.s / m.junction_s)), rel=1e-9)
+    clock.advance(10.0)
+    assert m.select_trunk() and m.add_key_section(0.5)  # the trunk: its own curve, s along the trunk
+    [(kt, evt)] = list(zip(m.state.sections[1:], m.evaluations[1:]))
+    assert kt.s == 0.5 and evt.area_plane == pytest.approx(float(m.areas.trunk_area(0.5)), rel=1e-9)
+    assert m.evaluations[0].area_plane == pytest.approx(m.areas.junction_area, rel=1e-9)  # the trunk start
 
 
 def test_a_key_section_keeps_its_shape_when_edited_but_not_its_size(cyl_model, clock):
@@ -1025,11 +1024,11 @@ def test_rescaling_a_section_that_already_has_its_area_is_a_no_op(cyl_model):
 def test_removing_key_sections(cyl_model, clock):
     m = cyl_model
     clock.advance(10.0)
-    m.add_key_section(0.3)
+    m.add_key_section(0.2)
     clock.advance(10.0)
-    m.add_key_section(0.6)
-    assert [ks.s for ks in m.state.sections] == [0.0, 0.3, 0.6]
-    assert m.remove_key_section(1) and [ks.s for ks in m.state.sections] == [0.0, 0.6]
+    m.add_key_section(0.4)
+    assert [ks.s for ks in m.state.sections] == [0.0, 0.2, 0.4]
+    assert m.remove_key_section(1) and [ks.s for ks in m.state.sections] == [0.0, 0.4]
     assert not m.remove_key_section(0) and not m.remove_key_section(5)  # the inlet and bad indexes stay
     assert m.undo() and len(m.state.sections) == 3
 
@@ -1261,9 +1260,10 @@ def test_wall_thickness_and_lip_extension(cyl_model, clock):
 
 def test_the_duct_spec_uses_the_sketched_sections_and_the_scene(cyl_model):
     m = cyl_model
-    m.add_key_section(0.5)
+    m.add_key_section(0.3)
     spec = m.duct_spec()
-    assert [k.s for k in spec.inlets[0].keys] == [0.0, 0.5] and m.duct.n_branches == 2 and spec.symmetry == "xz"
+    assert [k.s for k in spec.inlets[0].keys] == [0.0, 0.3] and m.duct.n_branches == 2 and spec.symmetry == "xz"
+    assert [k.s for k in spec.trunk] == [0.0]  # the trunk start: its own key section
     assert spec.face_centre == pytest.approx([6.0, 0.0, 0.0]) and spec.face_diameter == 0.5
     assert spec.inlets[0].inlet_area == pytest.approx(m.opening.area_plane)
     assert m.duct.areas.a_in == pytest.approx(m.opening.area_plane)
@@ -1326,8 +1326,9 @@ def test_duct_parameters_survive_a_save_and_a_reload(scene, writable, clock):
     assert ducts["junction"]["point"] == [3.4, 0.0, 0.35]
     assert ducts["inlets"][0]["start_handle"] == 0.7 and ducts["centreline"]["junction_pitch_deg"] == 12.0
     assert "start_handle" not in ducts["centreline"]  # the inlet handles belong to their inlet
-    assert ducts["centreline"]["end_handle"] is None  # defaults stay null
-    assert ducts["area_points"]["junction_area"] == 0.19 and ducts["inlets"][0]["area_points"][1] == [0.5, 0.1]
+    assert "end_handle" not in ducts["centreline"] and ducts["trunk"]["end_handle"] is None  # the trunk's; null = default
+    assert "area_points" not in ducts  # moved into ducts.trunk
+    assert ducts["trunk"]["junction_area"] == 0.19 and ducts["inlets"][0]["area_points"][1] == [0.5, 0.1]
     assert ducts["wall_thickness"] == 0.03 and ducts["lip_extension"] == 0.06 and ducts["lip_mode"] == "blunt"
     after = yaml.safe_load(writable.read_text(encoding="utf-8"))
     for section in ("engine", "design_point", "checks"):
@@ -1389,7 +1390,7 @@ def test_the_settings_reach_the_duct_spec_and_a_splitter_that_is_too_long_is_rep
     cfg["ducts"]["junction"].update(splitter_length=0.1, overlap=0.03)
     m = InletModel(scene, cfg, path, None)
     assert m.duct_spec().splitter_length == 0.1 and m.duct_spec().overlap == 0.03
-    assert m.duct.bodies()["neg_trunk"].dist[0] == pytest.approx(m.centreline.length_branch + 0.1, abs=1e-9)
+    assert m.duct.bodies()["neg_trunk"].dist[0] == pytest.approx(0.1, abs=1e-9)  # trunk distances start at the junction
     cfg["ducts"]["junction"]["splitter_length"] = 50.0
     bad = InletModel(scene, cfg, path, None)
     assert bad.duct is None and "shorter than the trunk" in bad.duct_error

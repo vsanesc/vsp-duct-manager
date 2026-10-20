@@ -245,12 +245,12 @@ def test_an_asymmetric_layout_without_symmetry_builds_and_its_default_junction_i
 def test_the_trunk_start_section_is_only_symmetrised_when_the_layout_is_symmetric():
     skew = ol.SectionShape.polygon([(0.0, 0.12), (-0.04, 0.05), (-0.11, -0.05), (0.07, -0.1), (0.12, 0.0)])
     skew_key = dm.KeyOutline(0.0, ol.build_outline(ol.edge_paths(skew)[0]), np.array(skew.vertices))
-    sym = duct([inlet("R", 0.45, 0.3, mirror=True, k=skew_key)], "xz")
+    sym = duct([inlet("R", 0.45, 0.3, mirror=True, k=skew_key)], "xz", trunk=(skew_key,))
     s = sym.trunk[0].ring
     assert max(np.linalg.norm(s - p * np.array([-1.0, 1.0]), axis=1).min() for p in s) < 1e-9
     skew = ol.SectionShape.polygon([(0.0, 0.12), (-0.04, 0.05), (-0.11, -0.05), (0.07, -0.1), (0.12, 0.0)])
     skew_key = dm.KeyOutline(0.0, ol.build_outline(ol.edge_paths(skew)[0]), np.array(skew.vertices))
-    free = duct([inlet("a", 0.45, 0.3, k=skew_key), inlet("b", -0.45, 0.3, k=skew_key)], "none")
+    free = duct([inlet("a", 0.45, 0.3, k=skew_key), inlet("b", -0.45, 0.3, k=skew_key)], "none", trunk=(skew_key,))
     s = free.trunk[0].ring
     assert max(np.linalg.norm(s - p * np.array([-1.0, 1.0]), axis=1).min() for p in s) > 1e-3
 
@@ -275,7 +275,7 @@ def test_splitter_walls_along_the_rays_have_exactly_the_wall_thickness():
             dist = np.linalg.norm(a[:, None] - c[None, :], axis=2).min()
             gaps.append(dist)
     assert min(gaps) == pytest.approx(t, abs=1e-9)  # neighbours are exactly one wall thickness apart
-    assert b["neg_trunk"].dist[0] == pytest.approx(lb + L, abs=1e-9)
+    assert b["neg_trunk"].dist[0] == pytest.approx(L, abs=1e-9)
 
 
 def test_branch_negatives_overlap_into_the_trunk_for_sectors_too():
@@ -284,7 +284,7 @@ def test_branch_negatives_overlap_into_the_trunk_for_sectors_too():
     for bg in d.branches:
         lb = bg.centreline.length_branch
         assert b[f"neg_branch_{bg.name}"].dist[-1] == pytest.approx(lb + 0.03)
-    assert b["neg_trunk"].dist[0] == pytest.approx(d.branches[0].centreline.length_branch - 0.03)
+    assert b["neg_trunk"].dist[0] == pytest.approx(-0.03)
 
 
 # ---- one continuous duct -------------------------------------------------------------------------------------------------------------------

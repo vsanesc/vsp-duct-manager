@@ -26,6 +26,12 @@ The junction depends on the number of branches B (twins counted):
 Each branch ends exactly on its piece (same shape, position and area), so the pieces tile the trunk start section;
 the branch centrelines end at the pieces' centroids and keep the junction tangent (G1).
 
+The trunk is its own entity: its key sections (``DuctSpec.trunk``, in the trunk's own arc-length fraction: 0 = the
+trunk start section at the junction, 1 = the engine face) do not depend on any inlet. The trunk start section is the
+section every branch end is cut from. Trunk stations carry the trunk's own coordinates (``s`` and ``dist`` from the
+junction), so nothing in the trunk depends on the number, the order or the names of the inlets (the default junction
+point and area are symmetric functions of the inlets).
+
 - NEGATIVE body = inner sections, preceded by a prismatic extension of ``lip_extension`` upstream of the opening
   plane (along the inlet normal), ending in a flat cap at the engine face. Each branch negative continues into
   the trunk as piece-sections by ``overlap`` (and by the ``splitter_length``, separated by walls of
@@ -55,6 +61,7 @@ DEFAULT_OVERLAP = 0.02  # m, ducts.junction.overlap when not configured
 SYMMETRIES = ("xz", "none")
 MITRE_LIMIT = 4.0  # an offset corner is never moved further than this many wall thicknesses
 UP = np.array([0.0, 0.0, 1.0])
+TRUNK_EXPONENT = 2.5  # the default trunk start section: a superellipse of this exponent
 REFINE_SUBDIVISIONS = 3  # extra rings between stations when the external region is measured
 SELF_SYMMETRIC_TOL = 1e-9  # m / deg: an inlet this close to y = 0 with no sweep is its own mirror image
 SECTOR_GRID = 8192  # angular samples of the radial function when the sector rays are solved
@@ -127,6 +134,13 @@ class DuctSpec:
     junction_fraction: float = 0.5
     splitter_length: float = 0.0  # m: the branch negatives stay separate (pieces) this far into the trunk
     overlap: float = DEFAULT_OVERLAP  # m: each branch negative reaches this far beyond the junction plane
+    trunk: tuple[KeyOutline, ...] = ()  # trunk key sections, s local (0 = trunk start); empty = the default start
+
+
+def default_trunk_keys() -> tuple[KeyOutline, ...]:
+    """The default trunk: one key section, the trunk start, a superellipse (the size is set by the junction area)."""
+    shape = ol.superellipse_shape(1.0, 1.0, TRUNK_EXPONENT)
+    return (KeyOutline(0.0, ol.build_outline(ol.edge_paths(shape)[0]), np.array(shape.vertices)),)
 
 
 def single_spec(plane, keys, face_centre, face_axis, face_diameter, mirror=True, name="R", inlet_area=None,
@@ -567,9 +581,10 @@ class Duct:
         n_branches = len(self.branches)
         self.n_branches = n_branches
         self._inlet_rings = [self._key_rings(ins, n) for ins in spec.inlets]
+        self.trunk_rings = self._trunk_key_rings(n)
         a_in = [ins.inlet_area if ins.inlet_area is not None else polygon_area(rings[0][1])
                 for ins, rings in zip(spec.inlets, self._inlet_rings)]
-        a_total = sum(a_in[bg.inlet] for bg in self.branches)
+        a_total = math.fsum(a_in[bg.inlet] for bg in self.branches)  # exactly rounded: independent of the order
         a_face = 0.25 * math.pi * spec.face_diameter**2
         starts = {}
         for bg in self.branches:
@@ -585,7 +600,8 @@ class Duct:
             points = AreaPoints(spec.area_points.junction_area, ins.area_points, spec.area_points.trunk)
             bg.areas = AreaCurves(a_in[bg.inlet], a_face, points, spec.area_law, n_branches, bg.flow, a_total)
         # the junction: common to all branches
-        mean_start = np.mean([starts[id(bg)][0] for bg in self.branches], axis=0)
+        mean_start = np.array([math.fsum(starts[id(bg)][0][i] for bg in self.branches) for i in range(3)]) \
+            / len(self.branches)
         dj = default_junction(mean_start, spec.face_centre, spec.junction_fraction)
         p = spec.centreline
         jx, jz = p.junction if p.junction is not None else (dj[0], dj[2])
@@ -661,6 +677,19 @@ class Duct:
         rings = interp.correspond([(o, v) for _, o, v in pairs], n)
         return [(s, r) for (s, _, _), r in zip(pairs, rings)]
 
+    def _trunk_key_rings(self, n: int) -> list[tuple[float, np.ndarray]]:
+        """The trunk's key rings (local s): its own key sections, then the engine face circle."""
+        keys = list(self.spec.trunk) or list(default_trunk_keys())
+        if keys[0].s != 0.0:
+            raise ValueError("the first trunk key section must be the trunk start (s = 0)")
+        if any(not 0.0 <= k.s < 1.0 for k in keys):
+            raise ValueError("trunk key sections need 0 <= s < 1 (the engine face at s = 1 is fixed)")
+        face = ol.circle_shape(0.5 * self.spec.face_diameter)
+        face_outline = ol.build_outline(ol.edge_paths(face)[0])
+        pairs = [(k.s, k.outline, k.vertices) for k in keys] + [(1.0, face_outline, np.array(face.vertices))]
+        rings = interp.correspond([(o, v) for _, o, v in pairs], n)
+        return [(s, r) for (s, _, _), r in zip(pairs, rings)]
+
     def ring_at(self, s: float, area: float, keys=None) -> np.ndarray:
         """The inner section (N, 2) at global ``s``: blended key sections, centred and scaled to ``area``."""
         keys = self.rings if keys is None else keys
@@ -681,7 +710,7 @@ class Duct:
         bg0 = self.branches[0]
         cl0 = bg0.centreline
         aj = bg0.areas.junction_area
-        ring = self.ring_at(cl0.s_junction, aj, bg0.rings)
+        ring = self.ring_at(0.0, aj, self.trunk_rings)  # the trunk start section, every branch end is cut from it
         T = cl0.junction_tangent
         V = symmetric_v(T)
         U = np.cross(T, V)
@@ -694,6 +723,7 @@ class Duct:
             return
         s_ring = symmetric_ring(ring, n) if self.symmetric else ring
         self.trunk_start = s_ring
+        self.trunk_rings[0] = (0.0, s_ring)  # the trunk loft starts from the section the branch ends are cut from
         wall_half = 0.5 * spec.wall_thickness if spec.splitter_length > 0 else 0.0
         self._wall_half = wall_half
         pos = []
@@ -735,8 +765,7 @@ class Duct:
         spec = self.spec
         bg0 = self.branches[0]
         cl0 = bg0.centreline
-        lb0, lt = cl0.length_branch, cl0.length_trunk
-        total0 = cl0.length
+        lt = cl0.length_trunk
 
         def along(curve, count, extra=()):
             dist = np.linspace(0.0, curve.length, count)
@@ -749,11 +778,9 @@ class Duct:
                  if 1e-9 < d < lt - 1e-9] if self.n_branches > 1 else []
         dt, pt, tt = along(cl0.trunk, spec.n_stations_trunk, extra)
         vt = transport_frames(tt, symmetric_v(tt[0]))
-        sj0 = bg0.s_junction
         eps = 1e-6
-        trunk_keys = [(sj0, self.trunk_start)] + [k for k in bg0.rings if sj0 + eps < k[0] < 1.0] + [bg0.rings[-1]]
 
-        def build(part, dist, pts, tans, vs, s, offset, area_fn, keys, last_ring=None):
+        def build(part, dist, pts, tans, vs, s, area_fn, keys, last_ring=None):
             out = []
             for i in range(len(dist)):
                 T, V = tans[i], vs[i]
@@ -764,12 +791,12 @@ class Duct:
                 else:
                     area = float(area_fn(i))
                     ring = self.ring_at(float(s[i]), area, keys)
-                out.append(Station(part, float(s[i]), float(dist[i] + offset), pts[i], T, U, V, area, ring))
+                out.append(Station(part, float(s[i]), float(dist[i]), pts[i], T, U, V, area, ring))
             return out
 
         areas0 = bg0.areas
-        self.trunk = build("trunk", dt, pt, tt, vt, (dt + lb0) / total0, lb0,
-                           lambda i: areas0.trunk_area(dt[i] / lt if lt > 0 else 1.0), trunk_keys)
+        self.trunk = build("trunk", dt, pt, tt, vt, dt / lt if lt > 0 else np.zeros_like(dt),
+                           lambda i: areas0.trunk_area(dt[i] / lt if lt > 0 else 1.0), self.trunk_rings)
         for bg in self.branches:
             if bg.twin:
                 continue
@@ -783,7 +810,7 @@ class Duct:
             vb = np.array([_rotate(v, t, twist * f) for v, t, f in zip(vb, tb, frac)])
             sj = bg.s_junction
             keys = [k for k in bg.rings if k[0] < sj - eps and k[0] < 1.0] + [(sj, bg.branch_end)]
-            bg.stations = build("branch", db, pb, tb, vb, db / cl.length, 0.0,
+            bg.stations = build("branch", db, pb, tb, vb, db / cl.length,
                                 lambda i, db=db, lb=lb, bg=bg: bg.areas.branch_area(db[i] / lb if lb > 0 else 1.0),
                                 keys, bg.branch_end)
         for bg in self.branches:
@@ -791,6 +818,11 @@ class Duct:
                 src = next(b for b in self.branches if not b.twin and b.inlet == bg.inlet)
                 bg.stations = [Station(s.part, s.s, s.dist, mirrored(s.centre), mirrored(s.T), mirrored(s.U),
                                        mirrored(s.V), s.area, s.ring) for s in src.stations]
+
+    def nearest_opening_length(self) -> float:
+        """The path length from the closest inlet opening to the junction (what trunk distances are measured from
+        when a distance 'from the opening' is wanted)."""
+        return min(bg.centreline.length_branch for bg in self.branches)
 
     def stations(self) -> list[Station]:
         return self.branches[0].stations + self.trunk
@@ -822,16 +854,14 @@ class Duct:
     def bodies(self) -> dict[str, Body]:
         out: dict[str, Body] = {}
         spec = self.spec
-        bg0 = self.branches[0]
-        lb0 = bg0.centreline.length_branch
         multi = self.n_branches > 1
         split = multi and spec.splitter_length > 0.0
         reach = (spec.splitter_length if split else 0.0) + spec.overlap  # how far the branches go into the trunk
-        into = [s for s in self.trunk if 1e-9 < s.dist - lb0 <= reach + 1e-9]
+        into = [s for s in self.trunk if 1e-9 < s.dist <= reach + 1e-9]
         pos_t = np.array([self.outer_ring(s) for s in self.trunk])
         dist_t = np.array([s.dist for s in self.trunk])
         if split:
-            keep = [s for s in self.trunk if s.dist - lb0 >= spec.splitter_length - 1e-9]
+            keep = [s for s in self.trunk if s.dist >= spec.splitter_length - 1e-9]
             neg_t = np.array([self.inner_ring(s) for s in keep])
             dist_nt = np.array([s.dist for s in keep])
         else:
@@ -845,7 +875,7 @@ class Duct:
             lb = bg.centreline.length_branch
             neg_b = np.array([self.lip_ring(bg)] + [self.inner_ring(s) for s in bg.stations]
                              + [self._trunk_piece(s, bg) for s in into])
-            dist_b = np.r_[-spec.lip_extension, [s.dist for s in bg.stations], [lb + s.dist - lb0 for s in into]]
+            dist_b = np.r_[-spec.lip_extension, [s.dist for s in bg.stations], [lb + s.dist for s in into]]
             pos_b = np.array([self.outer_ring(s) for s in bg.stations])
             dist_pb = np.array([s.dist for s in bg.stations])
             for kind, tag, rb, db in (("negative", "neg", neg_b, dist_b), ("positive", "pos", pos_b, dist_pb)):

@@ -50,7 +50,7 @@ def test_the_inner_section_has_exactly_the_area_law_area_at_every_station(shape)
     d = dm.Duct(spec_for(shape, origin=(1.0, 0.3, 0.2), mirror=True))
     for st in d.stations():
         want = float(d.areas.branch_area(st.dist / d.centreline.length_branch) if st.part == "branch"
-                     else d.areas.trunk_area((st.dist - d.centreline.length_branch) / d.centreline.length_trunk))
+                     else d.areas.trunk_area(st.dist / d.centreline.length_trunk))  # the trunk's own distance
         assert polygon_area(st.ring) == pytest.approx(want, rel=5e-3)
         assert polygon_area(st.ring) == pytest.approx(st.area, rel=1e-9)  # exact: the sample polygon is scaled
 
@@ -58,12 +58,14 @@ def test_the_inner_section_has_exactly_the_area_law_area_at_every_station(shape)
 def test_the_stations_run_from_the_inlet_centroid_to_the_face_centre():
     d = pentagon_to_circle()
     assert d.branch[0].centre == pytest.approx(d.centreline.start) and d.trunk[-1].centre == pytest.approx(FACE)
-    assert d.branch[0].s == 0.0 and d.trunk[-1].s == pytest.approx(1.0)
+    assert d.branch[0].s == 0.0 and d.trunk[-1].s == pytest.approx(1.0) and d.trunk[0].s == 0.0  # trunk: own s
     # the branch ends at the centroid of its half of the trunk start section, beside the trunk centre
     assert d.branch[-1].centre == pytest.approx(d.trunk[0].centre + d.branch_end_offset)
-    assert d.branch[-1].s == pytest.approx(d.s_junction) and d.trunk[0].s == pytest.approx(d.s_junction)
-    s = [st.s for st in d.stations()]
-    assert all(b >= a for a, b in zip(s, s[1:]))
+    assert d.branch[-1].s == pytest.approx(d.s_junction)
+    for sts in (d.branch, d.trunk):
+        s = [st.s for st in sts]
+        assert all(b >= a for a, b in zip(s, s[1:]))
+    assert d.trunk[0].dist == 0.0 and d.trunk[-1].dist == pytest.approx(d.centreline.length_trunk)
 
 
 def test_the_first_station_is_the_sketched_opening_in_the_inlet_plane():
@@ -376,17 +378,17 @@ def test_the_branch_negatives_overlap_into_the_trunk_and_the_trunk_negative_star
     lb = d.centreline.length_branch
     assert b["neg_branch_R"].dist[-1] == pytest.approx(lb + 0.02)  # beyond the junction plane by the overlap
     nt = b["neg_trunk"]
-    assert nt.dist[0] == pytest.approx(lb - 0.02)  # the trunk negative starts the same amount upstream
+    assert nt.dist[0] == pytest.approx(-0.02)  # the trunk negative starts the same amount upstream of the junction
     ring, st = nt.rings[0], d.trunk[0]  # a prism of the trunk start section, 0.02 m back along the tangent
     assert ((ring - st.centre) @ st.T) == pytest.approx(np.full(len(ring), -0.02), abs=1e-12)
     # positives are not extended
-    assert b["pos_branch_R"].dist[-1] == pytest.approx(lb) and b["pos_trunk"].dist[0] == pytest.approx(lb)
+    assert b["pos_branch_R"].dist[-1] == pytest.approx(lb) and b["pos_trunk"].dist[0] == pytest.approx(0.0)
 
 
 def test_the_overlap_rings_are_halves_of_the_trunk_section_so_the_internal_shape_is_unchanged():
     d = pentagon_to_circle(overlap=0.02)
     ring = d.bodies()["neg_branch_R"].rings[-1]
-    st = min(d.trunk, key=lambda s: abs(s.dist - d.centreline.length_branch - 0.02))
+    st = min(d.trunk, key=lambda s: abs(s.dist - 0.02))
     ab = np.c_[(ring - st.centre) @ st.U, (ring - st.centre) @ st.V]
     assert abs(polygon_area(ab)) == pytest.approx(0.5 * abs(polygon_area(st.ring)), rel=1e-3)
     inside = points_in_polygon(st.ring, ab * (1 - 1e-6))  # shrunk a hair about the origin: inside the trunk section
@@ -397,7 +399,7 @@ def test_no_overlap_means_flush_ends():
     d = pentagon_to_circle(overlap=0.0)
     b = d.bodies()
     lb = d.centreline.length_branch
-    assert b["neg_branch_R"].dist[-1] == pytest.approx(lb) and b["neg_trunk"].dist[0] == pytest.approx(lb)
+    assert b["neg_branch_R"].dist[-1] == pytest.approx(lb) and b["neg_trunk"].dist[0] == pytest.approx(0.0)
 
 
 def test_the_splitter_keeps_the_branch_negatives_apart_by_exactly_the_wall_thickness():
@@ -413,8 +415,8 @@ def test_the_splitter_keeps_the_branch_negatives_apart_by_exactly_the_wall_thick
         assert ring_l[:, 1].max() == pytest.approx(-t / 2, abs=1e-12)
         assert ring_r[:, 1].min() - ring_l[:, 1].max() == pytest.approx(t, abs=1e-12)  # ... so the wall is t thick
     nt = b["neg_trunk"]
-    assert nt.dist[0] == pytest.approx(lb + L, abs=1e-9)  # the trunk negative starts where the splitter ends
-    assert b["pos_trunk"].dist[0] == pytest.approx(lb)  # the positive trunk runs from the junction: the wall is left
+    assert nt.dist[0] == pytest.approx(L, abs=1e-9)  # the trunk negative starts where the splitter ends
+    assert b["pos_trunk"].dist[0] == pytest.approx(0.0)  # the positive trunk runs from the junction: the wall is left
 
 
 def test_without_a_splitter_the_branch_end_is_exactly_the_half_on_y_equals_0():

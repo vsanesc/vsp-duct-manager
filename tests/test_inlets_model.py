@@ -267,14 +267,15 @@ def test_per_inlet_area_points_and_handles(clock):
     assert m.reset_centreline() and m.state.inlets[0].start_handle is None and m.state.inlets[1].start_handle is None
 
 
-def test_key_sections_beyond_the_junction_are_taken_from_the_first_inlet(clock):
+def test_inlets_take_no_key_sections_beyond_the_junction_the_trunk_does(clock):
     m = model_for([inlet_entry("a", 0.4, 0.5), inlet_entry("b", -0.4, 0.5)], "none", clock)
-    m.select_inlet(1)
     late = (m.junction_s + 1.0) / 2
-    assert not m.add_key_section(late) and "first inlet" in m.message
-    assert m.add_key_section(m.junction_s / 2)
-    m.select_inlet(0)
-    assert m.add_key_section((m.junction_s + 1.0) / 2)
+    for k in (0, 1):  # no inlet, the first included
+        m.select_inlet(k)
+        assert not m.add_key_section(late) and "Trunk" in m.message
+        assert m.add_key_section(m.junction_s / 2)
+    assert m.select_trunk() and m.add_key_section(0.5)  # the trunk's s is along the trunk
+    assert [ks.s for ks in m.state.sections] == [0.0, 0.5]
 
 
 def test_sections_are_sized_per_inlet(clock):

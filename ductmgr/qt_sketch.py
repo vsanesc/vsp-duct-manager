@@ -116,7 +116,7 @@ class SketchCanvas(QtWidgets.QWidget):
 
     def on_model_changed(self) -> None:
         m = self.model
-        key = (m.placed, m.active if m.placed else None)
+        key = (m.placed, m.trunk_selected, m.active if m.placed else None)
         if key != self._view_key:
             self._view_key = key
             self.selected_vertex = self.selected_edge = None
@@ -349,7 +349,17 @@ class SketchCanvas(QtWidgets.QWidget):
         painter.drawText(QtCore.QPointF(self.width() - 205, self.height() - 8), "u right, v up (view from the front)")
 
     def _draw_symmetry_plane(self, painter):
-        plane = self.model.state.plane
+        m = self.model
+        if m.trunk_selected:  # the trunk frame is symmetric: the plane y = 0 is the vertical axis u = 0
+            if m.state.symmetry != "xz":
+                return
+            x = self.to_screen((0.0, 0.0)).x()
+            painter.setPen(self._pen(SYMMETRY_COLOR, 1.0, QtCore.Qt.PenStyle.DashLine))
+            painter.drawLine(QtCore.QPointF(x, 0), QtCore.QPointF(x, self.height()))
+            painter.setPen(self._pen(SYMMETRY_COLOR))
+            painter.drawText(QtCore.QPointF(min(max(x + 6, 4), self.width() - 130), 28), "symmetry plane y = 0")
+            return
+        plane = m.state.plane
         if plane is None:
             return
         u, v, _ = plane.frame()
@@ -525,9 +535,12 @@ class SketchDock(QtWidgets.QWidget):
         self.refresh()
 
     def _set_title(self, text: str) -> None:
-        """The section title, led by the inlet's name when there are several, and noting a symmetric editor."""
+        """The section title, led by the inlet's name when there are several (or "Trunk"), and noting a symmetric
+        editor."""
         m = self.model
-        if len(m.state.inlets) > 1:
+        if m.trunk_selected:
+            text = f"Trunk  |  {text}"
+        elif len(m.state.inlets) > 1:
             text = f"{m.inlet.name}  |  {text}"
         if m.symmetric_editing:
             text += "  [mirror symmetric about u = 0: edit one side]"
@@ -566,6 +579,9 @@ class SketchDock(QtWidgets.QWidget):
                                "trunk start section (derived, fixed)")
         elif m.active_is_face:
             self._set_title("Section s = 1.000  -  engine face (fixed circle)")
+        elif m.active_is_trunk_start:
+            self._set_title("Section s = 0.000  -  trunk start: every branch end is cut from this section "
+                            f"(size held at the junction area {op.target_area:.5f} m²)")
         elif m.active_is_inlet:
             self._set_title("Section s = 0.000  -  inlet (in the inlet plane, snaps to the skin)")
         else:

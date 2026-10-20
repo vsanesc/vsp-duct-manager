@@ -28,13 +28,13 @@ def circle_key(r):
 def straight(z=0.0, r=0.25, wall=0.01, **kw):
     """A single-inlet duct of constant radius ``r`` flying straight at height z (inlet and face coincide in size)."""
     spec = dm.single_spec(InletPlane((1.0, 0.0, z)), (circle_key(r),), np.array([6.0, 0.0, z]), AXIS, 2 * r,
-                       mirror=False, wall_thickness=wall, **kw)
+                       mirror=False, wall_thickness=wall, trunk=(circle_key(r),), **kw)
     return dm.Duct(spec)
 
 
 def s_duct(offset=1.0, r=0.25):
     spec = dm.single_spec(InletPlane((1.0, 0.0, offset)), (circle_key(r),), np.array([6.0, 0.0, 0.0]), AXIS, 2 * r,
-                       mirror=False)
+                       mirror=False, trunk=(circle_key(r),))
     return dm.Duct(spec)
 
 

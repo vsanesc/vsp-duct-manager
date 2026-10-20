@@ -435,6 +435,20 @@ def circle_shape(radius: float, centre=(0.0, 0.0)) -> SectionShape:
     return SectionShape(verts, (False,) * 4, (CURVED,) * 4, handles, (SMOOTH,) * 4)
 
 
+def superellipse_shape(a: float, b: float, exponent: float = 2.5, centre=(0.0, 0.0)) -> SectionShape:
+    """|u/a|^p + |v/b|^p = 1 as 4 smooth Bézier arcs (vertices at the top, left, bottom and right, counter-clockwise from
+    the top). The handle length is chosen so each arc passes through the superellipse's diagonal point; exponent 2
+    is the ellipse, larger values are squarer."""
+    if a <= 0.0 or b <= 0.0 or exponent <= 0.0:
+        raise ValueError("a superellipse needs positive semi-axes and exponent")
+    k = (8.0 * 2.0 ** (-1.0 / float(exponent)) - 4.0) / 3.0
+    ka, kb = k * float(a), k * float(b)
+    cu, cv = float(centre[0]), float(centre[1])
+    verts = ((cu, cv + b), (cu - a, cv), (cu, cv - b), (cu + a, cv))
+    handles = (((-ka, 0.0), (0.0, kb)), ((0.0, -kb), (-ka, 0.0)), ((ka, 0.0), (0.0, -kb)), ((0.0, kb), (ka, 0.0)))
+    return SectionShape(verts, (False,) * 4, (CURVED,) * 4, handles, (SMOOTH,) * 4)
+
+
 # ---- config round trip --------------------------------------------------------------------------------------------------
 def shape_to_config(shape: SectionShape) -> dict:
     """``vertices``, ``snapped``, ``edges``, ``handles`` and ``continuity`` as plain lists for the YAML config."""
