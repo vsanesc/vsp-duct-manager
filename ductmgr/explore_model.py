@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ductmgr import area_law, areacurve, ductcheck, sketch, vspio
+from ductmgr import area_law, areacurve, ductcheck, simplify, sketch, vspio
 from ductmgr import duct as dm
 from ductmgr import interp
 from ductmgr import outline as ol
@@ -43,6 +43,7 @@ MIN_S_SEPARATION = 0.01  # key sections closer than this in s are refused
 UNDO_LIMIT = 200  # history entries kept (the requirement is at least 50)
 MERGE_WINDOW_S = 0.8  # consecutive edits of one parameter / vertex within this window share one undo step
 PLANE_KEYS = ("pitch_deg", "sweep_deg")
+TRUNK_EXPONENT_RANGE = (1.0, 8.0)  # the superellipse exponent of the trunk start: 1 a diamond, 2 an ellipse, larger squarer
 
 MODE_VIEW, MODE_PLACING = "view", "placing"
 MODE_TEXT = {MODE_VIEW: "View", MODE_PLACING: "Placing inlet - click on fuselage, Esc to cancel"}
@@ -435,6 +436,7 @@ class InletModel:
         self._skins: list = []
         self._evals: list = []
         self._trunk_evals: list = []
+        self.simplify_note = ""  # the result of the last Simplify (cleared by any other change of the design)
         self.mode = MODE_VIEW
         self.live_checks = False  # the window turns this on to show a pending note for the heavy checks
         self.locked = False
@@ -951,6 +953,7 @@ class InletModel:
         offset = self.active - self.n_sections  # 0: the junction row (or the face without one), 1: the face
         selected = self.state.selected if keep_selection else new.selected
         trunk = self.state.trunk_selected if keep_selection else new.trunk_selected
+        self.simplify_note = ""
         self.state = replace(new, selected=min(max(selected, 0), len(new.inlets) - 1), trunk_selected=trunk)
         self.active = len(self.state.sections) + offset if was_fixed else min(self.active, max(len(self.state.sections) - 1, 0))
         self._recompute()
@@ -1423,6 +1426,51 @@ class InletModel:
             state = state.with_selected(area_branch=None)
         return self._apply(state, None)
 
+    # ---- the trunk start section: reset and simplify ---------------------------------------------------------------------
+    def _set_trunk_start(self, shape: SectionShape, key: str | None = None) -> bool:
+        secs = (KeySection(0.0, shape), *self.state.trunk[1:])
+        return self._commit(self._normalised(replace(self.state, trunk=secs)), key)
+
+    def reset_trunk_start(self, exponent: float | None = None) -> bool:
+        """The trunk start back to a superellipse of the given exponent (default ``duct.TRUNK_EXPONENT``), held at the
+        junction area. One undo step."""
+        exponent = dm.TRUNK_EXPONENT if exponent is None else float(exponent)
+        lo, hi = TRUNK_EXPONENT_RANGE
+        if not lo <= exponent <= hi:
+            self._say(f"The superellipse exponent must be between {lo:g} and {hi:g}")
+            self._notify()
+            return False
+        if not self._placed() or not self.state.trunk:
+            self._say("Place an inlet first")
+            self._notify()
+            return False
+        changed = self._set_trunk_start(ol.superellipse_shape(1.0, 1.0, exponent))
+        self._say(f"Trunk start reset to a superellipse (exponent {exponent:g}), held at the junction area"
+                  + ("" if changed else " (it already was)"))
+        self._notify()
+        return True
+
+    def simplify_trunk_start(self, n: int) -> bool:
+        """Reduce the trunk start to ``n`` vertices with curved edges fitted, keeping its area (and, with symmetry xz,
+        its mirror symmetry). The deviation from the previous outline is reported. One undo step."""
+        if not self._placed() or not self.state.trunk:
+            self._say("Place an inlet first")
+            self._notify()
+            return False
+        shape = self.state.trunk[0].shape
+        symmetric = self.state.symmetry == "xz" and ol.is_mirror_symmetric(shape)
+        try:
+            result = simplify.simplify(shape, int(n), symmetric)
+        except ValueError as exc:
+            self._say(f"Not simplified: {exc}")
+            self._notify()
+            return False
+        self._set_trunk_start(result.shape)
+        self.simplify_note = result.text()  # after the commit: any change clears it
+        self._say("Trunk start simplified: " + self.simplify_note)
+        self._notify()
+        return True
+
     def set_wall_thickness(self, value: float) -> bool:
         if value <= 0.0:
             self._say("The wall thickness must be positive")
@@ -1854,6 +1902,8 @@ class InletModel:
                                f"{ev.area_plane:.5f} m^2 (A(s) {ev.target_area:.5f}, {100 * ev.delta:+.2f} %), "
                                f"{ks.shape.n} vertices",
                                "pass" if ev.valid and abs(ev.delta) <= sketch.AREA_TOLERANCE else "error"))
+        if self.simplify_note:
+            out.append(Readout("Simplify", self.simplify_note))
         out.append(Readout("Section s=1.000", f"engine face circle, {self.face_area:.5f} m^2 (fixed)"))
         for ks, ev in zip(self.state.trunk, self._trunk_evals):
             out += [Readout("", f"ERROR: trunk, s = {ks.s:g}: {e}", "error") for e in ev.errors]

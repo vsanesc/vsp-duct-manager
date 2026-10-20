@@ -16,8 +16,9 @@ import math
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from ductmgr import duct as dm
 from ductmgr import outline as ol
-from ductmgr.explore_model import InletModel
+from ductmgr.explore_model import TRUNK_EXPONENT_RANGE, InletModel
 from ductmgr.viz import ACCENT, BACKGROUND, ERROR_COLOR
 
 HANDLE_RADIUS_PX = 9  # hit radius of a vertex handle
@@ -508,6 +509,15 @@ class SketchDock(QtWidgets.QWidget):
         self.btn_delete.setToolTip("Remove the selected vertex (Del or right-click); a section keeps at least 3")
         self.btn_delete.clicked.connect(lambda *_: self.canvas.delete_selected())
 
+        self.btn_reset_start = QtWidgets.QPushButton("Reset to default…")
+        self.btn_reset_start.setToolTip("Trunk start only: replace the section by a superellipse (you choose the exponent: "
+                                        "2 = ellipse, larger = squarer), held at the junction area. Undoable.")
+        self.btn_simplify = QtWidgets.QPushButton("Simplify…")
+        self.btn_simplify.setToolTip("Trunk start only: reduce the section to N vertices with curved edges fitted to the "
+                                     "outline, keeping its area; the deviation is shown. Undoable.")
+        self.btn_reset_start.clicked.connect(lambda *_: self._on_reset_start())
+        self.btn_simplify.clicked.connect(lambda *_: self._on_simplify())
+
         hint = QtWidgets.QLabel("Drag vertices and Bézier handles. Double-click an edge to insert a vertex; "
                                 "right-click a vertex (or Del) to remove it. Near the section curve a vertex snaps "
                                 "(filled); Alt disables snapping. Wheel zooms, middle-drag pans.")
@@ -528,6 +538,7 @@ class SketchDock(QtWidgets.QWidget):
         layout.addLayout(row(QtWidgets.QLabel("Edge"), self.btn_straight, self.btn_curved,
                              QtWidgets.QLabel("Vertex"), self.btn_corner, self.btn_smooth, self.btn_symmetric))
         layout.addLayout(row(self.btn_delete, self.btn_fit_area, self.btn_fit_view))
+        layout.addLayout(row(QtWidgets.QLabel("Trunk start"), self.btn_reset_start, self.btn_simplify))
         layout.addWidget(self.info)
         layout.addWidget(hint)
         model.add_listener(self.refresh)
@@ -545,6 +556,35 @@ class SketchDock(QtWidgets.QWidget):
         if m.symmetric_editing:
             text += "  [mirror symmetric about u = 0: edit one side]"
         self.title.setText(text)
+
+    # ---- the trunk start: reset and simplify ----------------------------------------------------------------------------
+    def ask_exponent(self) -> float | None:
+        """Ask for the superellipse exponent; None when cancelled."""
+        lo, hi = TRUNK_EXPONENT_RANGE
+        value, ok = QtWidgets.QInputDialog.getDouble(
+            self, "Reset to default", "Superellipse exponent (2 = ellipse, larger = squarer):", dm.TRUNK_EXPONENT, lo, hi, 2)
+        return value if ok else None
+
+    def ask_vertex_count(self, current: int) -> int | None:
+        """Ask for the number of vertices to keep; None when cancelled."""
+        value, ok = QtWidgets.QInputDialog.getInt(self, "Simplify", f"Vertices to keep (now {current}):",
+                                                  max(ol.MIN_VERTICES, min(8, current - 1)), ol.MIN_VERTICES,
+                                                  max(current - 1, ol.MIN_VERTICES))
+        return value if ok else None
+
+    def _on_reset_start(self) -> None:
+        if not self.model.active_is_trunk_start:
+            return
+        exponent = self.ask_exponent()
+        if exponent is not None:
+            self.model.reset_trunk_start(exponent)
+
+    def _on_simplify(self) -> None:
+        if not self.model.active_is_trunk_start:
+            return
+        n = self.ask_vertex_count(self.model.active_shape.n)
+        if n is not None:
+            self.model.simplify_trunk_start(n)
 
     # ---- buttons -> model ------------------------------------------------------------------------------------------
     def _set_edge(self, kind: str) -> None:
@@ -570,6 +610,8 @@ class SketchDock(QtWidgets.QWidget):
             btn.setEnabled(has_vertex and shape.continuity[v] != mode)
         self.btn_delete.setEnabled(has_vertex and shape.n > ol.MIN_VERTICES)
         self.btn_fit_area.setEnabled(editable)
+        for btn in (self.btn_reset_start, self.btn_simplify):
+            btn.setEnabled(m.active_is_trunk_start)
         if op is None:
             self.title.setText("")
             self.info.setText("")
@@ -600,5 +642,7 @@ class SketchDock(QtWidgets.QWidget):
             lines = [f'<span style="color:{colour}">Area {op.area_plane:.5f} m² vs A(s) {op.target_area:.5f} '
                      f"({100 * op.delta:+.2f} %)</span>"]
         lines.append(f"{shape.n} vertices, {sum(1 for k in range(shape.n) if shape.edge_is_curved(k))} curved edges")
+        if m.active_is_trunk_start and m.simplify_note:
+            lines.append(f"Simplified: {m.simplify_note}")
         lines += [f'<span style="color:{red}">ERROR: {err}</span>' for err in op.errors]
         self.info.setText("<br>".join(lines))

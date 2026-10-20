@@ -441,3 +441,80 @@ def test_placing_or_moving_an_inlet_leaves_the_trunk_row(clock):
     m.select_trunk()
     clock.advance(10.0)
     assert m.set_param("pitch_deg", 5.0) and not m.trunk_selected and m.state.inlets[0].plane.pitch_deg == 5.0
+
+
+# ---- reset to default and simplify the trunk start ---------------------------------------------------------------------------------------
+def test_reset_to_default_restores_a_superellipse_held_at_the_junction_area_and_is_undoable(clock):
+    m = make(config(MIRRORED_PAIR_AND_CENTRE, "xz"), clock)
+    default = m.state.trunk[0].shape
+    m.select_trunk()
+    clock.advance(10.0)
+    v = m.active_shape.vertices[3]
+    assert m.drag_vertex(3, (v[0] * 1.3, v[1]), None)
+    m.finish_edit()
+    edited = m.state
+    assert m.state.trunk[0].shape != default
+    clock.advance(10.0)
+    assert m.reset_trunk_start(4.0)
+    shape = m.state.trunk[0].shape
+    assert shape.n == 4 and shape != default  # exponent 4: squarer than the default 2.5
+    assert ol.outline_area(shape) == pytest.approx(JUNCTION_AREA, rel=1e-6) and ol.is_mirror_symmetric(shape)
+    assert "exponent 4" in m.message and m.dirty
+    assert m.undo() and m.state == edited
+    clock.advance(10.0)
+    assert m.reset_trunk_start() and m.state.trunk[0].shape == default  # the default exponent
+    assert_tiling(m.duct)
+
+
+def test_reset_to_default_keeps_the_other_trunk_sections_and_refuses_a_bad_exponent(clock):
+    m = make(config(FREE_THREE[:2], "none"), clock)
+    m.select_trunk()
+    assert m.add_key_section(0.5)
+    others = m.state.trunk[1:]
+    for bad in (0.5, 9.0):
+        assert not m.reset_trunk_start(bad) and "exponent" in m.message
+    assert m.reset_trunk_start(3.0) and m.state.trunk[1:] == others and len(m.state.trunk) == 2
+
+
+def migrated_model(clock, symmetry="xz"):
+    cfg, _ = legacy_cfg(symmetry, late_sections=0)
+    return make(cfg, clock)
+
+
+@pytest.mark.parametrize("symmetry, n", [("xz", 8), ("xz", 9), ("none", 6)])
+def test_simplify_reduces_the_migrated_polygon_keeping_area_symmetry_and_tiling(clock, symmetry, n):
+    m = migrated_model(clock, symmetry)
+    before = m.state
+    assert m.state.trunk[0].shape.n == m.duct.n  # the migrated start is a polygon of the section samples
+    m.select_trunk()
+    clock.advance(10.0)
+    assert m.simplify_trunk_start(n)
+    shape = m.state.trunk[0].shape
+    assert shape.n == n and any(e == "curved" for e in shape.edges)
+    assert ol.outline_area(shape) == pytest.approx(m.areas.junction_area, rel=1e-6)
+    if symmetry == "xz":
+        assert ol.is_mirror_symmetric(shape)
+    assert "deviation max" in m.simplify_note and f"{before.trunk[0].shape.n} -> {n} vertices" in m.simplify_note
+    assert "deviation" in m.message and any(r.label == "Simplify" for r in m.readouts())
+    assert_tiling(m.duct)
+    for body in m.duct.bodies().values():
+        assert body.mesh.n_open_edges == 0
+    assert m.undo() and m.state == before and not m.simplify_note  # one undo step; the note goes with it
+    assert m.redo() and m.state.trunk[0].shape.n == n
+
+
+def test_the_simplify_note_goes_away_with_the_next_edit(clock):
+    m = migrated_model(clock)
+    m.select_trunk()
+    assert m.simplify_trunk_start(8) and m.simplify_note
+    clock.advance(10.0)
+    assert m.set_wall_thickness(0.012) and not m.simplify_note
+
+
+def test_simplify_refuses_what_it_cannot_do_and_changes_nothing(clock):
+    m = migrated_model(clock)
+    state = m.state
+    for bad in (2, 64, 500):
+        assert not m.simplify_trunk_start(bad) and m.message.startswith("Not simplified") and m.state == state
+    default = make(config(FREE_THREE[:2], "none"), clock)
+    assert not default.simplify_trunk_start(4) and "fewer" in default.message  # the default has 4 vertices already

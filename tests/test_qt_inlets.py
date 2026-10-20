@@ -211,6 +211,38 @@ def test_adding_a_trunk_key_section_from_the_panel(window, monkeypatch):
     assert [ks.s for ks in m.state.trunk] == [0.0]
 
 
+def test_reset_and_simplify_buttons_act_on_the_trunk_start_only(window, monkeypatch):
+    w, m, clock = window([entry("a", 0.6), entry("b", -0.3)], "none")
+    dock = w.sketch
+    assert not dock.btn_reset_start.isEnabled() and not dock.btn_simplify.isEnabled()  # an inlet section is selected
+    w.inlet_list.setCurrentRow(2)
+    assert dock.btn_reset_start.isEnabled() and dock.btn_simplify.isEnabled()
+    w.section_list.setCurrentRow(1)  # the engine face
+    assert not dock.btn_reset_start.isEnabled() and not dock.btn_simplify.isEnabled()
+    w.section_list.setCurrentRow(0)
+    for k in range(4):  # more vertices to simplify away
+        clock.advance(10.0)
+        m.insert_vertex(k, tuple(np.mean([m.active_shape.vertices[k], m.active_shape.vertices[(k + 1) % m.active_shape.n]],
+                                         axis=0) * 1.05))
+    n = m.active_shape.n
+    assert n >= 6
+    monkeypatch.setattr(dock, "ask_vertex_count", lambda current: current - 2)
+    clock.advance(10.0)
+    dock.btn_simplify.click()
+    assert m.state.trunk[0].shape.n == n - 2 and "Simplified" in dock.info.text() and "deviation" in dock.info.text()
+    assert w.act_undo.isEnabled()
+    w.act_undo.trigger()
+    assert m.state.trunk[0].shape.n == n
+    monkeypatch.setattr(dock, "ask_exponent", lambda: 4.0)
+    clock.advance(10.0)
+    dock.btn_reset_start.click()
+    assert m.state.trunk[0].shape.n == 4 and "exponent 4" in w.message_label.text()
+    monkeypatch.setattr(dock, "ask_exponent", lambda: None)  # cancelled: nothing changes
+    state = m.state
+    dock.btn_reset_start.click()
+    assert m.state == state
+
+
 def test_the_readouts_list_the_trunk(window):
     w, m, _ = window([entry("a", 0.6), entry("b", -0.3)], "none")
     assert "Trunk" in w.readout_view.toPlainText()

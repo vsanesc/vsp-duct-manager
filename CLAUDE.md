@@ -54,6 +54,7 @@ ductmgr/
   areacurve.py    # A(s) as monotone PCHIP curves for the branch and the trunk
   duct.py         # 1..N branches + the trunk (its own key sections): stations, frames, sections at A(s), the junction (D-split / sectors, cut from the trunk start), POS + NEG bodies
   ductcheck.py    # external region, wall left, other Geoms, line of sight; solids.py = mesh queries
+  simplify.py     # reduce a section to N vertices with fitted Bézier edges (area kept, deviation reported)
   qt_paths.py     # side / top / area-law 2D editors
   explore_model.py / qt_sketch.py / qt_explorer.py   # section editor model + Qt UI
   checks.py       # clearance vs fuselage, area error, diffusion angle

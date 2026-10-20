@@ -228,7 +228,13 @@ other trunk sections at the trunk's `A(s)`. Every branch end is cut from the tru
 sectors), so editing it reshapes all of them and the pieces keep tiling it exactly. With symmetry `xz` the trunk
 sections are kept mirror symmetric about `u = 0` (edit one side). The **Inlets** list ends with a fixed **Trunk** row
 (it cannot be removed, renamed or moved): select it to edit the trunk's key sections in the section editor and its
-area curve in the Area tab. Inlets take no key sections beyond the junction. Nothing about the trunk depends on how
+area curve in the Area tab. While the trunk start is the section in the editor, two actions act on it (both one undo
+step): **Reset to default…** replaces it by a superellipse of an exponent you choose (2 = ellipse, larger = squarer,
+1 to 8), held at the junction area; **Simplify…** reduces it to N vertices (a subset of its own) with curved edges fitted
+to the outline, keeping its area and, with symmetry `xz`, its mirror symmetry (vertices go in mirror pairs, so the
+count may need one more or less); corners stay corners, and the deviation from the previous outline (max and rms, mm and
+% of the equivalent radius) is shown in the status line, the section info and the readouts. This is how a migrated
+64-vertex polygon becomes a handful of editable points. Inlets take no key sections beyond the junction. Nothing about the trunk depends on how
 many inlets there are, their order or their names (the junction point and the junction area, when not given, are
 symmetric functions of the inlets, so reordering or renaming never moves the trunk; give them explicitly and adding
 or removing an inlet leaves it bit for bit as it was). The panel's *Up* / *Down* buttons reorder the inlets.
