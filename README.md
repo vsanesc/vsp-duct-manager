@@ -348,10 +348,13 @@ each negative at every design station agrees with A(s), and the line of sight on
 The `export:` block of the config (see the example) holds every setting.
 
 The OpenVSP work runs in child processes: OpenVSP 3.55 sometimes corrupts its heap while building a Stack with Edit
-Curve XSecs and dies, and whether it does depends on the exact curves it is given. Every step (removing the old `DUCT_*`,
-each Geom, the verification) is therefore a process of its own, chained through the model file; a Geom whose process dies is
-made again with other sections (another number of Bezier segments, another station tolerance, another start point of the
-curves) up to ten times. A crash never takes the explorer down, but an export can take a few minutes while that happens.
+Curve XSecs and dies. It is not the Edit Curve symmetry (that is switched off, and checked, before any point is written:
+`SymType` defaults to SYM_RL and would silently rewrite an asymmetric section); whether it dies depends on the exact curves
+it is given. Every step (removing the old `DUCT_*`, each Geom, the verification) is a process of its own, chained through
+the model file, so a crash never takes the explorer down and says where it happened (Geom and XSec). With
+`export.retry_on_crash` (default true) a Geom whose process died is made again with other sections (another number of
+Bezier segments, station tolerance, start point of the curves, up to ten versions) and each such change is a WARN in the
+report; with it off a crash is an ERROR. Retries can make an export take a few minutes.
 
 ## Using your own model
 

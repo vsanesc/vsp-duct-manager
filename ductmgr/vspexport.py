@@ -59,6 +59,7 @@ class ExportSettings:
     tess_w: int = 65  # OpenVSP tessellation around the section (an odd number; one more than the points)
     tess_u: int = 9  # ... along each Stack interval
     verify: bool = True
+    retry_on_crash: bool = True  # a Geom whose OpenVSP process dies is made again with other sections (reported); else an ERROR
     area_tolerance: float = 0.03  # verification: WARN above this relative error
     volume_tolerance: float = 0.03
     volume_samples: int = 20000  # sample points per body for the volume estimate

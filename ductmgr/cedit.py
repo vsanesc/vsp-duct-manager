@@ -146,20 +146,35 @@ def make_edit_curve(xsec_surf_id: str, index: int) -> str:
     return vsp.GetXSec(xsec_surf_id, index)
 
 
-def apply_cedit(xsec_id: str, c: CeditSection, g1: bool = True) -> None:
+class CeditWriteError(RuntimeError):
+    """OpenVSP did not keep what it was given (e.g. its Edit Curve symmetry changed the points)."""
+
+
+# per-point deviation (normalised coordinates) above which the stored points are not those that were written
+STORED_TOLERANCE = 1e-9
+
+
+def apply_cedit(xsec_id: str, c: CeditSection, g1: bool = True, check: bool = True) -> None:
     """Write ``c`` into an Edit Curve XSec: Width / Height, the control points and (with ``g1``) the G1 flags.
 
-    The XSec's built-in symmetry is switched off first (it would mirror the edit), and the curve type is CEDIT.
-    ``g1=False`` leaves the per-point G1 parameters at OpenVSP's defaults (they are cheap to set; the geometry does not
-    depend on them).
+    An Edit Curve XSec starts with ``SymType`` = SYM_RL: OpenVSP then mirrors the points on every edit (it silently
+    rewrites an asymmetric section; measured: 0.8 of the section size). So, before any point is written, ``SymType`` is set to
+    SYM_NONE (and ``CloseFlag`` to closed, the skinning symmetry flags of the XSec to off) and an Update makes it effective;
+    with ``check`` the points OpenVSP then stores are read back and compared with ``c`` (``CeditWriteError`` if they differ).
+    ``g1=False`` leaves the per-point G1 parameters at OpenVSP's defaults.
     """
     import openvsp as vsp
 
     def parm(name):
         return vsp.GetXSecParm(xsec_id, name)
 
-    for name in ("SymType", "TBSym", "RLSym", "AllSym"):
+    vsp.SetParmVal(parm("SymType"), float(vsp.SYM_NONE))
+    vsp.SetParmVal(parm("CloseFlag"), 1.0)
+    for name in ("TBSym", "RLSym", "AllSym"):  # the XSec's own (skinning) symmetry, a different parameter
         vsp.SetParmVal(parm(name), 0.0)
+    vsp.Update()
+    if vsp.GetParmVal(parm("SymType")) != float(vsp.SYM_NONE):
+        raise CeditWriteError("could not switch the Edit Curve symmetry off")
     vsp.SetParmVal(parm("CurveType"), float(vsp.CEDIT))
     vsp.Update()
     vsp.SetXSecWidthHeight(xsec_id, c.width, c.height)
@@ -167,10 +182,26 @@ def apply_cedit(xsec_id: str, c: CeditSection, g1: bool = True) -> None:
     ctrl = [vsp.vec3d(x, y, 0.0) for x, y in c.points]
     vsp.SetEditXSecPnts(xsec_id, list(c.u), ctrl, [0.0] * len(ctrl))
     vsp.Update()
+    if check:
+        dev = stored_deviation(xsec_id, c)
+        if dev > STORED_TOLERANCE:
+            raise CeditWriteError(f"OpenVSP stored points that differ from the ones written by up to {dev:.3g} "
+                                  "(in units of the section size)")
     if g1:
         for i, flag in enumerate(c.g1):  # the per-point parameters exist only now that the points do
             vsp.SetParmVal(parm(f"G1_{i}"), 1.0 if flag else 0.0)
         vsp.Update()
+
+
+def stored_deviation(xsec_id: str, c: CeditSection) -> float:
+    """Largest difference between the control points stored in the XSec and those of ``c`` (normalised coordinates);
+    infinity when the number of points differs."""
+    import openvsp as vsp
+
+    got = vsp.GetEditXSecCtrlVec(xsec_id, True)
+    if len(got) != len(c.points):
+        return float("inf")
+    return max(max(abs(g.x() - p[0]), abs(g.y() - p[1])) for g, p in zip(got, c.points))
 
 
 def read_cedit_samples(xsec_id: str, n_segments: int, per_segment: int = SAMPLES_PER_SEGMENT) -> np.ndarray:

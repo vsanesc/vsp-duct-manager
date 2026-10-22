@@ -310,3 +310,60 @@ def test_no_compgeom_files_or_temp_sets_are_left_next_to_the_output(s_export):
     assert all(vsp.GetSetName(i) != vspio.TEMP_SET_NAME for i in range(vsp.GetNumSets()))
     assert {g.name for g in vspio.list_geoms()} == {"Test Fuselage", "Test Engine", "DUCT_BRANCH_right_POS",
                                                     "DUCT_BRANCH_right_NEG", "DUCT_TRUNK_POS", "DUCT_TRUNK_NEG"}
+
+
+# ---- a crash of OpenVSP is reported where it happened ------------------------------------------------------------------
+def fake_children(monkeypatch, crash_first_write_of=None, retry_ok=True):
+    """Replace the child processes: 'prepare' and 'write' succeed (empty files), except that the first 'write' of the
+    named Geom dies in its XSec 3 (and, with ``retry_ok`` False, so does every later one)."""
+    seen = {"n": 0}
+
+    def run(task, args, tmp, say):
+        if task == "prepare":
+            args["out_file"].write_bytes(b"")
+            return "ok", {"before": {}, "names": {}, "removed": []}, [], ""
+        g = args["geom"]
+        if g.name == crash_first_write_of and (seen["n"] == 0 or not retry_ok):
+            seen["n"] += 1
+            where = f"{g.name}: Edit Curve of XSec 3 of {len(g.sections) - 1} (exit code 0xC0000374)"
+            return "crash", None, [], where
+        args["out_file"].write_bytes(b"")
+        return "ok", True, [], f"Writing {g.name}"
+
+    monkeypatch.setattr(exportrun, "_run_task", run)
+
+
+def test_a_crash_is_an_error_naming_the_geom_and_the_xsec_when_retrying_is_off(s_env, tmp_path, monkeypatch):
+    cfg, path, _ = s_env
+    m = env.explorer_model(cfg, path, [lambda s: env.inlet(s, "right", 2.0, 0.5, True)], junction=[4.0, 0.0, 0.2])
+    m.cfg.setdefault("export", {})["retry_on_crash"] = False
+    fake_children(monkeypatch, crash_first_write_of="DUCT_BRANCH_right_NEG")
+    with pytest.raises(exportrun.OpenVSPCrash) as info:
+        run(m, tmp_path / "o.vsp3")
+    text = str(info.value)
+    assert text.startswith("ERROR") and "DUCT_BRANCH_right_NEG" in text and "Edit Curve of XSec 3" in text
+    assert "0xC0000374" in text and "retry_on_crash" in text
+
+
+def test_with_retrying_on_the_crash_and_the_changed_sections_are_reported_as_warnings(s_env, tmp_path, monkeypatch):
+    cfg, path, _ = s_env
+    m = env.explorer_model(cfg, path, [lambda s: env.inlet(s, "right", 2.0, 0.5, True)], junction=[4.0, 0.0, 0.2])
+    fake_children(monkeypatch, crash_first_write_of="DUCT_TRUNK_NEG")
+    result = run(m, tmp_path / "o.vsp3")
+    lines = [ln for ln in result.lines if "WARN" in ln]
+    assert any("OpenVSP crashed at: DUCT_TRUNK_NEG: Edit Curve of XSec 3" in ln for ln in lines)
+    assert any("differ from the first plan" in ln and "Bezier segments" in ln for ln in lines)
+
+
+def test_every_version_crashing_is_an_error_too(s_env, tmp_path, monkeypatch):
+    cfg, path, _ = s_env
+    m = env.explorer_model(cfg, path, [lambda s: env.inlet(s, "right", 2.0, 0.5, True)], junction=[4.0, 0.0, 0.2])
+    fake_children(monkeypatch, crash_first_write_of="DUCT_TRUNK_POS", retry_ok=False)
+    with pytest.raises(exportrun.OpenVSPCrash, match="every version of the Geom crashed it"):
+        run(m, tmp_path / "o.vsp3")
+
+
+def test_the_verification_checks_that_every_edit_curve_is_stored_as_written(s_export):
+    result, _, _ = s_export
+    assert levels(result)["Edit Curve XSecs"] == "pass"
+    assert result.verification.numbers["xsec_deviation"] < 1e-3  # 0.1 % of the section size

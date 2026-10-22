@@ -78,6 +78,10 @@ def prefix_from_config(cfg: dict) -> str:
     return prefix
 
 
+class OpenVSPCrash(RuntimeError):
+    """OpenVSP's process died; the message says in which Geom and XSec."""
+
+
 def resolve_paths(model_path, out_path) -> tuple[Path, Path]:
     model_path = Path(model_path).resolve()
     out_path = Path(out_path).resolve() if out_path is not None else output_path(model_path).resolve()
@@ -87,15 +91,16 @@ def resolve_paths(model_path, out_path) -> tuple[Path, Path]:
 
 
 def report_lines(out_path: Path, model_path: Path, removed: list[str], plan: vspexport.ExportPlan, design: dm.Duct,
-                 prefix: str, verification: exportcheck.Verification | None, retries: dict | None = None) -> list[str]:
+                 prefix: str, verification: exportcheck.Verification | None, crashes: dict | None = None) -> list[str]:
     """The report of an export: what was written, per Geom, and the verification."""
     lines = [f"Wrote {out_path}", f"  input {model_path.name} was not modified"]
     if removed:
         lines.append(f"  replaced {len(removed)} existing {prefix}* Geom(s): {', '.join(removed)}")
     for g in plan.geoms:
         lines.append(f"  {g.name}: {g.summary}")
-        if (retries or {}).get(g.name):
-            lines.append(f"      OpenVSP crashed {retries[g.name]} time(s) on the way; this is the version that went through")
+        for note in (crashes or {}).get(g.name, []):
+            lines.append(f"      WARN {note}" if note.startswith("OpenVSP crashed") else
+                         f"      WARN the sections of this Geom differ from the first plan: {note}")
         if g.prism_depth is not None and g.negative:
             lines.append(f"      prismatic start {g.prism_depth * 1000:.0f} mm after the opening plane, lip "
                          f"{design.spec.lip_extension * 1000:.0f} mm upstream")
@@ -128,7 +133,7 @@ def task_write(in_file, out_file, geom, settings, progress=None) -> bool:
     say = progress or (lambda text: None)
     say(f"Writing {geom.name}")
     vspio.open_model(in_file)
-    vspio.write_stack(geom, settings)
+    vspio.write_stack(geom, settings, say)
     vspio.save_model(out_file)
     return True
 
@@ -201,8 +206,9 @@ def _cpu_seconds(proc) -> float | None:
 
 
 def _run_task(task: str, args: dict, tmp: Path, say):
-    """Run one task in a child process. Returns (status, result, tail): "ok", "crash" (the child died, went silent or
-    spun for too long) or "error" (an ordinary Python error in the child; ``tail`` has its output)."""
+    """Run one task in a child process. Returns (status, result, tail, where): "ok", "crash" (the child died, went silent
+    or spun for too long) or "error" (an ordinary Python error in the child; ``tail`` has its output). ``where`` says what
+    the child did last and how it ended, e.g. "DUCT_X_NEG: Edit Curve of XSec 7 of 14 (exit code 0xC0000374)"."""
     work = Path(tempfile.mkdtemp(dir=tmp))
     job_file, result_file = work / "job.pkl", work / "result.pkl"
     with open(job_file, "wb") as f:
@@ -214,7 +220,7 @@ def _run_task(task: str, args: dict, tmp: Path, say):
                             encoding="utf-8", errors="replace")
     lines: queue.Queue = queue.Queue()
     threading.Thread(target=lambda: [lines.put(ln) for ln in proc.stdout] or lines.put(None), daemon=True).start()
-    tail = []
+    tail, last = [], ""
     started = active = time.monotonic()
     cpu = _cpu_seconds(proc)
     while True:
@@ -231,7 +237,7 @@ def _run_task(task: str, args: dict, tmp: Path, say):
             if now - active > CHILD_IDLE or now - started > STEP_LIMITS[task]:
                 proc.kill()  # silent and idle for too long (a crashed child the system keeps around) or spinning
                 if not result_file.is_file():
-                    return "crash", None, tail
+                    return "crash", None, tail, f"{last} (no sign of life for {CHILD_IDLE} s, or too long in one step)"
                 break
             continue
         if line is None:  # the pipe is closed: the child has ended
@@ -239,35 +245,36 @@ def _run_task(task: str, args: dict, tmp: Path, say):
         active = time.monotonic()
         line = line.rstrip()
         if line.startswith("PROGRESS "):
-            say(line[len("PROGRESS "):])
+            last = line[len("PROGRESS "):]
+            say(last)
         elif line:
             tail.append(line)
     try:
         code = proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
         proc.kill()
-        return "crash", None, tail
+        return "crash", None, tail, last
     if result_file.is_file():  # written before anything went wrong: a crash while the process was ending does not matter
         try:
             with open(result_file, "rb") as f:
-                return "ok", pickle.load(f), tail
+                return "ok", pickle.load(f), tail, last
         except (pickle.UnpicklingError, EOFError):
             pass  # the child died while writing it
     crashed = code in CRASH_CODES or (code == 1 and not any("Traceback" in t for t in tail))
-    return ("crash" if crashed else "error"), None, tail
+    return ("crash" if crashed else "error"), None, tail, f"{last} (exit code 0x{code & 0xFFFFFFFF:X})"
 
 
 def _checked(task: str, args: dict, tmp: Path, say, attempts: int = 3):
     """``_run_task`` again (the same arguments) when OpenVSP crashes; an ordinary error is raised."""
     tail = []
     for _ in range(attempts):
-        status, result, tail = _run_task(task, args, tmp, say)
+        status, result, tail, where = _run_task(task, args, tmp, say)
         if status == "ok":
             return result
         if status == "error":
             raise RuntimeError(f"the export failed in step '{task}':\n" + "\n".join(tail[-12:]))
-        say(f"OpenVSP crashed in step '{task}'; trying again")
-    raise RuntimeError(f"OpenVSP crashed in step '{task}' every time; last output:\n" + "\n".join(tail[-12:]))
+        say(f"OpenVSP crashed in step '{task}' at: {where}; trying again")
+    raise OpenVSPCrash(f"ERROR OpenVSP crashed in step '{task}' every time (last: {where})")
 
 
 def export_design(design: dm.Duct, cfg: dict, model_path, out_path=None, skin=None, skin_names=None, bodies=None,
@@ -286,31 +293,36 @@ def export_design(design: dm.Duct, cfg: dict, model_path, out_path=None, skin=No
     skin_names = list(skin_names if skin_names is not None else skin_names_from_config(cfg))
     say("Planning the stations and sections")
     plan = vspexport.plan_export(vspexport.fine_duct(design, settings), design, settings, skin, prefix)
-    retries: dict[str, int] = {}
+    crashes: dict[str, list] = {}  # per Geom: where OpenVSP crashed, and what was changed to get past it
     with tempfile.TemporaryDirectory(prefix="ductmgr_export_") as tmp:
         tmp = Path(tmp)
         current = tmp / "step0.vsp3"
         prepared = _checked("prepare", {"model_path": model_path, "out_file": current, "prefix": prefix}, tmp, say)
         for k, geom in enumerate(list(plan.geoms)):
-            tail = []
-            for attempt, (extra, factor, shift) in enumerate(RETRY_VARIANTS):
+            tail, where = [], ""
+            attempts = RETRY_VARIANTS if settings.retry_on_crash else RETRY_VARIANTS[:1]
+            for attempt, (extra, factor, shift) in enumerate(attempts):
                 g = geom if attempt == 0 else vspexport.rebuild_geom(
                     geom, replace(settings, cedit_anchors=settings.cedit_anchors + extra,
                                   station_tolerance=settings.station_tolerance * factor,
                                   cedit_start=settings.cedit_start + shift))
                 nxt = tmp / f"step{k + 1}.vsp3"
-                status, _, tail = _run_task("write", {"in_file": current, "out_file": nxt, "geom": g,
-                                                      "settings": settings}, tmp, say)
+                status, _, tail, where = _run_task("write", {"in_file": current, "out_file": nxt, "geom": g,
+                                                             "settings": settings}, tmp, say)
                 if status == "ok":
                     plan.geoms[k], current = g, nxt
-                    retries[g.name] = attempt
+                    if attempt:
+                        crashes.setdefault(g.name, []).append(
+                            f"written again with +{extra} Bezier segments, station tolerance x{factor:g}, start +{shift}")
                     break
                 if status == "error":  # an ordinary Python error: running it again would not help
                     raise RuntimeError(f"the export failed while writing {geom.name}:\n" + "\n".join(tail[-12:]))
-                say(f"OpenVSP crashed while writing {geom.name}; trying again with other sections")
+                crashes.setdefault(geom.name, []).append(f"OpenVSP crashed at: {where}")
+                say(f"OpenVSP crashed while writing {geom.name}: {where}")
             else:
-                raise RuntimeError(f"OpenVSP crashed on every version of {geom.name}; last output:\n"
-                                   + "\n".join(tail[-12:]))
+                raise OpenVSPCrash(f"ERROR OpenVSP crashed while writing {geom.name} at: {where}"
+                                   + ("; every version of the Geom crashed it" if settings.retry_on_crash
+                                      else " (export.retry_on_crash is off)"))
         say(f"Saving {out_path.name}")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(current, out_path)
@@ -322,4 +334,4 @@ def export_design(design: dm.Duct, cfg: dict, model_path, out_path=None, skin=No
                 "names": prepared["names"], "prefix": prefix, "viewer_los": viewer_los}, tmp, say)
     return ExportResult(out_path, plan, prepared["removed"], verification,
                         report_lines(out_path, model_path, prepared["removed"], plan, design, prefix, verification,
-                                     retries))
+                                     crashes))

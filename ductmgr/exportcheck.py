@@ -24,6 +24,7 @@ import pyvista as pv
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import polygonize, unary_union
 
+from ductmgr import cedit
 from ductmgr import duct as dm
 from ductmgr import ductcheck, vspio
 from ductmgr.geometry import polygon_area
@@ -81,6 +82,38 @@ def check_untouched(v: Verification, before: dict, names: dict, prefix: str, pla
               "error")
     else:
         v.add("File contents", f"PASS the model and {len(present)} {prefix}* Geoms, nothing else", "pass")
+
+
+XSEC_TOLERANCE = 1e-3  # of the section size: how far a stored Edit Curve may be from the outline it was written from
+
+
+def check_xsecs(v: Verification, plan) -> None:
+    """Every Edit Curve XSec in the saved file keeps the control points, the Width and Height it was written with (and has
+    its curve symmetry off): OpenVSP's own Edit Curve symmetry would silently rewrite an asymmetric section."""
+    import openvsp as vsp
+
+    worst, where, count, symmetric = 0.0, "", 0, []
+    for g in plan.geoms:
+        surf = vsp.GetXSecSurf(vspio.find_geom(g.name).id, 0)
+        for i, s in enumerate(g.sections):
+            if s.cedit is None:
+                continue
+            xs = vsp.GetXSec(surf, i)
+            count += 1
+            if vsp.GetParmVal(vsp.GetXSecParm(xs, "SymType")) != float(vsp.SYM_NONE):
+                symmetric.append(f"{g.name} XSec {i}")
+            size = max(vsp.GetXSecWidth(xs) / s.cedit.width, vsp.GetXSecHeight(xs) / s.cedit.height, 1.0)
+            dev = max(cedit.stored_deviation(xs, s.cedit), abs(vsp.GetXSecWidth(xs) / s.cedit.width - 1.0),
+                      abs(vsp.GetXSecHeight(xs) / s.cedit.height - 1.0)) * size
+            if dev > worst:
+                worst, where = dev, f"{g.name} XSec {i}"
+    v.numbers.update(xsec_deviation=worst)
+    if symmetric or worst > XSEC_TOLERANCE:
+        v.add("Edit Curve XSecs", f"FAIL {'symmetry on in ' + ', '.join(symmetric[:3]) if symmetric else ''}"
+              f"{'; ' if symmetric else ''}stored curves deviate up to {100 * worst:.3f} % of the section size at {where}", "error")
+    else:
+        v.add("Edit Curve XSecs", f"PASS {count} XSecs stored as written (max deviation {100 * worst:.4f} % of the section size, "
+              "curve symmetry off)", "pass")
 
 
 # ---- CompGeom and volumes -------------------------------------------------------------------------------------------------
@@ -338,6 +371,7 @@ def verify_export(saved_path, plan, design: dm.Duct, skin_names: list[str], skin
     say("Reopening the saved file")
     vspio.open_model(saved_path)
     check_untouched(v, before, names, prefix, [g.name for g in plan.geoms])
+    check_xsecs(v, plan)
     geoms = vspio.list_geoms()
     skin_geoms = [vspio.find_geom(n, geoms) for n in skin_names]
     duct_geoms = [g for g in geoms if g.name.startswith(prefix)]

@@ -359,11 +359,14 @@ def delete_geoms_with_prefix(prefix: str) -> list[str]:
     return removed
 
 
-def write_stack(plan, settings) -> str:
+def write_stack(plan, settings, progress=None) -> str:
     """Create the Stack geom of a ``vspexport.GeomPlan`` and return its id: one Edit Curve XSec per section (positions and
     frames from the plan), a POINT XSec at each end as the flat cap, skinning tangents along the section normals, the
-    negative-volume flag and the planar XZ symmetry as planned."""
+    negative-volume flag and the planar XZ symmetry as planned. ``progress`` is called with a line before each step, so a
+    crash of OpenVSP can be placed (the Geom and the XSec it was working on)."""
     from ductmgr import cedit, vspexport
+
+    say = progress or (lambda text: None)
 
     gid = vsp.AddGeom("STACK")
     vsp.SetGeomName(gid, plan.name)
@@ -396,7 +399,9 @@ def write_stack(plan, settings) -> str:
     vsp.Update()
     for i, section in enumerate(plan.sections):
         if section.cedit is not None:
+            say(f"{plan.name}: Edit Curve of XSec {i} of {n - 1}")
             cedit.apply_cedit(cedit.make_edit_curve(surf, i), section.cedit)
+    say(f"{plan.name}: caps, tessellation, flags")
     vsp.Update()
     vsp.SetParmVal(gid, "Tess_W", "Shape", float(settings.tess_w))
     vsp.SetParmVal(gid, "Tess_U", "Shape", float(settings.tess_u * (n - 1) + 1))

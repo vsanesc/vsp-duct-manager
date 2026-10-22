@@ -210,3 +210,39 @@ def test_applying_twice_replaces_the_curve(xsec):
     got = cedit.read_cedit_samples(xsec, c.n_segments) + np.array(c.centre)
     assert polyline_deviation(outline_of(shape), got) < DEVIATION * size_of(outline_of(shape))
     assert len(vsp.GetEditXSecCtrlVec(xsec, True)) == len(c.points)  # 16 points now, not the circle's 13
+
+
+# ---- the Edit Curve symmetry ------------------------------------------------------------------------------------------
+ASYMMETRIC = [(0.0, 1.0), (0.95, 0.31), (0.7, -0.81), (-0.2, -0.6), (-0.95, 0.5)]
+
+
+def test_an_edit_curve_xsec_starts_with_the_symmetry_on_and_openvsp_then_rewrites_an_asymmetric_section(xsec):
+    c = cedit.section_to_cedit(SectionShape.polygon(ASYMMETRIC))
+    assert vsp.GetParmVal(vsp.GetXSecParm(xsec, "SymType")) == vsp.SYM_RL  # the default
+    vsp.SetParmVal(vsp.GetXSecParm(xsec, "CurveType"), float(vsp.CEDIT))
+    vsp.SetXSecWidthHeight(xsec, c.width, c.height)
+    vsp.SetEditXSecPnts(xsec, list(c.u), [vsp.vec3d(x, y, 0.0) for x, y in c.points], [0.0] * len(c.points))
+    vsp.Update()
+    assert cedit.stored_deviation(xsec, c) > 0.05  # what is stored is not what was written
+
+
+def test_apply_cedit_switches_the_symmetry_off_before_the_points_and_stores_them_exactly(xsec):
+    c = cedit.section_to_cedit(SectionShape.polygon(ASYMMETRIC))
+    cedit.apply_cedit(xsec, c)
+    assert vsp.GetParmVal(vsp.GetXSecParm(xsec, "SymType")) == vsp.SYM_NONE
+    assert vsp.GetParmVal(vsp.GetXSecParm(xsec, "CloseFlag")) == 1.0
+    assert cedit.stored_deviation(xsec, c) < 1e-12
+
+
+def test_a_section_openvsp_does_not_keep_as_written_is_reported(xsec, monkeypatch):
+    c = cedit.section_to_cedit(SectionShape.polygon(ASYMMETRIC))
+    real = vsp.SetParmVal
+
+    def keep_symmetry(parm, value, *rest):
+        if rest == () and vsp.GetParmName(parm) == "SymType":
+            value = float(vsp.SYM_RL)  # as if the switch did not take
+        return real(parm, value, *rest)
+
+    monkeypatch.setattr(vsp, "SetParmVal", keep_symmetry)
+    with pytest.raises(cedit.CeditWriteError):
+        cedit.apply_cedit(xsec, c)

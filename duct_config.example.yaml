@@ -130,6 +130,8 @@ export:
   tess_w: 65                       # OpenVSP tessellation around a section
   tess_u: 9                        # ... along each Stack interval
   verify: true                     # reopen the saved file and run the checks
+  retry_on_crash: true             # OpenVSP 3.55 sometimes crashes on an Edit Curve Stack (data dependent): a Geom whose process
+                                   # died is made again with other sections and the change is reported as a WARN; false: an ERROR
   area_tolerance: 0.03             # WARN above this relative error of the area at the design stations
   volume_tolerance: 0.03           # WARN above this relative difference of the CompGeom volume
   volume_samples: 20000            # sample points per body in our own volume estimate
