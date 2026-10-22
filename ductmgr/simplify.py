@@ -44,7 +44,7 @@ class Simplified:
                 f"rms {1000 * self.rms_dev:.2f} mm")
 
 
-def _distances(points: np.ndarray, poly: np.ndarray, closed: bool) -> np.ndarray:
+def distances(points: np.ndarray, poly: np.ndarray, closed: bool) -> np.ndarray:
     """Distance of every point to the polyline ``poly``."""
     a = poly
     b = np.roll(poly, -1, axis=0) if closed else poly[1:]
@@ -95,7 +95,7 @@ def _bernstein(t: np.ndarray) -> np.ndarray:
     return np.c_[u**3, 3 * u**2 * t, 3 * u * t**2, t**3]
 
 
-def _fit_edge(d: np.ndarray, ta: np.ndarray, tb: np.ndarray, scale: float):
+def fit_edge(d: np.ndarray, ta: np.ndarray, tb: np.ndarray, scale: float):
     """(handles or None for a straight edge, max error) of the cubic Bézier through the end points of the dense
     points ``d`` with end tangents ``ta`` (leaving the first) and ``tb`` (arriving at the last)."""
     a, b = d[0], d[-1]
@@ -126,7 +126,7 @@ def _fit_edge(d: np.ndarray, ta: np.ndarray, tb: np.ndarray, scale: float):
         t = grid[nearest]
         t[0], t[-1] = 0.0, 1.0
     ctrl = np.array([a, a + alpha * ta, b - beta * tb, b])
-    err = float(_distances(d, _bernstein(np.linspace(0, 1, CURVE_SAMPLES)) @ ctrl, closed=False).max())
+    err = float(distances(d, _bernstein(np.linspace(0, 1, CURVE_SAMPLES)) @ ctrl, closed=False).max())
     return (alpha * ta, -beta * tb), err
 
 
@@ -151,7 +151,7 @@ def simplify(shape: ol.SectionShape, n: int, symmetric: bool = False) -> Simplif
         if key not in cache:
             ta = dense.tangents(a)
             tb = dense.tangents(b)
-            cache[key] = _fit_edge(dense.span(a, b), ta[1], tb[0], dense.scale)
+            cache[key] = fit_edge(dense.span(a, b), ta[1], tb[0], dense.scale)
         return cache[key]
 
     def removal_cost(v: int) -> float:
@@ -207,8 +207,8 @@ def simplify(shape: ol.SectionShape, n: int, symmetric: bool = False) -> Simplif
     out = ol.translate(out, shift)
     out = ol.scale_all(out, c_old, math.sqrt(abs(a_old) / a_new))
     new_pts = ol.build_outline(ol.edge_paths(out)[0])
-    d1 = _distances(dense.pts, new_pts, closed=True)
-    d2 = _distances(new_pts, dense.pts, closed=True)
+    d1 = distances(dense.pts, new_pts, closed=True)
+    d2 = distances(new_pts, dense.pts, closed=True)
     both = np.r_[d1, d2]
     radius = math.sqrt(abs(a_old) / math.pi)
     return Simplified(out, count, k, float(both.max()), float(np.sqrt((both**2).mean())), float(both.max()) / radius,

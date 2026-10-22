@@ -7,7 +7,9 @@ Surfaces are obtained through the OpenVSP API: the wanted geoms are put in a tem
 temporary STL, and loaded with PyVista. The temporary set is restored and the STL deleted afterwards.
 Nothing here saves the model.
 """
+import contextlib
 import math
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,6 +97,40 @@ def _free_set_index() -> int:
     raise RuntimeError("no free user set available for the temporary export")
 
 
+@contextlib.contextmanager
+def _without_compgeom_files():
+    """CompGeom (also behind the STL export) writes <model>_CompGeom.txt / .csv next to the model file: remove what a
+    block creates."""
+    name = vsp.GetVSPFileName()
+    if not name:  # a model that was never read from / written to a file: nothing is written next to it
+        yield
+        return
+    model_file = Path(name)
+    side = [model_file.with_name(f"{model_file.stem}_CompGeom{ext}") for ext in (".txt", ".csv")]
+    existed = [f.exists() for f in side]
+    try:
+        yield
+    finally:
+        for f, before in zip(side, existed):
+            if not before and f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+
+def read_stl(path) -> pv.PolyData:
+    """Read an STL file. OpenVSP writes ASCII STL, which VTK's reader sometimes fails on (an empty mesh or an error), so
+    an ASCII file is parsed here; anything else goes to PyVista."""
+    raw = Path(path).read_bytes()
+    if raw[:5] == b"solid" and b"facet" in raw[:400]:
+        xyz = np.array(re.findall(rb"vertex\s+(\S+)\s+(\S+)\s+(\S+)", raw), dtype=float)
+        n = len(xyz) // 3
+        faces = np.c_[np.full(n, 3), np.arange(3 * n).reshape(n, 3)]
+        return pv.PolyData(xyz, faces.ravel())
+    return pv.read(str(path))
+
+
 def export_mesh(geoms: list[GeomInfo]) -> pv.PolyData:
     """Triangulated surface of the given geoms (all symmetric copies), via a temporary set and STL."""
     if not geoms:
@@ -109,10 +145,11 @@ def export_mesh(geoms: list[GeomInfo]) -> pv.PolyData:
     try:
         with tempfile.TemporaryDirectory(prefix="ductmgr_") as tmp:
             stl = Path(tmp) / STL_NAME
-            vsp.ExportFile(str(stl), idx, vsp.EXPORT_STL)
+            with _without_compgeom_files():
+                vsp.ExportFile(str(stl), idx, vsp.EXPORT_STL)
             if not stl.is_file():
                 raise RuntimeError("OpenVSP did not write the temporary STL")
-            mesh = pv.read(str(stl))
+            mesh = read_stl(stl)
     finally:
         # Leave the session as we found it. ExportFile hides the geoms and leaves a transient "MeshGeom"
         # behind; remove only geoms that did not exist before the export.
@@ -301,3 +338,139 @@ def snap_to_surface(mesh: pv.PolyData, x: float, y: float, z_ref: float) -> tupl
         return None
     hit = points[int(np.argmin(np.abs(points[:, 2] - z_ref)))]
     return hit, surface_normal(mesh, hit)
+
+
+# ---- writing the duct (Phase 4) --------------------------------------------------------------------------------------
+SKINNING_SIDES = ("Top", "Right", "Bottom", "Left")
+
+
+def geoms_with_prefix(prefix: str) -> list[str]:
+    """Ids of the geoms whose name starts with ``prefix`` (the only ones this program ever touches)."""
+    return [gid for gid in vsp.FindGeoms() if vsp.GetGeomName(gid).startswith(prefix)]
+
+
+def delete_geoms_with_prefix(prefix: str) -> list[str]:
+    """Delete every geom whose name starts with ``prefix``; returns their names. Nothing else is touched."""
+    removed = []
+    for gid in geoms_with_prefix(prefix):
+        removed.append(vsp.GetGeomName(gid))
+        vsp.DeleteGeom(gid)
+    vsp.Update()
+    return removed
+
+
+def write_stack(plan, settings) -> str:
+    """Create the Stack geom of a ``vspexport.GeomPlan`` and return its id: one Edit Curve XSec per section (positions and
+    frames from the plan), a POINT XSec at each end as the flat cap, skinning tangents along the section normals, the
+    negative-volume flag and the planar XZ symmetry as planned."""
+    from ductmgr import cedit, vspexport
+
+    gid = vsp.AddGeom("STACK")
+    vsp.SetGeomName(gid, plan.name)
+    vsp.Update()
+    surf = vsp.GetXSecSurf(gid, 0)
+    n = len(plan.sections)
+    while vsp.GetNumXSec(surf) > n:
+        vsp.CutXSec(gid, 1)
+    while vsp.GetNumXSec(surf) < n:
+        vsp.InsertXSec(gid, 1, vsp.XS_ELLIPSE)
+    vsp.Update()
+    params = vspexport.stack_parameters(plan.sections)
+    # First the whole path: every XSec (still an ellipse of about its final size) gets its position, frame and skinning
+    # tangents, so no intermediate Stack is folded or wildly off while the sections are turned into Edit Curves one by one.
+    for i, (section, q) in enumerate(zip(plan.sections, params)):
+        xs = vsp.GetXSec(surf, i)
+        if section.cedit is not None:
+            vsp.SetParmVal(vsp.GetXSecParm(xs, "Ellipse_Width"), section.cedit.width)
+            vsp.SetParmVal(vsp.GetXSecParm(xs, "Ellipse_Height"), section.cedit.height)
+        for name, value in q.items():
+            vsp.SetParmVal(vsp.GetXSecParm(xs, name), value)
+        for side in SKINNING_SIDES:
+            for lr in ("L", "R"):
+                # along the section normal, except at a cap point: there in the section plane (a flat disc), and the
+                # section next to a cap gets a weak tangent towards it so the disc does not bulge
+                facing = (i == 0 and lr == "R") or (i == n - 1 and lr == "L")
+                vsp.SetParmVal(vsp.GetXSecParm(xs, f"{side}{lr}Angle"), 90.0 if section.cedit is None and facing else 0.0)
+                if (i == 1 and lr == "L") or (i == n - 2 and lr == "R"):
+                    vsp.SetParmVal(vsp.GetXSecParm(xs, f"{side}{lr}Strength"), settings.cap_strength)
+    vsp.Update()
+    for i, section in enumerate(plan.sections):
+        if section.cedit is not None:
+            cedit.apply_cedit(cedit.make_edit_curve(surf, i), section.cedit)
+    vsp.Update()
+    vsp.SetParmVal(gid, "Tess_W", "Shape", float(settings.tess_w))
+    vsp.SetParmVal(gid, "Tess_U", "Shape", float(settings.tess_u * (n - 1) + 1))
+    vsp.SetParmVal(gid, "Negative_Volume_Flag", "Negative_Volume_Props", 1.0 if plan.negative else 0.0)
+    vsp.SetParmVal(gid, "Sym_Planar_Flag", "Sym", float(vsp.SYM_XZ) if plan.mirrored else 0.0)
+    vsp.Update()
+    return gid
+
+
+def save_model(path) -> Path:
+    """Write the whole model to ``path`` (never call this with the input file)."""
+    path = Path(path)
+    vsp.WriteVSPFile(str(path), vsp.SET_ALL)
+    if not path.is_file():
+        raise RuntimeError(f"OpenVSP did not write {path}")
+    return path
+
+
+def param_hashes(prefix: str) -> dict[str, str]:
+    """A hash of every parameter value (geom, XSec and XSec-curve parameters, in order) of each geom whose name does NOT
+    start with ``prefix``, keyed by geom id: the fingerprint of everything this program must leave alone."""
+    import hashlib
+
+    out = {}
+    for gid in vsp.FindGeoms():
+        name = vsp.GetGeomName(gid)
+        if name.startswith(prefix):
+            continue
+        pids = list(vsp.GetGeomParmIDs(gid))
+        for k in range(vsp.GetNumXSecSurfs(gid)):
+            surf = vsp.GetXSecSurf(gid, k)
+            for i in range(vsp.GetNumXSec(surf)):
+                pids += list(vsp.GetXSecParmIDs(vsp.GetXSec(surf, i)))
+        h = hashlib.sha256()
+        h.update(f"{name}|{vsp.GetGeomTypeName(gid)}|{len(pids)}\n".encode())
+        for pid in pids:
+            h.update(f"{vsp.GetParmGroupName(pid)}|{vsp.GetParmName(pid)}|{vsp.GetParmVal(pid)!r}\n".encode())
+        out[gid] = h.hexdigest()
+    return out
+
+
+def comp_geom(geoms: list[GeomInfo]) -> dict:
+    """Run CompGeom on a temporary set of ``geoms`` and return its numbers; the set, the mesh geom CompGeom creates and
+    the visibility flags are restored afterwards. Keys: volume (theoretical: every component counted whole),
+    wet_volume (m^3: what the exposed surfaces enclose, negative volumes subtracted), area (wetted), triangles,
+    meshes."""
+    idx = _free_set_index()
+    old_name = vsp.GetSetName(idx)
+    ids_before = set(vsp.FindGeoms())
+    shown = {gid: vsp.GetSetFlag(gid, vsp.SET_SHOWN) for gid in ids_before}
+    vsp.SetSetName(idx, TEMP_SET_NAME)
+    for g in geoms:
+        vsp.SetSetFlag(g.id, idx, True)
+    try:
+        vsp.SetAnalysisInputDefaults("CompGeom")
+        vsp.SetIntAnalysisInput("CompGeom", "Set", [idx])
+        vsp.SetIntAnalysisInput("CompGeom", "HalfMeshFlag", [0])
+        with _without_compgeom_files():
+            res = vsp.ExecAnalysis("CompGeom")
+
+        def number(getter, name):
+            v = getter(res, name)
+            return v[0] if len(v) else 0
+
+        return {"volume": float(number(vsp.GetDoubleResults, "Total_Theo_Vol")),
+                "wet_volume": float(number(vsp.GetDoubleResults, "Total_Wet_Vol")),
+                "area": float(number(vsp.GetDoubleResults, "Total_Wet_Area")),
+                "triangles": int(number(vsp.GetIntResults, "Total_Num_Tris")),
+                "meshes": int(number(vsp.GetIntResults, "Total_Num_Meshes"))}
+    finally:
+        for gid in set(vsp.FindGeoms()) - ids_before:
+            vsp.DeleteGeom(gid)
+        for g in geoms:
+            vsp.SetSetFlag(g.id, idx, False)
+        vsp.SetSetName(idx, old_name)
+        for gid, flag in shown.items():
+            vsp.SetSetFlag(gid, vsp.SET_SHOWN, flag)

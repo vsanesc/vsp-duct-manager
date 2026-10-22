@@ -90,6 +90,16 @@ def section_to_cedit(shape: SectionShape, section: Section | None = None, clockw
     """The CEDIT control data of a section. The curve starts at ``start_vertex`` (default: the reference vertex,
     the one closest to +v) and runs clockwise (VSP's own direction) unless ``clockwise`` is False."""
     segs, g1 = segments_of(shape, section)
+    if start_vertex is None:
+        start_vertex = reference_vertex(np.array(shape.vertices))
+    return segments_to_cedit(segs, g1, np.array(shape.vertices[start_vertex], dtype=float), clockwise)
+
+
+def segments_to_cedit(segs: list, g1: list, start_anchor, clockwise: bool = True) -> CeditSection:
+    """The CEDIT control data of a closed outline given as cubic Bézier segments (each (4, 2), in order, the end of
+    one being the start of the next) with the G1 flag of the anchor that starts each. The curve starts at the anchor
+    nearest ``start_anchor`` and runs clockwise (VSP's own direction) unless ``clockwise`` is False."""
+    segs, g1 = list(segs), list(g1)
     m = len(segs)
     extent = np.ptp(np.vstack([bezier_points(s, 8) for s in segs]), axis=0)
     if extent[0] < MIN_EXTENT or extent[1] < MIN_EXTENT:
@@ -98,11 +108,8 @@ def section_to_cedit(shape: SectionShape, section: Section | None = None, clockw
     if ccw == clockwise:  # reverse the traversal: each segment is flipped and the anchors' flags follow
         segs = [s[::-1].copy() for s in reversed(segs)]
         g1 = [g1[(m - j) % m] for j in range(m)]
-    if start_vertex is None:
-        start_vertex = reference_vertex(np.array(shape.vertices))
     # rotate so the curve begins at the start vertex
-    start_anchor = np.array(shape.vertices[start_vertex], dtype=float)
-    k0 = min(range(m), key=lambda k: float(np.linalg.norm(segs[k][0] - start_anchor)))
+    k0 = min(range(m), key=lambda k: float(np.linalg.norm(segs[k][0] - np.asarray(start_anchor, dtype=float))))
     segs, g1 = segs[k0:] + segs[:k0], g1[k0:] + g1[:k0]
 
     pts = np.vstack([s[:3] for s in segs] + [segs[-1][3:4]])
@@ -139,10 +146,12 @@ def make_edit_curve(xsec_surf_id: str, index: int) -> str:
     return vsp.GetXSec(xsec_surf_id, index)
 
 
-def apply_cedit(xsec_id: str, c: CeditSection) -> None:
-    """Write ``c`` into an Edit Curve XSec: Width / Height, the control points and the G1 flags.
+def apply_cedit(xsec_id: str, c: CeditSection, g1: bool = True) -> None:
+    """Write ``c`` into an Edit Curve XSec: Width / Height, the control points and (with ``g1``) the G1 flags.
 
     The XSec's built-in symmetry is switched off first (it would mirror the edit), and the curve type is CEDIT.
+    ``g1=False`` leaves the per-point G1 parameters at OpenVSP's defaults (they are cheap to set; the geometry does not
+    depend on them).
     """
     import openvsp as vsp
 
@@ -158,9 +167,10 @@ def apply_cedit(xsec_id: str, c: CeditSection) -> None:
     ctrl = [vsp.vec3d(x, y, 0.0) for x, y in c.points]
     vsp.SetEditXSecPnts(xsec_id, list(c.u), ctrl, [0.0] * len(ctrl))
     vsp.Update()
-    for i, flag in enumerate(c.g1):  # the per-point parameters exist only now that the points do
-        vsp.SetParmVal(parm(f"G1_{i}"), 1.0 if flag else 0.0)
-    vsp.Update()
+    if g1:
+        for i, flag in enumerate(c.g1):  # the per-point parameters exist only now that the points do
+            vsp.SetParmVal(parm(f"G1_{i}"), 1.0 if flag else 0.0)
+        vsp.Update()
 
 
 def read_cedit_samples(xsec_id: str, n_segments: int, per_segment: int = SAMPLES_PER_SEGMENT) -> np.ndarray:

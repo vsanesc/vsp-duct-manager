@@ -12,6 +12,7 @@ if not os.environ.get("DUCTMGR_GUI_TESTS"):  # the opt-in GUI tests need the rea
 import copy
 import math
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -721,3 +722,51 @@ def test_a_failing_check_does_not_take_the_window_down(make_window, monkeypatch)
 def test_no_duct_widgets_are_active_before_the_inlet_is_placed(make_window, example_env):
     w = make_window(cfg=unplaced(example_env))
     assert not w.spin_wall.isEnabled() and not w.btn_reset_cl.isEnabled() and not w._heavy_timer.isActive()
+
+
+# ---- export to OpenVSP (Phase 4) ------------------------------------------------------------------------------------
+def test_export_button_and_shortcut_run_the_export_and_show_the_result(make_window, monkeypatch):
+    w = make_window()
+    assert w.act_export.shortcut().toString() == "Ctrl+E" and w.btn_export.text().startswith("Export to VSP")
+    assert w.model.export_blocker() is None and w.btn_export.isEnabled() and w.act_export.isEnabled()
+    calls, shown = [], []
+    result = SimpleNamespace(ok=True, warned=False, text="Wrote x_ducts.vsp3\n  PASS", out_path=Path("x_ducts.vsp3"))
+    w.export_runner = lambda **kw: calls.append(kw) or result
+    monkeypatch.setattr(w, "show_export_result", lambda ok, text, warned=False: shown.append((ok, text, warned)))
+    w.btn_export.click()
+    assert len(calls) == 1 and {"design", "cfg", "model_path", "skin", "skin_names", "viewer_los"} <= set(calls[0])
+    assert calls[0]["design"] is w.model.duct and calls[0]["model_path"].name.endswith(".vsp3")
+    assert shown == [(True, "Wrote x_ducts.vsp3\n  PASS", False)]
+    assert "x_ducts.vsp3" in w.message_label.text()
+    w.act_export.trigger()  # Ctrl+E does the same
+    assert len(calls) == 2
+
+
+def test_export_is_disabled_while_an_error_shows(make_window, example_env):
+    w = make_window(cfg=unplaced(example_env))  # nothing placed: nothing to export
+    assert not w.btn_export.isEnabled() and not w.act_export.isEnabled()
+    assert "place an inlet" in w.btn_export.toolTip()
+    calls = []
+    w.export_runner = lambda **kw: calls.append(kw)
+    w._on_export()  # even the shortcut path refuses
+    assert calls == []
+
+
+def test_export_is_disabled_when_a_readout_is_an_error(make_window, monkeypatch):
+    w = make_window()
+    monkeypatch.setattr(type(w.model), "readouts", lambda self: [Readout("Section", "ERROR the area is off", "error")])
+    w.model._notify()
+    assert not w.btn_export.isEnabled() and "the area is off" in w.btn_export.toolTip()
+
+
+def test_a_failing_export_is_reported_and_the_window_stays_up(make_window, monkeypatch):
+    w = make_window()
+    shown = []
+    monkeypatch.setattr(w, "show_export_result", lambda ok, text, warned=False: shown.append((ok, text)))
+
+    def boom(**kw):
+        raise RuntimeError("OpenVSP crashed on every attempt")
+
+    w.export_runner = boom
+    w._on_export()
+    assert shown and shown[0][0] is False and "crashed" in shown[0][1]

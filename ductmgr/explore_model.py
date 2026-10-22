@@ -30,7 +30,8 @@ from ductmgr import interp
 from ductmgr import outline as ol
 from ductmgr.areacurve import AreaCurves, AreaPoints
 from ductmgr.centreline import Centreline, CentrelineParams
-from ductmgr.config import PRIVATE_CONFIG, load_config, save_inlet_definition, skin_names_from_config
+from ductmgr.config import (PRIVATE_CONFIG, load_config, resolve_model_path, save_inlet_definition,
+                            skin_names_from_config)
 from ductmgr.engine import EngineSizingWarning, size_from_config
 from ductmgr.geometry import InletPlane, inlet_readout, polygon_centroid, sweep_for_edge_angle
 from ductmgr.outline import SectionShape
@@ -419,6 +420,7 @@ class InletModel:
     def __init__(self, scene, cfg: dict, config_path: Path, save_target: Path | None, clock=time.monotonic):
         """``save_target`` is the config Save writes to; None makes the model read-only (example config)."""
         self.scene = scene
+        self.cfg = cfg  # as loaded: the export reads the model path, the prefix and its settings from it
         self.config_path = Path(config_path)
         self.save_target = Path(save_target) if save_target is not None else None
         self._clock = clock
@@ -1665,6 +1667,33 @@ class InletModel:
     @property
     def checks(self) -> "ductcheck.DuctChecks | None":
         return self._built["checks"] if self.ensure_built() else None
+
+    # ---- export to OpenVSP (Phase 4) -----------------------------------------------------------------------------------------
+    def export_blocker(self, readouts: list[Readout] | None = None) -> str | None:
+        """Why the design cannot be exported now (None when it can): nothing placed, no duct, or an ERROR showing in the
+        readouts (pass the ones already computed to avoid computing them again)."""
+        if not self._placed():
+            return "place an inlet first"
+        if self.scene.face_center is None:
+            return "the engine face is unknown"
+        if not self.valid:
+            return "an opening is not valid"
+        if self.duct_error:
+            return self.duct_error
+        for r in (readouts if readouts is not None else self.readouts()):
+            if r.level == "error":
+                return r.value.removeprefix("ERROR").strip(": ") or r.label
+        return None
+
+    def export_inputs(self) -> dict | None:
+        """What ``exportrun.export_design`` needs from the current design (builds the bodies and checks if necessary);
+        None when there is no duct."""
+        if not self.ensure_built():
+            return None
+        checks = self._built["checks"]
+        return {"design": self.duct, "cfg": self.cfg, "model_path": resolve_model_path(self.cfg, self.config_path),
+                "skin": self.fuselage_solid(), "skin_names": list(self.state.skin), "bodies": self._built["bodies"],
+                "viewer_los": {"x": checks.los_x, "n": checks.los_n}}
 
     # ---- aligning the plane to an edge ---------------------------------------------------------------------------------
     def wing_edge(self, wing_index: int, edge: str) -> vspio.EdgeSweep:

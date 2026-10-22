@@ -168,6 +168,27 @@ class Station:
 
 
 @dataclass
+class RingSection:
+    """One ring of a body with the frame it lives in: the section ``ring`` (N, 2), in the ``(U, V)`` plane about
+    ``origin``, at arc length ``dist`` from the opening plane (negative upstream of it). ``index`` is the position in
+    the primary branch's / the trunk's stations when the ring is a design station (None otherwise) and ``role`` says
+    where it comes from: "lip" (the prismatic extension upstream of the opening), "station", "into" (a branch negative
+    continuing into the trunk) or "overlap" (a trunk negative starting upstream of the junction)."""
+
+    dist: float
+    origin: np.ndarray
+    T: np.ndarray
+    U: np.ndarray
+    V: np.ndarray
+    ring: np.ndarray
+    index: int | None = None
+    role: str = "station"
+
+    def points(self) -> np.ndarray:
+        return self.origin + self.ring[:, :1] * self.U + self.ring[:, 1:] * self.V
+
+
+@dataclass
 class Body:
     name: str  # e.g. "neg_branch_R", "pos_branch_R_mirror", "neg_trunk"
     kind: str  # "negative" or "positive"
@@ -177,6 +198,7 @@ class Body:
     dist: np.ndarray  # (R,) arc length of each ring from the opening plane (negative upstream of it)
     mesh: pv.PolyData  # closed, outward-oriented, triangulated
     lateral: pv.PolyData  # the open tube without end caps
+    sections: list = field(default_factory=list)  # the rings with their frames (empty for a mirrored twin)
 
 
 @dataclass(frozen=True)
@@ -845,52 +867,96 @@ class Duct:
         return self.inner_ring(st) - self.spec.lip_extension * st.T
 
     # ---- bodies --------------------------------------------------------------------------------------------------------------
-    def _trunk_piece(self, st: Station, bg: BranchGeom) -> np.ndarray:
-        """A branch's piece of a trunk station, for the branch negative continuing into the trunk (placed in 3D)."""
+    def _trunk_piece_ring(self, st: Station, bg: BranchGeom) -> np.ndarray:
+        """A branch's piece of a trunk station, for the branch negative continuing into the trunk (in the station's
+        own (U, V) frame)."""
         scale = math.sqrt(st.area / polygon_area(self.trunk_start))
-        return self.place(st, piece_ring(st.ring, bg.piece, self._wall_half if self.n_branches > 1 else 0.0, self.n,
-                                         scale))
+        return piece_ring(st.ring, bg.piece, self._wall_half if self.n_branches > 1 else 0.0, self.n, scale)
 
-    def bodies(self) -> dict[str, Body]:
-        out: dict[str, Body] = {}
+    def trunk_station_at(self, dist: float) -> Station:
+        """A trunk station at ``dist`` from the junction (which need not be one of the design stations): the centreline
+        point and tangent there, the frame parallel-transported from the nearest station upstream, the section at A(s)."""
+        cl = self.branches[0].centreline
+        lt = cl.length_trunk
+        t = cl.trunk.t_at_length(np.array([dist]))
+        centre, T = cl.trunk.points(t)[0], cl.trunk.tangents(t)[0]
+        ref = max((s for s in self.trunk if s.dist <= dist + 1e-12), key=lambda s: s.dist, default=self.trunk[0])
+        v = _minimal_rotation(ref.V, ref.T, T)
+        V = v - np.dot(v, T) * T
+        V = V / np.linalg.norm(V)
+        s = dist / lt if lt > 0 else 1.0
+        area = float(self.branches[0].areas.trunk_area(s))
+        return Station("trunk", s, float(dist), centre, T, np.cross(T, V), V, area,
+                       self.ring_at(s, area, self.trunk_rings))
+
+    def body_sections(self, single_overlap: bool = False) -> dict[str, list[RingSection]]:
+        """The rings of every body (mirrored twins left out) with their frames. ``single_overlap`` gives a single
+        branch (no junction) the same overlap with the trunk as the junction of several branches has: its negative
+        continues ``overlap`` into the trunk and the trunk negative starts that much upstream, so the two never share
+        a face (the export needs this; the viewer does not)."""
         spec = self.spec
         multi = self.n_branches > 1
+        join = multi or (single_overlap and spec.overlap > 0.0)  # the negatives overlap at the junction
         split = multi and spec.splitter_length > 0.0
         reach = (spec.splitter_length if split else 0.0) + spec.overlap  # how far the branches go into the trunk
-        into = [s for s in self.trunk if 1e-9 < s.dist <= reach + 1e-9]
-        pos_t = np.array([self.outer_ring(s) for s in self.trunk])
-        dist_t = np.array([s.dist for s in self.trunk])
+        into = [(i, s) for i, s in enumerate(self.trunk) if 1e-9 < s.dist <= reach + 1e-9]
+        if join and not multi:
+            into = [(None, self.trunk_station_at(spec.overlap))]
+
+        def ring_section(st, ring, index, role="station", shift=0.0, dist=None):
+            return RingSection(st.dist if dist is None else dist, st.centre - shift * st.T, st.T, st.U, st.V, ring,
+                               index, role)
+
+        t = spec.wall_thickness
+        out: dict[str, list[RingSection]] = {}
+        pos_t = [ring_section(s, offset_ring(s.ring, t), i) for i, s in enumerate(self.trunk)]
         if split:
-            keep = [s for s in self.trunk if s.dist >= spec.splitter_length - 1e-9]
-            neg_t = np.array([self.inner_ring(s) for s in keep])
-            dist_nt = np.array([s.dist for s in keep])
+            neg_t = [ring_section(s, s.ring, i) for i, s in enumerate(self.trunk) if s.dist >= spec.splitter_length - 1e-9]
         else:
             first = self.trunk[0]
-            rings = [self.inner_ring(first) - spec.overlap * first.T] if (multi and spec.overlap > 0.0) else []
-            neg_t = np.array(rings + [self.inner_ring(s) for s in self.trunk])
-            dist_nt = np.r_[[first.dist - spec.overlap] if (multi and spec.overlap > 0.0) else [], dist_t]
+            head = [ring_section(first, first.ring, None, "overlap", spec.overlap, first.dist - spec.overlap)] \
+                if (join and spec.overlap > 0.0) else []
+            neg_t = head + [ring_section(s, s.ring, i) for i, s in enumerate(self.trunk)]
         for bg in self.branches:
             if bg.twin:
                 continue
             lb = bg.centreline.length_branch
-            neg_b = np.array([self.lip_ring(bg)] + [self.inner_ring(s) for s in bg.stations]
-                             + [self._trunk_piece(s, bg) for s in into])
-            dist_b = np.r_[-spec.lip_extension, [s.dist for s in bg.stations], [lb + s.dist for s in into]]
-            pos_b = np.array([self.outer_ring(s) for s in bg.stations])
-            dist_pb = np.array([s.dist for s in bg.stations])
-            for kind, tag, rb, db in (("negative", "neg", neg_b, dist_b), ("positive", "pos", pos_b, dist_pb)):
-                out[f"{tag}_branch_{bg.name}"] = self._body(f"{tag}_branch_{bg.name}", kind, "branch", bg.name, rb, db)
+            st0 = bg.stations[0]
+            neg_b = [ring_section(st0, st0.ring, None, "lip", spec.lip_extension, -spec.lip_extension)]
+            neg_b += [ring_section(s, s.ring, i) for i, s in enumerate(bg.stations)]
+            neg_b += [ring_section(s, self._trunk_piece_ring(s, bg), i, "into", dist=lb + s.dist) for i, s in into]
+            out[f"neg_branch_{bg.name}"] = neg_b
+            out[f"pos_branch_{bg.name}"] = [ring_section(s, offset_ring(s.ring, t), i) for i, s in enumerate(bg.stations)]
+        out["neg_trunk"] = neg_t
+        out["pos_trunk"] = pos_t
+        return out
+
+    def bodies(self) -> dict[str, Body]:
+        out: dict[str, Body] = {}
+        sections = self.body_sections()
+        for bg in self.branches:
+            if bg.twin:
+                continue
+            for kind, tag in (("negative", "neg"), ("positive", "pos")):
+                secs = sections[f"{tag}_branch_{bg.name}"]
+                rb = np.array([s.points() for s in secs])
+                db = [s.dist for s in secs]
+                out[f"{tag}_branch_{bg.name}"] = self._body(f"{tag}_branch_{bg.name}", kind, "branch", bg.name, rb, db,
+                                                            secs)
                 if any(b.twin and b.inlet == bg.inlet for b in self.branches):
                     twin = f"{bg.name}_mirror"
                     out[f"{tag}_branch_{twin}"] = self._body(f"{tag}_branch_{twin}", kind, "branch", twin,
                                                              mirrored(rb)[:, ::-1], db)
-        out["neg_trunk"] = self._body("neg_trunk", "negative", "trunk", "C", neg_t, dist_nt)
-        out["pos_trunk"] = self._body("pos_trunk", "positive", "trunk", "C", pos_t, dist_t)
+        for kind, tag in (("negative", "neg"), ("positive", "pos")):
+            secs = sections[f"{tag}_trunk"]
+            out[f"{tag}_trunk"] = self._body(f"{tag}_trunk", kind, "trunk", "C", np.array([s.points() for s in secs]),
+                                             [s.dist for s in secs], secs)
         return out
 
     @staticmethod
-    def _body(name, kind, part, side, rings, dist) -> Body:
-        return Body(name, kind, part, side, rings, np.asarray(dist), tube_mesh(rings, True), tube_mesh(rings, False))
+    def _body(name, kind, part, side, rings, dist, sections=()) -> Body:
+        return Body(name, kind, part, side, rings, np.asarray(dist), tube_mesh(rings, True), tube_mesh(rings, False),
+                    list(sections))
 
     # ---- numbers --------------------------------------------------------------------------------------------------------------
     def cone_half_angles(self, branch: int = 0) -> dict[str, np.ndarray]:

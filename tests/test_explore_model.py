@@ -1395,3 +1395,26 @@ def test_the_settings_reach_the_duct_spec_and_a_splitter_that_is_too_long_is_rep
     bad = InletModel(scene, cfg, path, None)
     assert bad.duct is None and "shorter than the trunk" in bad.duct_error
     assert bad.centreline is None  # no centreline without a valid junction; the model still loads
+
+
+# ---- export (Phase 4) -------------------------------------------------------------------------------------------------
+def test_export_blocker_names_why_the_design_cannot_be_exported(scene, example_env):
+    cfg, path, _ = example_env
+    ready = make(scene, path)
+    assert ready.export_blocker() is None
+    unplaced = make(scene, path, cfg=cfgutil.unplace(copy.deepcopy(cfg)))
+    assert unplaced.export_blocker() == "place an inlet first"
+    ready.readouts = lambda: [em.Readout("", "ERROR the wall is too thin", "error")]
+    assert ready.export_blocker() == "the wall is too thin"
+    assert ready.export_blocker([em.Readout("Wall", "0.01 m", "pass")]) is None  # readouts passed in are used instead
+
+
+def test_export_inputs_hold_what_the_exporter_needs(scene, example_env):
+    _, path, _ = example_env
+    m = make(scene, path)
+    inputs = m.export_inputs()
+    assert set(inputs) == {"design", "cfg", "model_path", "skin", "skin_names", "bodies", "viewer_los"}
+    assert inputs["design"] is m.duct and inputs["skin_names"] == list(m.state.skin)
+    assert inputs["model_path"].name == "model.vsp3" and inputs["model_path"].is_file()
+    assert set(inputs["viewer_los"]) == {"x", "n"} and all(0.0 <= v <= 1.0 for v in inputs["viewer_los"].values())
+    assert make(scene, path, cfg=cfgutil.unplace(copy.deepcopy(load_config(path)[0]))).export_inputs() is None

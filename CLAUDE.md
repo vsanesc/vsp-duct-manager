@@ -41,7 +41,7 @@ Lives in `CLAUDE.local.md` (gitignored, never published). Imported below:
 ```
 duct_config.yaml
 ductmgr/
-  vspio.py        # open model, find geoms, tessellate, write DUCT_* stacks
+  vspio.py        # open model, find geoms, tessellate, write DUCT_* stacks, CompGeom, parameter hashes
   engine.py       # ISA, mass flow, capture/face areas, Mach checks
   geometry.py     # inlet plane frame, projected area, centreline, frames
   section.py      # plane ∩ fuselage skin as a (u, v) curve, snapping, signed distance
@@ -59,8 +59,12 @@ ductmgr/
   explore_model.py / qt_sketch.py / qt_explorer.py   # section editor model + Qt UI
   checks.py       # clearance vs fuselage, area error, diffusion angle
   viz.py          # PyVista scene + matplotlib A(s) plot
-run_explore.py    # interactive viewer: place the inlets, save them to the config
-run_design.py     # design + visualise (no VSP write)
-run_export.py     # write DUCT_* into <name>_ducts.vsp3 + CompGeom check
+  sectionfit.py   # corresponding rings -> Edit Curve sections with common anchors (tolerance, linear fallback)
+  vspexport.py    # export plan: adaptive XSecs, prismatic start, CEDIT sections, frames -> Stack parameters
+  exportrun.py    # open input, delete DUCT_*, write, save <name>_ducts.vsp3, verify; runs in a child process
+  exportworker.py # the child process (OpenVSP can crash on big Edit Curve Stacks; the export retries)
+  exportcheck.py  # verification of the saved file: untouched geoms, CompGeom, volumes, areas, line of sight
+run_explore.py    # interactive viewer: place the inlets, save them to the config (Ctrl+E exports)
+run_export.py     # write DUCT_* into <name>_ducts.vsp3 + verification
 tests/
 ```

@@ -7,8 +7,8 @@ only used to generate and update the duct components.
 
 > **Status: early development.** Implemented so far: the environment/config scaffolding
 > (config loader, `env_check.py`, example model), Phase 1 engine/capture-area sizing, and
-> Phase 2: an interactive 3D viewer to place the inlets on the fuselage. The duct geometry,
-> checks and export stages below are planned and not implemented yet.
+> Phase 2: an interactive 3D viewer to place the inlets on the fuselage, the duct design with live checks (Phase 3)
+> and the export of the duct into an OpenVSP model with automatic verification (Phase 4).
 
 ## What it will do
 
@@ -325,6 +325,33 @@ a window.
 Tests: `python -m pytest` runs without a display (the window is tested on Qt's offscreen platform, without its 3D
 view). The embedded 3D view and real clicks need a desktop session:
 `$env:DUCTMGR_GUI_TESTS=1; python -m pytest tests/test_qt_gui_3d.py` (opens a window briefly).
+
+## Export to OpenVSP (Phase 4)
+
+```powershell
+.venv\Scripts\python run_export.py            # or Ctrl+E / "Export to VSP" in the explorer
+```
+
+Opens the input model, deletes only the Geoms whose name starts with `model.duct_prefix` (default `DUCT_`), creates the
+duct and saves `<name>_ducts.vsp3` next to it; the input file is never written. Per independent inlet branch there is a
+positive and a negative Stack, `DUCT_BRANCH_<name>_POS` / `_NEG` (a mirrored twin is OpenVSP's planar XZ symmetry on the
+same pair, not a second Geom), and for the trunk `DUCT_TRUNK_POS` / `_NEG`. Negatives have `Negative_Volume_Flag` = 1: the
+branch negative starts `lip_extension` upstream of the opening with a prismatic segment along the inlet axis (so the skin
+is cut along the sketched outline), the branch and the trunk negatives overlap at the junction, the trunk negative ends at
+the engine face. Every section is an Edit Curve (a short chain of Beziers you can move point by point in the GUI) and the
+number of XSecs per Geom is chosen adaptively. The flat end caps are point XSecs `export.cap_thickness` beyond the end
+sections (OpenVSP's own flat-cap option drops a segment of some Edit Curves).
+
+After saving, the file is reopened and checked: every other Geom has identical parameters, CompGeom on {skin, `DUCT_*`}
+returns a non-empty mesh, the CompGeom volume agrees with our own estimate of (skin + positives - negatives), the area of
+each negative at every design station agrees with A(s), and the line of sight on the exported mesh agrees with the viewer.
+The `export:` block of the config (see the example) holds every setting.
+
+The OpenVSP work runs in child processes: OpenVSP 3.55 sometimes corrupts its heap while building a Stack with Edit
+Curve XSecs and dies, and whether it does depends on the exact curves it is given. Every step (removing the old `DUCT_*`,
+each Geom, the verification) is therefore a process of its own, chained through the model file; a Geom whose process dies is
+made again with other sections (another number of Bezier segments, another station tolerance, another start point of the
+curves) up to ten times. A crash never takes the explorer down, but an export can take a few minutes while that happens.
 
 ## Using your own model
 

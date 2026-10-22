@@ -109,3 +109,27 @@ checks:
   min_clearance: 0.02              # m, minimum wall clearance to the fuselage skin
   max_diffuser_half_angle_deg: 6.0
   lip_length: 0.15                 # m, the positive may leave the skin only this far aft of the opening
+
+# ---- Phase 4: export to OpenVSP -----------------------------------------
+# run_export.py (or Ctrl+E in the explorer) writes <model>_ducts.vsp3 with DUCT_BRANCH_<name>_POS / _NEG per inlet and
+# DUCT_TRUNK_POS / _NEG. Every value here is optional; the defaults are shown.
+export:
+  fine_stations: 48                # stations per part of the fine resampling the adaptive XSec selection starts from
+  station_tolerance: 0.005         # of the section size: how far an XSec left out may be from the interpolated one
+  min_stations: 3                  # XSecs per Geom at least
+  cedit_anchors: 8                 # Bezier segments per Edit Curve section at least (more where it has corners)
+  cedit_tolerance: 0.005           # of the section size: else a linear Edit Curve through the sampled points
+  cedit_corner_deg: 20.0           # a ring turning by more than this at a sample has a corner there
+  cedit_start: 1                   # the Edit Curves start at the anchor this many places after ring point 0 (OpenVSP crashes
+                                   # for some sections started at point 0, and for none started one anchor later)
+  cap_thickness: 0.001             # m, the flat end caps are point XSecs this far beyond the end sections
+  cap_strength: 0.01               # skinning tangent strength next to a cap
+  prism_min: 0.03                  # m, shortest prismatic segment after the opening plane
+  prism_clearance: 0.01            # m, how far inside the skin the prismatic segment must end
+  skin_tolerance: 0.003            # m, a section point this close to the skin counts as on it
+  tess_w: 65                       # OpenVSP tessellation around a section
+  tess_u: 9                        # ... along each Stack interval
+  verify: true                     # reopen the saved file and run the checks
+  area_tolerance: 0.03             # WARN above this relative error of the area at the design stations
+  volume_tolerance: 0.03           # WARN above this relative difference of the CompGeom volume
+  volume_samples: 20000            # sample points per body in our own volume estimate

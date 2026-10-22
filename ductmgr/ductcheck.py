@@ -282,19 +282,19 @@ def _face_grid(duct: dm.Duct) -> tuple[np.ndarray, np.ndarray]:
     return pts, (a**2 + b**2) <= r**2 * (1 + 1e-9)
 
 
-def line_of_sight(duct: dm.Duct, bodies: dict, c: DuctChecks) -> None:
+def los_fractions(duct: dm.Duct, casters: list) -> tuple[float, float]:
     """Fraction of the engine face seen straight through an opening, along +X and along the inlet normal.
 
     Rays run from face sample points back towards the opening; a point counts as visible when the ray reaches the
-    opening plane inside the opening outline without crossing the bore wall (branch + trunk negative surface).
-    The union over the right and the mirrored left inlet is reported."""
+    opening plane inside the opening outline without crossing the bore wall. ``casters`` has one ``RayCaster`` per
+    branch of ``duct.branches`` (the wall that branch's rays must not cross). The union over every opening (mirrored
+    twins included) is reported."""
     pts, mask = _face_grid(duct)
     flat, m = pts.reshape(-1, 3), mask.ravel()
     sides = []
-    for bg in duct.branches:  # every opening, mirrored twins included
+    for bg, caster in zip(duct.branches, casters):  # every opening, mirrored twins included
         st0 = bg.stations[0]
-        casters = RayCaster(bodies[f"neg_branch_{bg.name}"].lateral, bodies["neg_trunk"].lateral)
-        sides.append((st0.centre, -st0.T, st0.U, st0.V, st0.ring, casters))
+        sides.append((st0.centre, -st0.T, st0.U, st0.V, st0.ring, caster))
     dirs = {"x": np.array([1.0, 0.0, 0.0]), "n": None}
     result = {}
     for key in ("x", "n"):
@@ -316,8 +316,13 @@ def line_of_sight(duct: dm.Duct, bodies: dict, c: DuctChecks) -> None:
                     ok[i] = False
             vis_any |= ok
         result[key] = float(vis_any[m].mean()) if m.any() else 0.0
-    # either direction
-    c.los_x, c.los_n = result["x"], result["n"]
+    return result["x"], result["n"]
+
+
+def line_of_sight(duct: dm.Duct, bodies: dict, c: DuctChecks) -> None:
+    """Line of sight through the negative bores (branch + trunk lateral surfaces, without end caps)."""
+    casters = [RayCaster(bodies[f"neg_branch_{bg.name}"].lateral, bodies["neg_trunk"].lateral) for bg in duct.branches]
+    c.los_x, c.los_n = los_fractions(duct, casters)
     c.los_any = max(c.los_x, c.los_n)
     level = "pass" if c.los_any > 0.0 else "warn"
     c.add("Line of sight", f"{100 * c.los_x:.0f} % of the face along +X, {100 * c.los_n:.0f} % along the inlet "

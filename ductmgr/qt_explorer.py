@@ -14,7 +14,7 @@ import sys
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ductmgr import vspio
+from ductmgr import exportrun, vspio
 from ductmgr.explore_model import MIN_ALIGN_PROJECTION, MODE_PLACING, InletModel, Readout
 from ductmgr.geometry import InletPlane, sweep_for_edge_angle
 from ductmgr.qt_paths import AreaCanvas, PathCanvas
@@ -262,6 +262,8 @@ class ExploreWindow(QtWidgets.QMainWindow):
     def __init__(self, scene: Scene, model: InletModel, with_3d: bool = True, parent=None):
         super().__init__(parent)
         self.scene, self.model = scene, model
+        self.export_runner = exportrun.export_design  # replaced in tests
+        self.last_export_text = ""
         self.plotter = None
         self.view: SceneView | None = None
         self._syncing = False
@@ -312,6 +314,8 @@ class ExploreWindow(QtWidgets.QMainWindow):
         self.act_redo = self._action("Redo", m.redo, ["Ctrl+Y", "Ctrl+Shift+Z"], tip="Redo (Ctrl+Y)")
         self.act_save = self._action("Save to config", m.save, ["Ctrl+S"], tip="Save to config (Ctrl+S)")
         self.act_revert = self._action("Revert to saved", m.revert, tip="Re-read the inlet from the config file")
+        self.act_export = self._action("Export to VSP", self._on_export, ["Ctrl+E"],
+                                       tip="Write the duct into <model>_ducts.vsp3 and verify it (Ctrl+E)")
         self.act_fit_area = self._action("Fit area", m.fit_area, tip="Scale the free vertices to the target area")
         self.act_align = self._action("Align to edge…", self._on_align,
                                       tip="Set the sweep so the opening's planform trace is parallel to a wing "
@@ -557,6 +561,9 @@ class ExploreWindow(QtWidgets.QMainWindow):
         row.addWidget(self.btn_save)
         row.addWidget(self.btn_revert)
         col.addLayout(row)
+        self.btn_export = QtWidgets.QPushButton("Export to VSP  (Ctrl+E)")
+        self.btn_export.clicked.connect(lambda *_: self._on_export())
+        col.addWidget(self.btn_export)
         col.addStretch(1)
 
         scroll = QtWidgets.QScrollArea()
@@ -812,7 +819,13 @@ class ExploreWindow(QtWidgets.QMainWindow):
                    "Save is disabled: the example config is read-only" if m.save_target is None else
                    "Save is disabled: the opening is not valid" if m.placed else "Place an inlet first")
             self.btn_save.setToolTip(tip)
-            self.readout_view.setHtml(readouts_html(m.readouts()))
+            readouts = m.readouts()
+            self.readout_view.setHtml(readouts_html(readouts))
+            blocker = m.export_blocker(readouts)
+            self.btn_export.setEnabled(blocker is None)
+            self.act_export.setEnabled(blocker is None)
+            self.btn_export.setToolTip("Write the duct into <model>_ducts.vsp3 and verify it (Ctrl+E)" if blocker is None
+                                       else f"Export is disabled: {blocker}")
         finally:
             self._syncing = False
         self.mode_label.setText(m.mode_text)
@@ -882,6 +895,50 @@ class ExploreWindow(QtWidgets.QMainWindow):
         if self.plotter is not None:
             self.view.update_ducts(self.model)
             self.plotter.render()
+
+    # ---- export to OpenVSP ---------------------------------------------------------------------------------------------
+    def _on_export(self) -> None:
+        """Export the current design (Ctrl+E): disabled while an ERROR shows. Runs in this thread with a progress dialog;
+        the result is printed to the terminal and shown in a dialog."""
+        m = self.model
+        blocker = m.export_blocker()
+        if blocker is not None:
+            self.message_label.setText(f"Export disabled: {blocker}"[:200])
+            return
+        progress = QtWidgets.QProgressDialog("Exporting to OpenVSP...", None, 0, 0, self)
+        progress.setWindowTitle("Export to VSP")
+        progress.setMinimumDuration(0)
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.show()
+
+        def step(text: str) -> None:
+            progress.setLabelText(text + "...")
+            print(f"... {text}", flush=True)
+            QtWidgets.QApplication.processEvents()
+
+        try:
+            inputs = m.export_inputs()
+            result = self.export_runner(**inputs, progress=step)
+        except Exception as exc:  # the dialog reports it; the window stays up
+            progress.close()
+            self.show_export_result(False, f"Export failed: {type(exc).__name__}: {exc}")
+            return
+        progress.close()
+        print(result.text, flush=True)
+        self.show_export_result(result.ok, result.text, result.warned)
+        m._say(f"Exported to {result.out_path.name}: " + ("FAIL" if not result.ok else "PASS with warnings"
+                                                             if result.warned else "PASS"))
+        m._notify()
+
+    def show_export_result(self, ok: bool, text: str, warned: bool = False) -> None:
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Information if ok and not warned else QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Export to VSP")
+        box.setText("Export finished: " + ("PASS" if ok and not warned else "PASS with warnings" if ok else "FAIL"))
+        box.setDetailedText(text)
+        box.setInformativeText(text.splitlines()[0] if text else "")
+        self.last_export_text = text
+        box.exec()
 
     def window_title(self) -> str:
         return f"VSP Duct Manager - inlet explorer - {self.model.config_path.name}" + (" *" if self.model.dirty else "")

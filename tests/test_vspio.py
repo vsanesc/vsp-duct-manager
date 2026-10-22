@@ -93,7 +93,7 @@ def test_temp_files_are_removed_even_when_the_export_fails(model, monkeypatch):
     tmp_root = Path(tempfile.gettempdir())
     before_dirs = {p.name for p in tmp_root.glob("ductmgr_*")}
     before = _set_state()
-    monkeypatch.setattr(vspio.pv, "read", lambda *_: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(vspio, "read_stl", lambda *_: (_ for _ in ()).throw(RuntimeError("boom")))
     with pytest.raises(RuntimeError, match="boom"):
         vspio.fuselage_mesh("Test Fuselage")
     assert {p.name for p in tmp_root.glob("ductmgr_*")} == before_dirs
